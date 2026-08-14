@@ -1,0 +1,21 @@
+{
+  "name": "memoire-embed-worker",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Memoire embed worker (D218 vector lane): freshness sweep + query-embed service, MiniLM q8 via @huggingface/transformers",
+  "type": "module",
+  "scripts": {
+    "serve": "node src/index.mjs serve",
+    "sweep": "node src/index.mjs sweep",
+    "fetch-model": "node scripts/model-tool.mjs fetch",
+    "verify-model": "node scripts/model-tool.mjs verify"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.2.0"
+  },
+  "overrides": {
+    "sharp": "0.35.0",
+    "adm-zip": "0.6.0"
+  }
+}

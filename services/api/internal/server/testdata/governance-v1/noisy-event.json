@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "project": "memoire-test",
+  "session_id": "http-noise-capture-session",
+  "source_adapter": "governance-test",
+  "source_event_id": "http-noise-capture-event",
+  "event_type": "note",
+  "occurred_at_epoch": 1800000100,
+  "payload": {
+    "message": "scratch unsourced broad claim that must still be captured",
+    "noise_candidate": true
+  },
+  "text": "scratch unsourced broad claim that must still be captured"
+}

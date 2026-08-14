@@ -1,0 +1,2 @@
+{"uuid":"qwen-corrupt-line-0001","parentUuid":null,"sessionId":"qwen-corrupt-session-20260707","timestamp":"2026-07-06T22:49:00.000Z","type":"user","cwd":"/tmp/qwen-corrupt-project","version":"0.17.0","gitBranch":"qwen-smoke-branch","message":{"role":"user","parts":[{"text":"corrupt transcript first line is valid"}]}}
+{"uuid":"qwen-corrupt-line-0002","parentUuid":"qwen-corrupt-line-0001","sessionId":"qwen-corrupt-session-20260707","timestamp":"2026-07-06T22:49:01.000Z","type":"assistant"

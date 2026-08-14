@@ -1,0 +1,255 @@
+{
+  "comment": [
+    "The memoire versioned API surface (D172). HTTP routes + MCP tools. Enforced by contract tests in make test (services/api/internal/server + services/mcp); a mismatch fails the build. Editing this file is the deliberate act of changing the contract.",
+    "Coverage boundary, HTTP: four things are tracked and gated. (1) Route membership, as far as a package-local tripwire binds it — see the next paragraph for what that does not prove. (2) Each route's auth class, probed behaviorally through the real server against an ENUMERATED credential x transport truth table: tokenless, read-only, write-only and admin-only credentials, over the Authorization bearer header and over the ?token= query fallback (auth() consults the query only when the required scope is read; on a read route it then applies the same scope rule as the header, so every credential is probed over both transports). (3) The NAMES of top-level required parameters, probed from both sides: omitting a declared name is refused with 400, and every route's canonical request must reach its handler — including the routes declaring nothing required, whose canonical request is the empty object. That request carries NO field name this file does not declare (the test harness refuses one that does), which is what makes a name becoming required trip the gate instead of hiding behind a pre-supplied value. (4) The body_mode of the routes declaring one — see the body_mode paragraph below.",
+    "What the route-membership tripwire does NOT prove: it counts Handle/HandleFunc occurrences in the server package's own sources, so it binds THAT package to the one route table. It is not a semantic proof that the served mux equals the table. Registration delegated to another package, and any wrapper placed around the handler server.New returns where the process assembles its server (services/api/cmd/api), are outside this gate and belong to review.",
+    "Coverage boundary, HTTP: three axes are deliberately NOT tracked and NOT gated. Optional parameters — not mechanically derivable from the handlers, and a hand-listed set would be a cache that can lie. Parameter TYPES — entries record names only. Nested body shapes, per the paragraph below. Changing any of them is still a contract change under the BREAKING/ADDITIVE legend in INJECTION-AND-SEARCH.md; it is simply one no test will force you to record.",
+    "Coverage boundary, MCP: tool parameters ARE fully tracked, optional ones included, because they are read from the schema tools/list actually serves.",
+    "body_mode marks the routes whose body handling DEVIATES from the ordinary named-fields posture; its absence means that ordinary posture, and only the routes below carry it. Closed vocabulary. opaque_queue: the raw bytes are queued unread, ANY body answers 202, and a malformed one dies at drain with the bytes preserved — the capture-is-never-blocked custody promise. json_envelope: the body must parse as JSON (unparseable is refused with 400), but membership of any named field is not required. Each mode is probed behaviorally, not merely recorded — a parse-before-queue change on an opaque_queue route, or a relaxation of a json_envelope route's JSON validation, trips the gate. Changing or removing a route's body_mode is a BREAKING contract change.",
+    "required_query and required_body name TOP-LEVEL parameters only. Nested item shapes stay the handlers' contract and are neither modeled nor probed here: PUT /v1/embeddings also requires observation_id, model, vector, and text_hash on every item of its batch.",
+    "Paths are the canonical registered patterns. Go's ServeMux additionally serves HEAD wherever a GET pattern is registered, and treats the trailing-slash /ui/ pattern as a subtree with an automatic redirect from /ui; the inventory lists the canonical patterns only."
+  ],
+  "http": [
+    {
+      "method": "GET",
+      "path": "/metrics",
+      "auth": "exempt"
+    },
+    {
+      "method": "GET",
+      "path": "/ui/",
+      "auth": "exempt"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/admin/lapse-expired",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/context",
+      "auth": "read",
+      "required_body": ["q"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/credentials",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/credentials/{id}/revoke",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/derivation-runs",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/derivation-runs/{id}",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/derive/notify",
+      "auth": "write",
+      "required_body": ["project", "session_id"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/derive/outstanding",
+      "auth": "admin"
+    },
+    {
+      "method": "PUT",
+      "path": "/v1/embeddings",
+      "auth": "admin",
+      "required_body": ["embeddings"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/embeddings/freshness",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/embeddings/missing",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events",
+      "auth": "write",
+      "body_mode": "opaque_queue"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/events/batch",
+      "auth": "write",
+      "body_mode": "json_envelope"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/events/tool-window",
+      "auth": "read",
+      "required_query": ["session_id"]
+    },
+    {
+      "method": "DELETE",
+      "path": "/v1/events/{id}",
+      "auth": "write"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/events/{id}",
+      "auth": "read"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/health",
+      "auth": "exempt"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/observations",
+      "auth": "read"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/observations/{id}",
+      "auth": "read"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/accept",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/confirm",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/demote",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/dispute",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/elevate",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/lapse",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/reject",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/review",
+      "auth": "admin",
+      "required_body": ["to_state"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/observations/{id}/review-log",
+      "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/rewrite",
+      "auth": "admin",
+      "required_body": ["text"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/readiness",
+      "auth": "exempt"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/search",
+      "auth": "read",
+      "required_query": ["q"]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/search",
+      "auth": "read",
+      "required_body": ["q"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/sessions",
+      "auth": "read"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/sessions/{id}",
+      "auth": "read"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/sessions/{id}/lapse-remaining",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/stats",
+      "auth": "read"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/timeline",
+      "auth": "read"
+    }
+  ],
+  "mcp_tools": [
+    {
+      "name": "memoire_context",
+      "params": [
+        {"name": "limit", "type": "number", "required": false},
+        {"name": "project", "type": "string", "required": false},
+        {"name": "q", "type": "string", "required": true}
+      ]
+    },
+    {
+      "name": "memoire_get_observations",
+      "params": [
+        {"name": "ids", "type": "array", "items_type": "number", "required": true}
+      ]
+    },
+    {
+      "name": "memoire_search",
+      "params": [
+        {"name": "exclude_kind", "type": "string", "required": false},
+        {"name": "include_proposed", "type": "boolean", "required": false},
+        {"name": "kind", "type": "string", "required": false},
+        {"name": "limit", "type": "number", "required": false},
+        {"name": "project", "type": "string", "required": false},
+        {"name": "q", "type": "string", "required": true}
+      ]
+    },
+    {
+      "name": "memoire_timeline",
+      "params": [
+        {"name": "exclude_kind", "type": "string", "required": false},
+        {"name": "include_proposed", "type": "boolean", "required": false},
+        {"name": "limit", "type": "number", "required": false},
+        {"name": "project", "type": "string", "required": false}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Containerfile
+    environment:
+      MEMOIRE_ADDR: 0.0.0.0:37778
+      MEMOIRE_HOME: /data
+      MEMOIRE_DB: /data/memoire.db
+      MEMOIRE_SCHEMA_DIR: /app/schema
+    ports:
+      - "127.0.0.1:37778:37778"
+    volumes:
+      - memoire-data:/data:Z
+
+volumes:
+  memoire-data:
+

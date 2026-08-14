@@ -1,0 +1,8 @@
+services/ui/node_modules
+services/api/internal/ui/dist
+tmp
+bin
+*.db
+*.db-shm
+*.db-wal
+.git

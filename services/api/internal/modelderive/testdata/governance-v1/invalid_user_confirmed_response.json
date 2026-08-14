@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "observations": [
+    {
+      "kind": "fact",
+      "text": "model must not self-confirm its own derived observation",
+      "confidence": 0.8,
+      "source_event_ids": [__EVENT_ID__],
+      "rationale": "the source is model-derived, not human-confirmed",
+      "provenance": "user_confirmed",
+      "noise_candidate": false
+    }
+  ]
+}

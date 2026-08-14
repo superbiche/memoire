@@ -1,0 +1,105 @@
+/* SPDX-License-Identifier: AGPL-3.0-only
+   Copyright (C) 2026 Michel Tomas */
+
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    'Inter var', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono:
+    ui-monospace, 'JetBrains Mono', 'Cascadia Code', 'Fira Code', Menlo, monospace;
+}
+
+html {
+  scrollbar-gutter: stable;
+}
+
+body {
+  @apply bg-zinc-50 text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100;
+}
+
+/* Subtle ambient glow behind the app, more visible in dark mode. */
+#app::before {
+  content: '';
+  position: fixed;
+  inset: -20% -10% auto;
+  height: 55vh;
+  pointer-events: none;
+  z-index: -1;
+  background:
+    radial-gradient(ellipse 60% 80% at 20% 0%, rgb(139 92 246 / 0.07), transparent 60%),
+    radial-gradient(ellipse 50% 70% at 80% 0%, rgb(14 165 233 / 0.06), transparent 60%);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  @apply rounded-full bg-zinc-300 dark:bg-zinc-700;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+kbd {
+  @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-zinc-300 bg-white px-1 font-mono text-[10px] font-medium text-zinc-500 shadow-[0_1px_0_rgb(0_0_0/0.06)] dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-400 dark:shadow-[0_1px_0_rgb(0_0_0/0.4)];
+}
+
+/* Review queue list transitions (TransitionGroup name="queue"). */
+.queue-move {
+  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.queue-enter-active {
+  transition:
+    opacity 0.3s ease,
+    transform 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.queue-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.queue-leave-active {
+  position: absolute;
+  width: 100%;
+  transition:
+    opacity 0.32s ease,
+    transform 0.32s cubic-bezier(0.55, 0, 0.55, 0.2);
+  z-index: 0;
+}
+.queue-leave-to {
+  opacity: 0;
+  transform: translateX(-32px) scale(0.98);
+}
+.queue-leave-to[data-verdict='accepted'],
+.queue-leave-to[data-verdict='confirmed'] {
+  transform: translateX(48px) scale(0.98);
+}
+/* Lapse = parked, not judged: the card drops down instead of picking a side. */
+.queue-leave-to[data-verdict='lapsed'] {
+  transform: translateY(16px) scale(0.98);
+}
+
+/* Toast transitions */
+.toast-enter-active,
+.toast-leave-active {
+  transition:
+    opacity 0.25s ease,
+    transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translateY(10px) scale(0.97);
+}
+
+/* Detail panel crossfade */
+.detail-enter-active {
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+.detail-enter-from {
+  opacity: 0;
+  transform: translateY(4px);
+}

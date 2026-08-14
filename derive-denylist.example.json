@@ -1,0 +1,7 @@
+{
+  "deny_projects": [
+    "tmp",
+    ".agents",
+    "agent-*"
+  ]
+}

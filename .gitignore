@@ -1,0 +1,16 @@
+.env
+compose.override.yml
+cdk8s/dist/
+tmp/
+bin/
+*.db
+*.db-shm
+*.db-wal
+services/ui/node_modules/
+services/api/internal/ui/dist/*
+!services/api/internal/ui/dist/.gitkeep
+
+.claude/
+services/mcp/mcp
+/dist/
+services/embed-worker/node_modules/

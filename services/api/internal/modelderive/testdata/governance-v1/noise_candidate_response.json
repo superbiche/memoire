@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "observations": [
+    {
+      "kind": "fact",
+      "text": "scratch derivation note is useful only when explicitly requested",
+      "confidence": 0.74,
+      "source_event_ids": [__EVENT_ID__],
+      "rationale": "the source describes an intermediate scratch note",
+      "provenance": "generated",
+      "noise_candidate": true
+    }
+  ]
+}

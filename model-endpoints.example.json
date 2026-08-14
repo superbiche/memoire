@@ -1,0 +1,11 @@
+{
+  "_comment": "Model endpoint registry for the -execute derivation path. Copy to $MEMOIRE_HOME/model-endpoints.json (or point MEMOIRE_MODEL_ENDPOINTS at this file) and replace the placeholder with your OpenAI-compatible endpoint (llama.cpp, vLLM, Ollama, ...). api_key_env names the env var holding the bearer token; the value is NEVER stored here (env-var-by-name, see D73). Omit api_key_env for unauthenticated local endpoints. No hostnames are compiled into the binary; the copied registry file is their home.",
+  "endpoints": [
+    {
+      "endpoint_id": "local",
+      "base_url": "http://127.0.0.1:8000",
+      "api_key_env": "MEMOIRE_DERIVE_API_KEY",
+      "models": ["your-model-name"]
+    }
+  ]
+}

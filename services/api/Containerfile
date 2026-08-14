@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Michel Tomas
+
+FROM node:22-bookworm-slim AS ui
+WORKDIR /src/services/ui
+COPY services/ui/package.json services/ui/package-lock.json ./
+RUN npm ci --no-audit --fund=false
+COPY services/ui/ ./
+# vite outDir is ../api/internal/ui/dist → /src/services/api/internal/ui/dist
+RUN npm run build
+
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY go.work ./
+COPY services/api/go.mod services/api/go.sum* ./services/api/
+COPY services/mcp/go.mod services/mcp/go.sum* ./services/mcp/
+WORKDIR /src/services/api
+RUN go mod download
+WORKDIR /src
+COPY . .
+COPY --from=ui /src/services/api/internal/ui/dist ./services/api/internal/ui/dist
+# Version stamp from the repo's VERSION file (MISSING #7): the binary
+# reports what it was built from — /v1/health must never carry a literal.
+RUN CGO_ENABLED=1 go build -tags sqlite_fts5 \
+      -ldflags "-X memoire/services/api/internal/buildinfo.Version=$(head -1 VERSION)" \
+      -o /out/memoire-api ./services/api/cmd/api
+
+# Named stage + explicit --target api at every API build entry point
+# (Makefile quadlet-image, scripts/quadlet.sh): the ops stage below is
+# LAST in this file, and an untargeted build would silently tag the ops
+# image as localhost/memoire:latest and brick the API container
+# (cdk8s review round-1 finding 1).
+FROM debian:bookworm-slim AS api
+WORKDIR /app
+COPY --from=build /out/memoire-api /usr/local/bin/memoire-api
+COPY schema /app/schema
+# schema-pg is resolved as the schema dir's sibling when MEMOIRE_DB is a
+# postgres:// DSN (store dialect seam, memoire:D157).
+COPY schema-pg /app/schema-pg
+EXPOSE 37778
+CMD ["memoire-api"]
+
+# ops image (HL3 relocation plan, cdk8s CronJobs): every hub-side timer
+# lane in one container — derive sweeps (hourly HL3 + nightly HL5 with
+# the lane-fresh gate), snapshot custody leg. Carries the operational
+# binaries, the scripts they exec, and the shell toolchain the scripts
+# assume. Built as a separate target: podman build --target ops.
+FROM golang:1.25 AS opsbuild
+WORKDIR /src
+COPY --from=build /src /src
+RUN CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-derive ./services/api/cmd/derive \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-queue ./services/api/cmd/queue \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-purge ./services/api/cmd/purge \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-redact-derived ./services/api/cmd/redactderived \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-mint-token ./services/api/cmd/minttoken \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-pgshadow ./services/api/cmd/pgshadow
+
+FROM debian:bookworm-slim AS ops
+# tzdata: the CronJobs' quiet-hours math runs `date +%H` under
+# TZ=Europe/Paris — a slim base without zoneinfo silently falls back to
+# UTC (round-1 finding 8).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash curl jq ca-certificates age zstd sqlite3 rsync openssh-client util-linux tzdata \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=opsbuild /out/ /usr/local/bin/
+COPY schema /app/schema
+COPY schema-pg /app/schema-pg
+COPY scripts /app/scripts
+# The export lane is home-classified tooling (memoire:D229; its pattern
+# file says "never ships" and means it) — the ops image must not carry it.
+RUN rm -rf /app/scripts/export
+# The D166 hard-fail contract: every store-opening binary in this image
+# sees an absolute schema dir regardless of cwd.
+ENV MEMOIRE_SCHEMA_DIR=/app/schema
+ENV MEMOIRE_DERIVE_BIN=/usr/local/bin/memoire-derive
+# Capture adapters resolve the queue writer relative to the scripts dir
+# ($ROOT/bin/memoire-queue = /app/bin/...) — point them at the installed
+# binary (round-1 finding 7).
+ENV MEMOIRE_QUEUE_BIN=/usr/local/bin/memoire-queue
+CMD ["bash", "-c", "echo 'memoire-ops: run a script from /app/scripts' && exit 2"]
