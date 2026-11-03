@@ -1,0 +1,9 @@
+# Reviewed gitleaks false positives in the v0.8.0 snapshot commit (all synthetic:
+# env var names, split test fixtures, the jwt.io sample token). One fingerprint
+# per finding: commit:file:rule:line. New findings are never added here unreviewed.
+89cc4264d1756f5436e9c925127a2ec3c091c113:docs/DERIVE-PROFILE-DESIGN.md:generic-api-key:50
+89cc4264d1756f5436e9c925127a2ec3c091c113:scripts/tests/hl5-lane-units-test.sh:generic-api-key:85
+89cc4264d1756f5436e9c925127a2ec3c091c113:services/api/internal/modelderive/qwen_adapter_test.go:generic-api-key:475
+89cc4264d1756f5436e9c925127a2ec3c091c113:services/api/internal/redactderived/redactderived_pg_test.go:gitlab-pat:224
+89cc4264d1756f5436e9c925127a2ec3c091c113:services/api/internal/sweep/sweep_contract_test.go:jwt:518
+89cc4264d1756f5436e9c925127a2ec3c091c113:tests/foreign/redaction-smoke.sh:generic-api-key:152
