@@ -82,6 +82,24 @@ func newFixture(t *testing.T) fixture {
 		 VALUES (3, 'k3', 'k3', 's2', 'keep', 'claude-code', 'note', '/x', '{}', 'keep gamma text', 100, 100)`,
 		`INSERT INTO observations(id, project, session_id, kind, text, occurred_at_epoch, created_at_epoch, review_state, provenance, supersedes_id)
 		 VALUES (12, 'keep', 's2', 'fact', 'keep obs gamma', 100, 100, 'accepted', 'inferred', 11)`,
+		// Derived children (#616 slice E, decision 4): the same rows as the
+		// Postgres fixture so both engines must cascade identically — obs 11's
+		// triage reasoning, usage rows quoting it, and its embedding; obs 12's
+		// own children survive, except the usage row whose usage EVENT (2) is
+		// purged.
+		`INSERT INTO observation_triage_suggestions(observation_id, stage, prompt_version, model, actor, suggested_verdict, reason_text, created_at_epoch)
+		 VALUES (11, 1, 'p1', 'm', 'triage', 'accept', 'purgeme reason text', 100)`,
+		`INSERT INTO observation_triage_suggestions(observation_id, stage, prompt_version, model, actor, suggested_verdict, created_at_epoch)
+		 VALUES (12, 1, 'p1', 'm', 'triage', 'accept', 100)`,
+		`INSERT INTO observation_usage(observation_id, event_id, session_id, project, verdict, reason, occurred_at_epoch)
+		 VALUES (11, 3, 's2', 'keep', 'used', 'quoted purgeme secret', 100)`,
+		`INSERT INTO observation_usage(observation_id, event_id, session_id, project, verdict, occurred_at_epoch)
+		 VALUES (12, 2, 's1', 'purgeme', 'used', 100)`,
+		`INSERT INTO observation_usage(observation_id, event_id, session_id, project, verdict, occurred_at_epoch)
+		 VALUES (12, 3, 's2', 'keep', 'unused', 100)`,
+		// No embeddings rows: schema/0002 observation_embeddings is an
+		// unapplied sketch on SQLite (the vector lane is Postgres-only); the
+		// engine probes for the table and reports 0 when it is absent.
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.Exec(stmt); err != nil {
@@ -213,6 +231,23 @@ func TestApplyProjectPurge(t *testing.T) {
 	if report.IdentityRootsDeleted != 1 || report.IdentityAlertsDeleted != 1 {
 		t.Fatalf("identity roots=%d alerts=%d, want 1/1", report.IdentityRootsDeleted, report.IdentityAlertsDeleted)
 	}
+	// Cascade parity with Postgres (#616 slice E): obs 11's usage row (by
+	// observation) + obs 12's row whose usage event 2 is purged (by event) =
+	// 2; obs 11's triage reasoning goes; obs 12's survive. Embeddings: the
+	// SQLite store has no embeddings table (unapplied 0002 sketch), so the
+	// probe reports 0 instead of failing.
+	if report.UsageRowsDeleted != 2 || report.TriageSuggestionsDeleted != 1 || report.EmbeddingsDeleted != 0 {
+		t.Fatalf("usage=%d triage=%d embeddings=%d, want 2/1/0", report.UsageRowsDeleted, report.TriageSuggestionsDeleted, report.EmbeddingsDeleted)
+	}
+	if n := countRows(t, fx.opts.DBPath, `SELECT COUNT(*) FROM observation_usage`); n != 1 {
+		t.Fatalf("surviving usage rows=%d, want 1 (obs 12 × event 3)", n)
+	}
+	if n := countRows(t, fx.opts.DBPath, `SELECT COUNT(*) FROM observation_triage_suggestions WHERE observation_id = 12`); n != 1 {
+		t.Fatalf("obs 12 triage suggestion must survive, got %d", n)
+	}
+	if n := countRows(t, fx.opts.DBPath, `SELECT COUNT(*) FROM observation_usage u JOIN observations o ON o.id = u.observation_id WHERE o.text LIKE '%purgeme%'`); n != 0 {
+		t.Fatalf("no usage row may still point at purged text, got %d", n)
+	}
 	if report.DeriveIntentsDeleted != 1 {
 		t.Fatalf("derive_intents deleted=%d, want 1 (purged project only)", report.DeriveIntentsDeleted)
 	}
@@ -306,6 +341,15 @@ func TestEventIDSelector(t *testing.T) {
 	// Event 1 + its raw projection (10) + linked derived (11).
 	if report.EventsDeleted != 1 || report.ObservationsDeleted != 2 {
 		t.Fatalf("deleted events=%d obs=%d, want 1/2", report.EventsDeleted, report.ObservationsDeleted)
+	}
+	// Children cascade on the event selector too (slice E, PG parity with
+	// TestPGEventIDSelector): obs 11's usage row and triage suggestion go;
+	// obs 12's children and the usage row keyed on surviving event 2 stay.
+	if report.UsageRowsDeleted != 1 || report.TriageSuggestionsDeleted != 1 {
+		t.Fatalf("usage=%d triage=%d, want 1/1", report.UsageRowsDeleted, report.TriageSuggestionsDeleted)
+	}
+	if got := countRows(t, fx.opts.DBPath, `SELECT count(*) FROM observation_usage`); got != 2 {
+		t.Fatalf("surviving usage rows=%d, want 2 (obs 12 × events 2 and 3)", got)
 	}
 	if report.SessionsDeleted != 0 || report.DerivationRunsDeleted != 0 {
 		t.Fatal("id selector must not touch sessions or derivation runs")
@@ -640,6 +684,10 @@ func TestProjectPurgeCleansResidueRows(t *testing.T) {
 		 VALUES ('runr', 'resid', 'sr', 'manual', 'local', 'v1', 'hr', 90, 110, 'completed', 100)`,
 		`INSERT INTO project_roots(project, root, source, first_seen_epoch, last_seen_epoch)
 		 VALUES ('resid', '/home/x/resid', 'event', 100, 100)`,
+		// A usage row captured under the project (slice E): project purge
+		// deletes it on both engines, and the probe must count it.
+		`INSERT INTO observation_usage(observation_id, event_id, session_id, project, verdict, reason, occurred_at_epoch)
+		 VALUES (10, 3, 'sr', 'resid', 'used', 'resid reason', 100)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := conn.Exec(stmt); err != nil {
@@ -660,9 +708,9 @@ func TestProjectPurgeCleansResidueRows(t *testing.T) {
 	if report.EventsMatched != 0 || report.ObservationsMatched != 0 {
 		t.Fatalf("precondition: resid must have no events/observations, got %d/%d", report.EventsMatched, report.ObservationsMatched)
 	}
-	if report.SessionsDeleted != 1 || report.DerivationRunsDeleted != 1 || report.IdentityRootsDeleted != 1 {
-		t.Fatalf("residue cleanup sessions=%d runs=%d roots=%d, want 1/1/1",
-			report.SessionsDeleted, report.DerivationRunsDeleted, report.IdentityRootsDeleted)
+	if report.SessionsDeleted != 1 || report.DerivationRunsDeleted != 1 || report.IdentityRootsDeleted != 1 || report.UsageRowsDeleted != 1 {
+		t.Fatalf("residue cleanup sessions=%d runs=%d roots=%d usage=%d, want 1/1/1/1",
+			report.SessionsDeleted, report.DerivationRunsDeleted, report.IdentityRootsDeleted, report.UsageRowsDeleted)
 	}
 	if report.Generation != 1 {
 		t.Fatalf("residue-only purge must bump generation, got %d", report.Generation)
@@ -722,6 +770,9 @@ func TestProjectRowProbeProvesCommitAndRollback(t *testing.T) {
 		`DELETE FROM project_roots WHERE project = 'purgeme'`,
 		`DELETE FROM project_identity_alerts WHERE project = 'purgeme'`,
 		`DELETE FROM derive_intents WHERE project = 'purgeme'`,
+		// Slice E: the project's usage rows are part of the probed set on
+		// both engines, so a committed purge has removed them too.
+		`DELETE FROM observation_usage WHERE project = 'purgeme'`,
 	} {
 		if _, err := conn.Exec(stmt); err != nil {
 			t.Fatal(err)
@@ -742,5 +793,102 @@ func TestProjectRowProbeProvesCommitAndRollback(t *testing.T) {
 	}
 	if _, err := os.Stat(fx.opts.IntentPath); err == nil {
 		t.Fatal("resume must remove the intent")
+	}
+}
+
+// TestUsageOnlyResiduePurgeAdvancesGeneration pins slice E review round-1
+// F1: a project whose only remaining rows are usage rows (the orphan
+// population the old SQLite purge left behind) is probed, purged, tombstoned
+// and bumps the custody generation; the re-apply is convergent. Before the
+// fix the SQLite probe ignored usage rows, so the intent recorded no probes
+// and a lost committed-intent flip became unprovable.
+func TestUsageOnlyResiduePurgeAdvancesGeneration(t *testing.T) {
+	fx := newFixture(t)
+	conn, err := sql.Open("sqlite3", fx.opts.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(`INSERT INTO observation_usage(observation_id, event_id, session_id, project, verdict, reason, occurred_at_epoch)
+		 VALUES (10, 2, 'so', 'orphaned', 'used', 'orphaned reason quoting a purged secret', 100)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fx.opts.Selector = Selector{Project: "orphaned"}
+	fx.opts.Apply = true
+	fx.opts.NoQuarantine = true
+	report, err := Run(context.Background(), fx.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.UsageRowsDeleted != 1 || report.Generation != 1 {
+		t.Fatalf("usage-only residue: usage=%d gen=%d, want 1/1", report.UsageRowsDeleted, report.Generation)
+	}
+	if _, err := os.Stat(fx.opts.IntentPath); err == nil {
+		t.Fatal("apply must remove the intent")
+	}
+	// Lost-flip variant: a pre-commit intent whose only probe is the project
+	// row count, rows gone -> DB work is inferred and the generation advances.
+	if err := writeIntent(fx.opts.IntentPath, intentJournal{
+		Phase:            phasePreCommit,
+		Selector:         "project",
+		ProbeProject:     "orphaned",
+		ProbeProjectRows: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := ResumeIntent(context.Background(), fx.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Generation != 2 {
+		t.Fatalf("lost-flip usage-only resume must bump generation, got %d", resumed.Generation)
+	}
+	second, err := Run(context.Background(), fx.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.UsageRowsDeleted != 0 || second.Generation != 2 {
+		t.Fatalf("re-apply not convergent: usage=%d gen=%d", second.UsageRowsDeleted, second.Generation)
+	}
+}
+
+// TestSQLiteEmbeddingsTableCascadesWhenPresent exercises the present-table
+// branch of the embeddings probe on SQLite: with the 0002 table created, a
+// purged observation's row goes and the survivor's stays.
+func TestSQLiteEmbeddingsTableCascadesWhenPresent(t *testing.T) {
+	requireAge(t)
+	fx := newFixture(t)
+	conn, err := sql.Open("sqlite3", fx.opts.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS observation_embeddings (observation_id INTEGER PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL, created_at_epoch INTEGER NOT NULL)`,
+		`INSERT INTO observation_embeddings(observation_id, model, dim, vector, created_at_epoch) VALUES (11, 'm', 2, X'0000', 100)`,
+		`INSERT INTO observation_embeddings(observation_id, model, dim, vector, created_at_epoch) VALUES (12, 'm', 2, X'0000', 100)`,
+	} {
+		if _, err := conn.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pub, _ := ageKeypair(t)
+	fx.opts.Selector = Selector{Project: "purgeme"}
+	fx.opts.Apply = true
+	fx.opts.AgeRecipient = pub
+	fx.opts.QuarantineOut = filepath.Join(fx.home, "q.tar.age")
+	report, err := Run(context.Background(), fx.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.EmbeddingsDeleted != 1 {
+		t.Fatalf("embeddings deleted=%d, want 1 (obs 11)", report.EmbeddingsDeleted)
+	}
+	if got := countRows(t, fx.opts.DBPath, `SELECT count(*) FROM observation_embeddings`); got != 1 {
+		t.Fatalf("surviving embeddings=%d, want 1 (obs 12)", got)
 	}
 }

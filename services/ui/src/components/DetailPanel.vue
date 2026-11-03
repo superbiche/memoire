@@ -10,6 +10,7 @@ import KindBadge from './KindBadge.vue'
 import ElevatedBadge from './ElevatedBadge.vue'
 import ElevationConfirm from './ElevationConfirm.vue'
 import VerdictActions from './VerdictActions.vue'
+import UsageSection from './UsageSection.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -222,6 +223,7 @@ function confirmHistoryElevation(reasonText: string) {
                 >
               </div>
             </dl>
+            <UsageSection :observation-id="observation.id" />
           </div>
 
           <!-- Actions -->
@@ -321,7 +323,7 @@ function confirmHistoryElevation(reasonText: string) {
                     v-if="!observation.can_instruct"
                     :disabled="elevationBusy"
                     class="rounded-lg border border-violet-300 px-4 py-1.5 text-sm font-medium text-violet-600 transition hover:bg-violet-50 disabled:opacity-50 dark:border-violet-500/40 dark:text-violet-300 dark:hover:bg-violet-500/10"
-                    title="rides the operating notes of every future session — asks to confirm"
+                    title="rides the operating notes of every future session when session-start injection is on — asks to confirm"
                     @click="confirming = 'elevate'"
                   >
                     Elevate ↑

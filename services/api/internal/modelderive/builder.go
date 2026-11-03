@@ -29,6 +29,10 @@ var canonicalInputEventTypes = map[string]bool{
 	"codex_assistant_turn":    true,
 	"qwen_assistant_turn":     true,
 	"opencode_assistant_turn": true,
+	// pi_assistant_turn (2026-10-07, Pi live capture): a type that did not
+	// exist before, so no historical window changes composition or hash and
+	// the derivation version stays (the memoire:D138 precedent).
+	"pi_assistant_turn": true,
 }
 
 // CanonicalInputEventTypes returns the canonical input event types as a sorted
@@ -73,6 +77,39 @@ const (
 	alreadyCapturedEntryBytes = 300
 )
 
+// Collapsed content-less runs (prompt v2.5, 2026-09-11, Fibery #365).
+//
+// A canonical event whose eventContentText is empty renders as envelope and
+// nothing else — roughly 336 bytes of ids, epoch, type and adapter carrying no
+// text the model can ground on. No adapter in this repo produces a
+// claude_PostToolUse result summary, so EVERY tool event is that shape, and
+// the min-content guard (guard.go) measures it as zero content too: renderer
+// and guard already agree, the renderer just spent the bytes anyway. A
+// subagent tool burst could therefore push a rhythm segment (memoire:D261)
+// past the byte ceiling while leaving both halves of the median split under
+// the content floor — skipped as degenerate_window, no run row, no coverage,
+// re-cut identically on every later tick.
+//
+// So a MAXIMAL RUN of consecutive content-less events renders as ONE compact
+// block: the run's id and epoch span, its event-type counts, its tool-name
+// counts. Nothing leaves the input: the collapsed ids stay in
+// input_event_ids, so memoire:D211 coverage still covers them, and they stay
+// citable through the parser's id maps (parser.go), which resolve against the
+// request's events and never against the rendered prompt.
+const (
+	// collapsedToolNameLimit bounds how many tool names a collapsed block
+	// names individually. The overflow folds into a single `other xN` entry
+	// (N counts the folded EVENTS, not the folded names), so a pathological
+	// run cannot grow the block without bound.
+	collapsedToolNameLimit = 12
+)
+
+// collapsedIntro is the one-sentence Source Events preamble that tells the
+// model what a collapsed block is. Fixed framing: it renders on every prompt,
+// so the section shape does not depend on whether a window happens to hold a
+// content-less run.
+const collapsedIntro = "A `### events A..B` block summarizes a run of consecutive events with no captured content: counts only, nothing to cite.\n\n"
+
 // ErrPromptExceedsMaxBytes marks a BuildPrompt failure where the SOURCE
 // WINDOW alone exceeds MaxPromptBytes (the advisory context has already
 // yielded to zero by then). Callers that size windows (the CLI dry-run, and
@@ -83,8 +120,8 @@ var ErrPromptExceedsMaxBytes = errors.New("prompt exceeds MaxPromptBytes")
 // alreadyCapturedIntro is the section preamble, a fixed part of the rendered
 // budget.
 const alreadyCapturedIntro = "## Already Captured (this session)\n\n" +
-	"The observations below were already derived for this session — every " +
-	"review state, including reviewed-away content. Do not re-emit them or " +
+	"The observations below were already derived for this session — accepted, " +
+	"proposed and reviewed-away alike. Do not re-emit them or " +
 	"restatements/paraphrases of them; emit only genuinely NEW content from " +
 	"the source events. An update that changes a result or status (a fix " +
 	"landing, a verdict changing, a new concrete value) is new content; a " +
@@ -157,6 +194,54 @@ func clipUTF8(s string, n int) string {
 	return s[:n]
 }
 
+// eventGroup is one unit of the Source Events section: either a single
+// content-bearing event rendered in full, or a maximal run of consecutive
+// content-less events rendered as one collapsed block.
+type eventGroup struct {
+	Collapsed bool
+	Events    []db.EventRecord
+}
+
+// groupEvents walks the ordered events and folds every MAXIMAL run of
+// consecutive content-less events into one collapsed group. A run of length 1
+// collapses too — the rule is uniform, a content-less event never gets a
+// per-event block. Content is measured with the guard's eventContentText
+// (guard.go), never a second definition, so the renderer and the min-content
+// guard can never disagree on what content is.
+//
+// The grouping is computed ONCE per BuildPrompt and handed to both render
+// passes (the base pass and the already-captured pass), so the two passes
+// cannot diverge and the prompt meta counts exactly what the prompt shows.
+func groupEvents(events []db.EventRecord) []eventGroup {
+	groups := make([]eventGroup, 0, len(events))
+	for i := 0; i < len(events); i++ {
+		if eventContentText(events[i]) != "" {
+			groups = append(groups, eventGroup{Events: events[i : i+1]})
+			continue
+		}
+		j := i + 1
+		for j < len(events) && eventContentText(events[j]) == "" {
+			j++
+		}
+		groups = append(groups, eventGroup{Collapsed: true, Events: events[i:j]})
+		i = j - 1
+	}
+	return groups
+}
+
+// collapsedCounts reports how many events sit inside collapsed blocks and how
+// many blocks there are, for the prompt meta.
+func collapsedCounts(groups []eventGroup) (events, blocks int) {
+	for _, g := range groups {
+		if !g.Collapsed {
+			continue
+		}
+		blocks++
+		events += len(g.Events)
+	}
+	return events, blocks
+}
+
 // BuildPrompt constructs the deterministic model prompt and prompt metadata for
 // derivation_runs.meta_json. It enforces the input-event and prompt-byte limits
 // fail-closed before any provider call. It performs no provider call and no DB
@@ -188,12 +273,15 @@ func BuildPrompt(req Request) (string, map[string]any, error) {
 	// headroom, then the advisory section takes at most what remains. The
 	// section counts its exact rendered bytes, so it can never push a
 	// window that fits on its own past MaxPromptBytes.
-	base := renderPrompt(req, events, "")
+	groups := groupEvents(events)
+	collapsedEvents, collapsedBlocks := collapsedCounts(groups)
+
+	base := renderPrompt(req, groups, "")
 	section, sectionEntries, sectionTruncated := renderAlreadyCaptured(
 		req.AlreadyCaptured, alreadyCapturedBudget(req.Limits.MaxPromptBytes, len(base)))
 	prompt := base
 	if section != "" {
-		prompt = renderPrompt(req, events, section)
+		prompt = renderPrompt(req, groups, section)
 	}
 
 	// Fail closed on MaxPromptBytes before returning the prompt. With the
@@ -223,8 +311,17 @@ func BuildPrompt(req Request) (string, map[string]any, error) {
 			"end_epoch":   req.Window.EndEpoch,
 			"event_types": CanonicalInputEventTypes(),
 		},
+		// The input manifest lists EVERY admitted canonical event, collapsed
+		// ones included: coverage (memoire:D211) is a property of the input
+		// set, not of how many bytes the prompt spent on it.
 		"input_event_count": len(events),
 		"input_event_ids":   eventIDs,
+		// Collapse effect (prompt v2.5, Fibery #365): how many events the
+		// prompt summarized instead of rendering per-event, in how many
+		// blocks. Per-run numbers so the ceiling calibration can measure the
+		// saving on real sweep legs.
+		"collapsed_event_count": collapsedEvents,
+		"collapsed_block_count": collapsedBlocks,
 		// The context the prompt actually carries, post-budget: available =
 		// what the caller fetched; count = entries rendered; truncated =
 		// anything dropped, clipped, or the whole section yielded away.
@@ -242,7 +339,7 @@ func BuildPrompt(req Request) (string, map[string]any, error) {
 	return prompt, meta, nil
 }
 
-func renderPrompt(req Request, events []db.EventRecord, alreadyCapturedSection string) string {
+func renderPrompt(req Request, groups []eventGroup, alreadyCapturedSection string) string {
 	var b strings.Builder
 
 	b.WriteString("# Memoire Observation Derivation\n\n")
@@ -326,6 +423,11 @@ func renderPrompt(req Request, events []db.EventRecord, alreadyCapturedSection s
 	b.WriteString("- transient session mechanics: statements true only while the session\n")
 	b.WriteString("  runs (what is currently open, running, or awaited), worthless as\n")
 	b.WriteString("  durable memory once it ends.\n\n")
+	// Graduated genres (triage lane v1, R-B): the narrow, evidence-gated
+	// second death point. Renders nothing until a genre graduates, so the
+	// prompt is byte-identical to the pre-triage one on a deployment that
+	// has graduated none.
+	renderGraduatedGenres(&b)
 
 	b.WriteString("## Output Format\n\n")
 	b.WriteString("Return strict JSON only, no prose wrapper, shaped as:\n\n")
@@ -366,17 +468,91 @@ func renderPrompt(req Request, events []db.EventRecord, alreadyCapturedSection s
 		req.Window.Project, req.Window.SessionID, req.Window.StartEpoch, req.Window.EndEpoch))
 
 	b.WriteString("## Source Events\n\n")
-	if len(events) == 0 {
+	b.WriteString(collapsedIntro)
+	if len(groups) == 0 {
 		b.WriteString("(no source events in window)\n")
 	}
-	for _, e := range events {
-		writeEvent(&b, e)
+	for _, g := range groups {
+		if g.Collapsed {
+			writeCollapsedBlock(&b, g.Events)
+			continue
+		}
+		writeEvent(&b, g.Events[0], req.Window)
 	}
 
 	return b.String()
 }
 
-func writeEvent(b *strings.Builder, e db.EventRecord) {
+// writeCollapsedBlock renders one maximal run of content-less events as a
+// single block (prompt v2.5, Fibery #365). Deterministic by construction: the
+// span comes from the run's ends in prompt order and both count lines are
+// ordered by count desc then name asc.
+func writeCollapsedBlock(b *strings.Builder, run []db.EventRecord) {
+	first, last := run[0], run[len(run)-1]
+	noun := "events"
+	if len(run) == 1 {
+		noun = "event"
+	}
+	b.WriteString(fmt.Sprintf("### events %d..%d (%d %s, no captured content)\n", first.ID, last.ID, len(run), noun))
+	b.WriteString(fmt.Sprintf("- occurred_at_epoch: %d..%d\n", first.OccurredAtEpoch, last.OccurredAtEpoch))
+
+	types := map[string]int{}
+	tools := map[string]int{}
+	for _, e := range run {
+		types[e.EventType]++
+		// Same key lookup writeEvent uses for the per-event `- tool:` line.
+		if tool := payloadString(e.Payload, "tool_name", "toolName", "tool"); tool != "" {
+			tools[tool]++
+		}
+	}
+	// event_types is unbounded on purpose: the canonical set is closed and
+	// small (builder.go canonicalInputEventTypes), so the line is short and
+	// it tells the model what the run was.
+	b.WriteString("- event_types: " + renderNameCounts(types, 0) + "\n")
+	if len(tools) > 0 {
+		b.WriteString("- tools: " + renderNameCounts(tools, collapsedToolNameLimit) + "\n")
+	}
+	b.WriteString("\n")
+}
+
+// renderNameCounts renders `name xN` pairs ordered by count desc then name
+// asc — a total order, so the same run always renders the same bytes. A
+// positive limit names at most that many and folds the rest into a single
+// `other xN`, where N is the number of EVENTS folded, not the number of names.
+func renderNameCounts(counts map[string]int, limit int) string {
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if counts[names[i]] != counts[names[j]] {
+			return counts[names[i]] > counts[names[j]]
+		}
+		return names[i] < names[j]
+	})
+
+	parts := make([]string, 0, len(names)+1)
+	other := 0
+	for i, name := range names {
+		if limit > 0 && i >= limit {
+			other += counts[name]
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s x%d", name, counts[name]))
+	}
+	if other > 0 {
+		parts = append(parts, fmt.Sprintf("other x%d", other))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// writeEvent renders one content-bearing event. The project and session_id
+// lines are omitted when they repeat the window (prompt v2.5, Fibery #365):
+// the `## Source Window` header already states both, and in time-window mode
+// (Window.SessionID == "") the session line stays on every event because the
+// header cannot state it. source_adapter stays, and source_event_id ALWAYS
+// stays: the parser maps string citations through it (parser.go).
+func writeEvent(b *strings.Builder, e db.EventRecord, w Window) {
 	b.WriteString(fmt.Sprintf("### event %d\n", e.ID))
 	b.WriteString(fmt.Sprintf("- occurred_at_epoch: %d\n", e.OccurredAtEpoch))
 	b.WriteString(fmt.Sprintf("- event_type: %s\n", e.EventType))
@@ -384,8 +560,10 @@ func writeEvent(b *strings.Builder, e db.EventRecord) {
 	if e.SourceEventID != "" {
 		b.WriteString(fmt.Sprintf("- source_event_id: %s\n", e.SourceEventID))
 	}
-	b.WriteString(fmt.Sprintf("- project: %s\n", e.Project))
-	if e.SessionID != "" {
+	if e.Project != w.Project {
+		b.WriteString(fmt.Sprintf("- project: %s\n", e.Project))
+	}
+	if e.SessionID != "" && e.SessionID != w.SessionID {
 		b.WriteString(fmt.Sprintf("- session_id: %s\n", e.SessionID))
 	}
 	switch e.EventType {
@@ -406,7 +584,7 @@ func writeEvent(b *strings.Builder, e db.EventRecord) {
 			b.WriteString(strings.TrimSpace(summary))
 			b.WriteString("\n")
 		}
-	case "claude_assistant_turn", "codex_assistant_turn", "qwen_assistant_turn", "opencode_assistant_turn":
+	case "claude_assistant_turn", "codex_assistant_turn", "qwen_assistant_turn", "opencode_assistant_turn", "pi_assistant_turn":
 		// Assistant turns carry their visible prose in the event text column
 		// (live-captured or transcript-backfilled), not in the payload.
 		if text := strings.TrimSpace(e.Text); text != "" {

@@ -4,6 +4,7 @@
 package modelderive
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -561,6 +562,67 @@ func TestParserMapsSourceEventIDStrings(t *testing.T) {
 		}
 		if len(got.RejectedCandidates) != 1 || got.RejectedCandidates[0].Class != RejectClassUngrounded {
 			t.Fatalf("want 1 ungrounded rejection, got %v", got.RejectedCandidates)
+		}
+	})
+}
+
+// TestParserAcceptsCitationInsideCollapsedRun pins the #365 invariant that
+// makes collapsing safe: the renderer summarizes content-less runs, but the
+// parser resolves citations against req.Events, never against the rendered
+// prompt, so an id inside a collapsed block stays a valid citation — by
+// number and through its source_event_id string.
+func TestParserAcceptsCitationInsideCollapsedRun(t *testing.T) {
+	events := []db.EventRecord{
+		userPromptEvent(1, 100, "a question with enough substance to matter"),
+		contentLessToolEvent(2, 110, "Read"),
+		contentLessToolEvent(3, 120, "Grep"),
+	}
+	req := baseRequest(events)
+	prompt, meta, err := BuildPrompt(req)
+	if err != nil {
+		t.Fatalf("BuildPrompt: %v", err)
+	}
+	// Precondition: ids 2 and 3 really are collapsed away from the prompt
+	// body but really are in the input manifest.
+	if !strings.Contains(prompt, "### events 2..3") {
+		t.Fatalf("fixture must collapse ids 2..3; prompt:\n%s", prompt)
+	}
+	for _, id := range []int{2, 3} {
+		if strings.Contains(prompt, fmt.Sprintf("### event %d\n", id)) {
+			t.Fatalf("id %d must not have a per-event block", id)
+		}
+	}
+	if got, _ := meta["input_event_count"].(int); got != 3 {
+		t.Fatalf("input_event_count = %v, want 3", meta["input_event_count"])
+	}
+
+	t.Run("numeric citation of a collapsed id is accepted", func(t *testing.T) {
+		raw := []byte(`{"schema_version":"1","observations":[{"kind":"fact","text":"the burst read then grepped","confidence":0.8,"source_event_ids":[3]}]}`)
+		got, err := ParseResponse(raw, req)
+		if err != nil {
+			t.Fatalf("ParseResponse: %v", err)
+		}
+		if len(got.Observations) != 1 || len(got.RejectedCandidates) != 0 {
+			t.Fatalf("want 1 observation / 0 rejections, got %d/%d (%v)",
+				len(got.Observations), len(got.RejectedCandidates), got.RejectedCandidates)
+		}
+		if ids := got.Observations[0].SourceEventIDs; len(ids) != 1 || ids[0] != 3 {
+			t.Fatalf("mapped ids = %v, want [3]", ids)
+		}
+	})
+
+	t.Run("string citation of a collapsed id is accepted", func(t *testing.T) {
+		raw := []byte(`{"schema_version":"1","observations":[{"kind":"fact","text":"the burst read then grepped","confidence":0.8,"source_event_ids":["claude-posttooluse-2"]}]}`)
+		got, err := ParseResponse(raw, req)
+		if err != nil {
+			t.Fatalf("ParseResponse: %v", err)
+		}
+		if len(got.Observations) != 1 || len(got.RejectedCandidates) != 0 {
+			t.Fatalf("want 1 observation / 0 rejections, got %d/%d (%v)",
+				len(got.Observations), len(got.RejectedCandidates), got.RejectedCandidates)
+		}
+		if ids := got.Observations[0].SourceEventIDs; len(ids) != 1 || ids[0] != 2 {
+			t.Fatalf("mapped ids = %v, want [2]", ids)
 		}
 	})
 }

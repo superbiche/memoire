@@ -43,7 +43,9 @@ func unitVec(axis int) []float32 {
 
 func TestRRFFuse(t *testing.T) {
 	mk := func(id int64, snippet string) SearchHit {
-		return SearchHit{ID: id, Snippet: snippet}
+		// The run id rides along so fusion's whole-hit copy is checked on
+		// the field lineage-at-retrieval keys on (Fibery #335).
+		return SearchHit{ID: id, Snippet: snippet, DerivationRunID: fmt.Sprintf("drv_%d", id)}
 	}
 	fts := []SearchHit{mk(1, "fts-1"), mk(2, "fts-2"), mk(3, "fts-3")}
 	vec := []SearchHit{mk(2, "vec-2"), mk(4, "vec-4")}
@@ -57,6 +59,12 @@ func TestRRFFuse(t *testing.T) {
 	for i, id := range wantOrder {
 		if got[i].ID != id {
 			t.Fatalf("fused[%d].ID = %d, want %d (full: %+v)", i, got[i].ID, id, got)
+		}
+	}
+	// Fusion copies whole hits, so derivation_run_id survives it.
+	for _, h := range got {
+		if want := fmt.Sprintf("drv_%d", h.ID); h.DerivationRunID != want {
+			t.Fatalf("fused hit %d: derivation_run_id = %q, want %q", h.ID, h.DerivationRunID, want)
 		}
 	}
 	// Dual-lane hit keeps the FTS struct (real snippet), Rank is the RRF score.
@@ -301,6 +309,14 @@ func TestHybridSearchPG(t *testing.T) {
 	}
 	if vecHit.Snippet == "" {
 		t.Fatal("vector-lane hit has no snippet (want text prefix)")
+	}
+	// The vector lane projects derivation_run_id like every other lane, so
+	// a fused hit carries its run whichever lane found it (Fibery #335).
+	if vecHit.DerivationRunID != run.ID {
+		t.Fatalf("vector-lane hit derivation_run_id = %q, want %q", vecHit.DerivationRunID, run.ID)
+	}
+	if ftsHit := found[obsIDs[0]]; ftsHit.DerivationRunID != run.ID {
+		t.Fatalf("fused FTS hit derivation_run_id = %q, want %q", ftsHit.DerivationRunID, run.ID)
 	}
 	if stub.calls != 1 {
 		t.Fatalf("embedder calls = %d, want 1", stub.calls)

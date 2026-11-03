@@ -68,3 +68,9 @@ func TestToolWindowEndpoint(t *testing.T) {
 	assertStatus(t, handler, http.MethodGet, "/v1/events/tool-window?start=100&end=300", "read-token", "", http.StatusBadRequest)
 	assertStatus(t, handler, http.MethodGet, "/v1/events/tool-window?session_id=win-session&start=notanumber", "read-token", "", http.StatusBadRequest)
 }
+
+// end < start is a client error: 400 with the store message, not a store fault.
+func TestToolWindowInvertedRangeStays400(t *testing.T) {
+	handler, _ := testServer(t, "read-token")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/events/tool-window?session_id=s&start=300&end=100", "read-token", "", http.StatusBadRequest, "end must be >= start")
+}

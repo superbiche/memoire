@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"memoire/services/api/internal/db"
 )
@@ -32,10 +33,41 @@ const (
 	DefaultNearDupHiThreshold = 0.90
 )
 
+// Supersede thresholds (Fibery #344). A candidate that HITS the gate above is
+// rejected today; when it also RESTATES and GROWS ON its target it supersedes
+// it instead — the mid-arc "so far" observation a later cut restates with more
+// information keeps its content and its filiation instead of being lost as a
+// paraphrase or landing as a second triage row.
+//
+// These three numbers are UNCALIBRATED first values, in the memoire:D72 /
+// memoire:D261 sense: chosen by judgment, not measured. The run metadata logs
+// the target id and all three scores for every supersede
+// (meta_json.superseded_candidates), and the near-dup rejections keep logging
+// theirs, so a week of sweeps yields the distribution both sides of the line
+// and the numbers get re-derived from data rather than calcifying.
+const (
+	// DefaultSupersedeContainment is the minimum share of the TARGET's
+	// trigrams the candidate must carry — "the new text says what the old
+	// one said". Directional on purpose: Jaccard cannot express containment,
+	// because the candidate's own growth depresses it.
+	DefaultSupersedeContainment = 0.80
+	// DefaultSupersedeGrowthRatio is the minimum share of the CANDIDATE's
+	// trigrams that are novel — "and it says more".
+	DefaultSupersedeGrowthRatio = 0.15
+	// DefaultSupersedeGrowthChars is the minimum RUNE-count growth of the
+	// normalized text. The ratio alone admits a long reword; an absolute
+	// floor demands real added content. Runes, not bytes, so a non-ASCII
+	// observation is not held to a stricter bar than an ASCII one.
+	DefaultSupersedeGrowthChars = 40
+)
+
 // nearDupProfile is the precomputed comparison form of one text.
 type nearDupProfile struct {
 	trigrams map[string]bool
 	digits   map[string]bool
+	// runeLen is the normalized text's rune count, the supersede growth
+	// rule's length unit.
+	runeLen int
 }
 
 // nearDupRef ties a profile to the stored observation row it came from —
@@ -46,6 +78,25 @@ type nearDupProfile struct {
 type nearDupRef struct {
 	profile       nearDupProfile
 	observationID int64
+	// reviewState is the row's state as the gate read it (empty for a row
+	// this run just inserted, which is `proposed` by construction). It gates
+	// supersede only: a machine proposal may replace a machine proposal, but
+	// a human-confirmed row is superseded only by a human gesture (rewrite,
+	// memoire:D146). Near-dup rejection is state-blind, as before.
+	reviewState string
+	// intraResponse marks a ref that is an earlier candidate of THIS
+	// response. Such a match is never a supersede: the two statements come
+	// from one generation over one window, so there is no later cut that
+	// learned more — it is the plain duplicate the gate already rejects.
+	intraResponse bool
+	// sameRun marks a ref written by the run now executing (review round-1
+	// F1). "Not from this response" is NOT the same statement as "from an
+	// earlier run": a stale-running takeover REUSES the run id, so a retry's
+	// session read sees the dead attempt's rows as pre-existing session
+	// material. Superseding one of those would put both rows under one run id
+	// and call a retry of one derivation a succession of two. Refused on the
+	// same terms as intraResponse: an ordinary near-dup rejection.
+	sameRun bool
 }
 
 // nearDupMatch reports the strongest gate hit for a candidate.
@@ -73,6 +124,7 @@ func buildNearDupProfile(text string) nearDupProfile {
 	return nearDupProfile{
 		trigrams: trigramSet(norm),
 		digits:   digitTokens(norm),
+		runeLen:  utf8.RuneCountInString(norm),
 	}
 }
 
@@ -190,14 +242,93 @@ func hitIDs(hits []nearDupMatch) ([]int64, map[int64]float64) {
 }
 
 // nearDupRefsFromSession precomputes gate references for a session's
-// existing observations.
-func nearDupRefsFromSession(existing []db.SessionObservationSummary) []nearDupRef {
+// existing observations. currentRunID is the run now executing, so a row it
+// already wrote — a dead attempt's, after a stale-running takeover reused the
+// id — is marked sameRun and cannot be superseded. An EMPTY run id on the row
+// (a rewrite successor has none) never matches: those rows stay eligible under
+// the ordinary conditions, which is what they were before F1.
+func nearDupRefsFromSession(existing []db.SessionObservationSummary, currentRunID string) []nearDupRef {
 	refs := make([]nearDupRef, 0, len(existing))
 	for _, obs := range existing {
 		refs = append(refs, nearDupRef{
 			profile:       buildNearDupProfile(obs.Text),
 			observationID: obs.ID,
+			reviewState:   obs.ReviewState,
+			sameRun:       obs.DerivationRunID != "" && obs.DerivationRunID == currentRunID,
 		})
 	}
 	return refs
+}
+
+// supersedeScores measures the two directional quantities the supersede
+// verdict needs, over the SAME normalized trigram sets the near-dup policy
+// compares:
+//
+//   - containment: |tri(old) ∩ tri(new)| / |tri(old)| — how much of the older
+//     statement the candidate carries ("it restates it");
+//   - growth: |tri(new) \ tri(old)| / |tri(new)| — how much of the candidate
+//     is new ("and it adds").
+//
+// An empty target trigram set contains vacuously (containment 1), mirroring
+// jaccard's both-empty convention.
+func supersedeScores(cand, target nearDupProfile) (containment, growth float64) {
+	inter := 0
+	for k := range target.trigrams {
+		if cand.trigrams[k] {
+			inter++
+		}
+	}
+	if len(target.trigrams) == 0 {
+		containment = 1
+	} else {
+		containment = float64(inter) / float64(len(target.trigrams))
+	}
+	if len(cand.trigrams) == 0 {
+		return containment, 0
+	}
+	novel := 0
+	for k := range cand.trigrams {
+		if !target.trigrams[k] {
+			novel++
+		}
+	}
+	return containment, float64(novel) / float64(len(cand.trigrams))
+}
+
+// supersedeVerdict decides whether a candidate that already HIT the near-dup
+// policy against ref supersedes it instead of being rejected (Fibery #344).
+// The scores are returned whatever the verdict, so a refusal can still be
+// explained from run metadata.
+//
+// All five conditions must hold; the hit itself is condition 1, established by
+// the caller. This function never widens what the gate catches — it only
+// re-classifies pairs the gate already rejects today.
+func supersedeVerdict(cand nearDupProfile, ref nearDupRef) (containment, growth float64, ok bool) {
+	containment, growth = supersedeScores(cand, ref.profile)
+	switch {
+	// (2) a machine proposal may replace a machine proposal; any other
+	// state — accepted, disputed, rejected, lapsed, superseded — is a row a
+	// human ruled on, and only a human gesture supersedes it.
+	case ref.reviewState != "proposed":
+		return containment, growth, false
+	// (3) the target must come from an EARLIER RUN. Two ways a row fails
+	// that: it is an earlier candidate of this response, or it was written by
+	// this same run id — which a stale-running takeover makes possible
+	// (review round-1 F1). A row with no run id at all (rewrite successor)
+	// fails neither.
+	case ref.intraResponse, ref.sameRun:
+		return containment, growth, false
+	// (4) restates.
+	case containment < DefaultSupersedeContainment:
+		return containment, growth, false
+	// (5) grows, in both the relative and the absolute sense. In the hi band
+	// (trigram >= 0.90) the ratio cannot be met, so near-identical
+	// restatements stay rejected — that is the intended consequence, not a
+	// gap.
+	case growth < DefaultSupersedeGrowthRatio:
+		return containment, growth, false
+	case cand.runeLen < ref.profile.runeLen+DefaultSupersedeGrowthChars:
+		return containment, growth, false
+	}
+	return containment, growth, true
 }

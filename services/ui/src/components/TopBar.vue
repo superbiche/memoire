@@ -3,8 +3,9 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { acceptedCount, confirmedCount, rejectedCount, state } from '../stores/review'
+import { totalStaked } from '../stores/triage'
 
-const tab = defineModel<'review' | 'browse' | 'sessions'>('tab', { required: true })
+const tab = defineModel<'review' | 'triage' | 'stage2' | 'browse' | 'sessions'>('tab', { required: true })
 const emit = defineEmits<{ jump: [id: number] }>()
 
 // "#id" jump: observation ids arrive from injection blocks and chat as
@@ -37,7 +38,7 @@ function submitJump(e: Event) {
 
       <nav class="flex items-center gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-zinc-900">
         <button
-          v-for="t in ['review', 'browse', 'sessions'] as const"
+          v-for="t in ['review', 'triage', 'stage2', 'browse', 'sessions'] as const"
           :key="t"
           class="rounded-md px-3 py-1 text-sm font-medium capitalize transition"
           :class="
@@ -52,6 +53,14 @@ function submitJump(e: Event) {
             v-if="t === 'review' && state.items.length"
             class="ml-1 rounded-full bg-violet-600/90 px-1.5 text-[10px] font-semibold text-white"
             >{{ state.items.length }}</span
+          >
+          <!-- Staked-but-unapplied rows are the one thing a tab hop could
+               lose sight of: the badge is what keeps them from being
+               forgotten on another screen. -->
+          <span
+            v-if="t === 'triage' && totalStaked"
+            class="ml-1 rounded-full bg-amber-500/90 px-1.5 text-[10px] font-semibold text-white"
+            >{{ totalStaked }}</span
           >
         </button>
       </nav>
@@ -78,6 +87,13 @@ function submitJump(e: Event) {
         <span v-if="tab === 'review'" class="hidden items-center gap-2 font-mono md:flex">
           <kbd>j</kbd><kbd>k</kbd> move <kbd>a</kbd> accept <kbd>c</kbd> confirm <kbd>r</kbd> reject <kbd>l</kbd> lapse
           <kbd>e</kbd> elevate <kbd>w</kbd> rewrite <kbd>u</kbd> back
+        </span>
+        <span v-else-if="tab === 'triage'" class="hidden items-center gap-2 font-mono md:flex">
+          <kbd>j</kbd><kbd>k</kbd> move <kbd>&larr;</kbd> accept <kbd>&rarr;</kbd> lapse <kbd>n</kbd> noise genre
+          <kbd>x</kbd> reject <kbd>space</kbd> unstake
+        </span>
+        <span v-else-if="tab === 'stage2'" class="hidden items-center gap-2 font-mono md:flex">
+          <kbd>j</kbd><kbd>k</kbd> move <kbd>c</kbd> confirm <kbd>e</kbd> elevate <kbd>d</kbd> decline
         </span>
         <span v-else-if="tab === 'sessions'" class="hidden items-center gap-2 font-mono md:flex">
           <kbd>j</kbd><kbd>k</kbd> rows <kbd>n</kbd><kbd>p</kbd> sessions <kbd>a</kbd> accept <kbd>c</kbd> confirm

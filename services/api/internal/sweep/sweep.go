@@ -13,9 +13,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
+	"memoire/services/api/internal/rawstore"
 	"memoire/services/api/internal/redact"
 )
 
@@ -139,19 +139,13 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		return Report{}, fmt.Errorf("create output dir: %w", err)
 	}
 
-	// --- Collect raw file basenames (keep order deterministic) ---
-	rawEntries, err := os.ReadDir(rawDir)
+	// --- Hold raw custody still: the packer must not move files between
+	// the redaction pass and the quarantine pass (internal/rawstore). ---
+	sess, err := rawstore.Custody{RawDir: rawDir}.Enter(rawstore.ModeRead)
 	if err != nil {
-		return Report{}, fmt.Errorf("read raw dir: %w", err)
+		return Report{}, err
 	}
-
-	var rawNames []string
-	for _, ent := range rawEntries {
-		if ent.Type().IsRegular() {
-			rawNames = append(rawNames, ent.Name())
-		}
-	}
-	sort.Strings(rawNames)
+	defer sess.Release()
 
 	// --- Load redaction key ---
 	key, err := redact.LoadOrCreateKey(opts.RedactionKeyPath)
@@ -174,16 +168,19 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	var totalOutputBytes int64
 
 	// --- Redact each file (streaming: read once, write redacted, re-read for quarantine) ---
-	for _, name := range rawNames {
-		path := filepath.Join(rawDir, name)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return Report{}, fmt.Errorf("read raw file %s: %w", name, err)
-		}
-
+	// Raw custody may be partly packed: every regular file, flat or a day-
+	// pack member, is one input; packs themselves are containers, not input.
+	// The output generation is flat; the packer re-packs it.
+	var rawNames []string
+	err = rawstore.WalkFiles(rawDir, func(entry rawstore.Entry, data []byte) error {
+		name := entry.Name
+		rawNames = append(rawNames, name)
 		totalInputBytes += int64(len(data))
 
-		redacted, hits := redactor.JSON(data)
+		redacted, hits, err := redactor.JSON(data)
+		if err != nil {
+			return fmt.Errorf("redact raw file %s: %w", name, err)
+		}
 		if len(hits) > 0 {
 			report.FilesWithHits++
 			for _, h := range hits {
@@ -193,9 +190,13 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 
 		outPath := filepath.Join(outputDir, name)
 		if err := os.WriteFile(outPath, redacted, 0o600); err != nil {
-			return Report{}, fmt.Errorf("write redacted %s: %w", name, err)
+			return fmt.Errorf("write redacted %s: %w", name, err)
 		}
 		totalOutputBytes += int64(len(redacted))
+		return nil
+	})
+	if err != nil {
+		return Report{}, fmt.Errorf("read raw custody: %w", err)
 	}
 
 	report.FilesScanned = len(rawNames)
@@ -203,7 +204,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	report.TotalOutputBytes = totalOutputBytes
 
 	// --- Quarantine originals (streaming: re-read files, pipe tar → age) ---
-	if err := quarantineStreaming(opts, rawDir, rawNames); err != nil {
+	if err := quarantineStreaming(opts, rawDir, len(rawNames)); err != nil {
 		return Report{}, err
 	}
 
@@ -268,7 +269,7 @@ func checkNoClobber(opts Options) error {
 }
 
 // quarantineStreaming streams each raw file through a tar writer into age via io.Pipe.
-func quarantineStreaming(opts Options, rawDir string, names []string) error {
+func quarantineStreaming(opts Options, rawDir string, want int) error {
 	if _, err := exec.LookPath("age"); err != nil {
 		return fmt.Errorf("age binary not found")
 	}
@@ -280,30 +281,29 @@ func quarantineStreaming(opts Options, rawDir string, names []string) error {
 	// Writer goroutine: stream tar entries into the pipe writer.
 	go func() {
 		tw := tar.NewWriter(pw)
-		var writeErr error
-		for _, name := range names {
-			path := filepath.Join(rawDir, name)
-			data, err := os.ReadFile(path)
-			if err != nil {
-				writeErr = fmt.Errorf("re-read raw file %s for quarantine: %w", name, err)
-				pw.CloseWithError(writeErr)
-				return
-			}
+		got := 0
+		writeErr := rawstore.WalkFiles(rawDir, func(entry rawstore.Entry, data []byte) error {
+			name := entry.Name
 			hdr := &tar.Header{
 				Name: name,
 				Mode: 0o600,
 				Size: int64(len(data)),
 			}
 			if err := tw.WriteHeader(hdr); err != nil {
-				writeErr = fmt.Errorf("tar write header %s: %w", name, err)
-				pw.CloseWithError(writeErr)
-				return
+				return fmt.Errorf("tar write header %s: %w", name, err)
 			}
 			if _, err := tw.Write(data); err != nil {
-				writeErr = fmt.Errorf("tar write data %s: %w", name, err)
-				pw.CloseWithError(writeErr)
-				return
+				return fmt.Errorf("tar write data %s: %w", name, err)
 			}
+			got++
+			return nil
+		})
+		if writeErr == nil && got != want {
+			writeErr = fmt.Errorf("quarantine re-read %d files, redaction pass read %d", got, want)
+		}
+		if writeErr != nil {
+			pw.CloseWithError(fmt.Errorf("re-read raw custody for quarantine: %w", writeErr))
+			return
 		}
 		if tw.Close() != nil {
 			writeErr = errors.New("tar close")

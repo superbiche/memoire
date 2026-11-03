@@ -351,6 +351,25 @@ func TestUnauthorizedAudit(t *testing.T) {
 	}
 }
 
+// TestWriteCredentialCannotDeleteEvent pins Fibery #616 slice C: event
+// soft-delete is admin-only. A write-scoped hook token is refused with 403
+// and audited; the admin token still deletes.
+func TestWriteCredentialCannotDeleteEvent(t *testing.T) {
+	handler, store := testServer(t, "secret-token")
+	if _, err := store.EnsureTokenCredential(t.Context(), "write-token", "write-only", []string{"write"}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertStatus(t, handler, http.MethodPost, "/v1/events", "write-token", `{"project":"allowed"}`, http.StatusAccepted)
+	assertStatus(t, handler, http.MethodDelete, "/v1/events/1", "write-token", "", http.StatusForbidden)
+	if count, err := store.AuditCount(t.Context(), "auth.forbidden"); err != nil || count != 1 {
+		t.Fatalf("auth.forbidden audit count = %d, err=%v", count, err)
+	}
+	// Admin keeps the gesture; 404 here only proves the scope gate was passed
+	// (no event 1 has been drained in this server).
+	assertStatus(t, handler, http.MethodDelete, "/v1/events/1", "secret-token", "", http.StatusNotFound)
+}
+
 func TestReadOnlyCredentialCannotWrite(t *testing.T) {
 	handler, store := testServer(t, "secret-token")
 	if _, err := store.EnsureTokenCredential(t.Context(), "read-token", "read-only", []string{"read"}); err != nil {
@@ -397,19 +416,19 @@ func TestObservationReadParityAndAdminReviewTransitions(t *testing.T) {
 
 	seed := seedReviewHTTPObservations(t, store)
 
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, "http accepted decision")
-	assertBodyNotContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, "http proposed open question")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&kind=open_question", "read-token", "", http.StatusOK, "http proposed open question")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/search?q=http+proposed+open+question&project=memoire-test&session_id=http-review-session&kind=open_question", "read-token", "", http.StatusOK, `"review_state":"proposed"`)
-	assertBodyContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&session_id=http-review-session&kind=open_question", "read-token", "", http.StatusOK, "http proposed open question")
-	assertBodyContains(t, handler, http.MethodPost, "/v1/context?token=read-token", "", `{"q":"http proposed open question","project":"memoire-test","session_id":"http-review-session","kind":"open_question"}`, http.StatusOK, "open_question/proposed")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyNotContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, "http proposed open question")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&kind=open_question&include_derived=true", "read-token", "", http.StatusOK, "http proposed open question")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/search?q=http+proposed+open+question&project=memoire-test&session_id=http-review-session&kind=open_question&include_derived=true", "read-token", "", http.StatusOK, `"review_state":"proposed"`)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&session_id=http-review-session&kind=open_question&include_derived=true", "read-token", "", http.StatusOK, "http proposed open question")
+	assertBodyContains(t, handler, http.MethodPost, "/v1/context?token=read-token", "", `{"q":"http proposed open question","project":"memoire-test","session_id":"http-review-session","kind":"open_question","include_derived":true}`, http.StatusOK, "open_question/proposed")
 	// Wire names of the hit governance fields: search and timeline both
 	// serve provenance and occurred_at_epoch alongside the legacy
 	// captured_at_epoch alias, so a consumer can weigh and date a result
 	// line without a per-id fetch.
 	for _, path := range []string{
-		"/v1/search?q=http+proposed+open+question&project=memoire-test&session_id=http-review-session&kind=open_question",
-		"/v1/timeline?project=memoire-test&session_id=http-review-session&kind=open_question",
+		"/v1/search?q=http+proposed+open+question&project=memoire-test&session_id=http-review-session&kind=open_question&include_derived=true",
+		"/v1/timeline?project=memoire-test&session_id=http-review-session&kind=open_question&include_derived=true",
 	} {
 		assertBodyContains(t, handler, http.MethodGet, path, "read-token", "", http.StatusOK, `"provenance":"inferred"`)
 		assertBodyContains(t, handler, http.MethodGet, path, "read-token", "", http.StatusOK, `"occurred_at_epoch":`)
@@ -418,7 +437,7 @@ func TestObservationReadParityAndAdminReviewTransitions(t *testing.T) {
 
 	assertStatus(t, handler, http.MethodPost, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/review", "read-token", `{"to_state":"accepted","reason_text":"read token blocked"}`, http.StatusForbidden)
 	assertBodyContains(t, handler, http.MethodPost, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/review", "secret-token", `{"to_state":"accepted","reason_text":"looks durable"}`, http.StatusOK, `"review_state":"accepted"`)
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID, "read-token", "", http.StatusOK, `"review_state":"accepted"`)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"?include_derived=true", "read-token", "", http.StatusOK, `"review_state":"accepted"`)
 	assertStatus(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/review-log", "read-token", "", http.StatusForbidden)
 	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/review-log", "secret-token", "", http.StatusOK, `"observation_id":`+seed.ProposedOpenQuestionPathID)
 	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/review-log", "secret-token", "", http.StatusOK, `"actor":"local-`)
@@ -464,8 +483,8 @@ func TestDerivationRunInspectionEndpoints(t *testing.T) {
 	assertBodyContains(t, handler, http.MethodGet, "/v1/derivation-runs?project=memoire-test&provider=local-qwen&model=qwen-14b&endpoint_id=hl3", "secret-token", "", http.StatusOK, modelRun.ID)
 	assertBodyContains(t, handler, http.MethodGet, "/v1/derivation-runs/"+modelRun.ID, "secret-token", "", http.StatusOK, `"endpoint_id":"hl3"`)
 
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?derivation_run_id="+seed.DerivationRunID+"&review_state=proposed", "read-token", "", http.StatusOK, "http proposed task")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?derivation_run_id="+seed.DerivationRunID+"&review_state=proposed", "read-token", "", http.StatusOK, `"review_state":"proposed"`)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?derivation_run_id="+seed.DerivationRunID+"&review_state=proposed&include_derived=true", "read-token", "", http.StatusOK, "http proposed task")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?derivation_run_id="+seed.DerivationRunID+"&review_state=proposed&include_derived=true", "read-token", "", http.StatusOK, `"review_state":"proposed"`)
 }
 
 func TestObservationAcceptRejectEndpoints(t *testing.T) {
@@ -478,8 +497,8 @@ func TestObservationAcceptRejectEndpoints(t *testing.T) {
 
 	// Proposed-queue listing surfaces provenance for triage: kind,
 	// derivation_run_id, and source_event_ids.
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?review_state=proposed&project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, `"derivation_run_id":"`+seed.DerivationRunID+`"`)
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?review_state=proposed&project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, wantSourceEvents)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?review_state=proposed&project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, `"derivation_run_id":"`+seed.DerivationRunID+`"`)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?review_state=proposed&project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, wantSourceEvents)
 
 	// Auth: accept/reject require admin scope; a read token is forbidden.
 	assertStatus(t, handler, http.MethodPost, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/accept", "read-token", `{"reason_text":"blocked"}`, http.StatusForbidden)
@@ -488,8 +507,8 @@ func TestObservationAcceptRejectEndpoints(t *testing.T) {
 	// Accept moves a proposed observation into trusted memory; the
 	// response carries the updated state and provenance.
 	assertBodyContains(t, handler, http.MethodPost, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"/accept", "secret-token", `{"reason_text":"durable"}`, http.StatusOK, `"review_state":"accepted"`)
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID, "read-token", "", http.StatusOK, `"review_state":"accepted"`)
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID, "read-token", "", http.StatusOK, wantSourceEvents)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"?include_derived=true", "read-token", "", http.StatusOK, `"review_state":"accepted"`)
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations/"+seed.ProposedOpenQuestionPathID+"?include_derived=true", "read-token", "", http.StatusOK, wantSourceEvents)
 
 	// Reject removes a proposed observation from the trusted set without losing the record.
 	assertBodyContains(t, handler, http.MethodPost, "/v1/observations/"+seed.ProposedTaskPathID+"/reject", "secret-token", `{"reason_text":"noise"}`, http.StatusOK, `"review_state":"rejected"`)
@@ -531,21 +550,21 @@ func TestObservationElevateDemoteEndpoints(t *testing.T) {
 	// then elevate. A plain accept is not enough — elevate never promotes.
 	assertBodyContains(t, handler, http.MethodPost, target+"/confirm", "secret-token", `{"reason_text":"durable"}`, http.StatusOK, `"provenance":"user_confirmed"`)
 	assertBodyContains(t, handler, http.MethodPost, target+"/elevate", "secret-token", `{"reason_text":"rides every session"}`, http.StatusOK, `"can_instruct":1`)
-	assertBodyContains(t, handler, http.MethodGet, target, "read-token", "", http.StatusOK, `"provenance":"user_confirmed"`)
+	assertBodyContains(t, handler, http.MethodGet, target+"?include_derived=true", "read-token", "", http.StatusOK, `"provenance":"user_confirmed"`)
 
 	// The operating-notes read: can_instruct=true narrows list and timeline
 	// to elevated observations only.
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&can_instruct=true", "read-token", "", http.StatusOK, "http proposed open question")
-	assertBodyNotContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&can_instruct=true", "read-token", "", http.StatusOK, "http accepted decision")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&exclude_kind=raw&can_instruct=true", "read-token", "", http.StatusOK, "http proposed open question")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&can_instruct=true&include_derived=true", "read-token", "", http.StatusOK, "http proposed open question")
+	assertBodyNotContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&can_instruct=true&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&exclude_kind=raw&can_instruct=true&include_derived=true", "read-token", "", http.StatusOK, "http proposed open question")
 
 	// Double elevate is a 409, not a silent no-op.
 	assertBodyContains(t, handler, http.MethodPost, target+"/elevate", "secret-token", `{"reason_text":"again"}`, http.StatusConflict, "already elevated")
 
 	// Demote reverses can_instruct only; provenance stays user_confirmed.
 	assertBodyContains(t, handler, http.MethodPost, target+"/demote", "secret-token", `{"reason_text":"stand down"}`, http.StatusOK, `"can_instruct":0`)
-	assertBodyContains(t, handler, http.MethodGet, target, "read-token", "", http.StatusOK, `"provenance":"user_confirmed"`)
-	assertBodyNotContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&exclude_kind=raw&can_instruct=true", "read-token", "", http.StatusOK, "http proposed open question")
+	assertBodyContains(t, handler, http.MethodGet, target+"?include_derived=true", "read-token", "", http.StatusOK, `"provenance":"user_confirmed"`)
+	assertBodyNotContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&exclude_kind=raw&can_instruct=true&include_derived=true", "read-token", "", http.StatusOK, "http proposed open question")
 
 	// Demoting a non-elevated observation is a 409.
 	assertBodyContains(t, handler, http.MethodPost, target+"/demote", "secret-token", `{"reason_text":"again"}`, http.StatusConflict, "not elevated")
@@ -576,7 +595,7 @@ func TestConfirmOnAcceptedPromotesProvenance(t *testing.T) {
 
 	// Fast queue pass: plain accept — provenance untouched (R-5 split).
 	assertBodyContains(t, handler, http.MethodPost, target+"/accept", "secret-token", `{"reason_text":"seen"}`, http.StatusOK, `"review_state":"accepted"`)
-	assertBodyNotContains(t, handler, http.MethodGet, target, "read-token", "", http.StatusOK, `"provenance":"user_confirmed"`)
+	assertBodyNotContains(t, handler, http.MethodGet, target+"?include_derived=true", "read-token", "", http.StatusOK, `"provenance":"user_confirmed"`)
 
 	// Elevate on accepted-but-unconfirmed is still a 409 (double-gesture
 	// invariant holds).
@@ -585,7 +604,7 @@ func TestConfirmOnAcceptedPromotesProvenance(t *testing.T) {
 	// Confirm on the ACCEPTED row: provenance promoted, state unchanged,
 	// review-log row written.
 	assertBodyContains(t, handler, http.MethodPost, target+"/confirm", "secret-token", `{"reason_text":"I vouch"}`, http.StatusOK, `"provenance":"user_confirmed"`)
-	assertBodyContains(t, handler, http.MethodGet, target, "read-token", "", http.StatusOK, `"review_state":"accepted"`)
+	assertBodyContains(t, handler, http.MethodGet, target+"?include_derived=true", "read-token", "", http.StatusOK, `"review_state":"accepted"`)
 	assertBodyContains(t, handler, http.MethodGet, target+"/review-log", "secret-token", "", http.StatusOK, `"from_state":"accepted"`)
 
 	// ...and elevate now succeeds: the accepted->confirmed->elevated chain

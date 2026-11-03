@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -47,6 +48,11 @@ type Config struct {
 	// from TokenPath (this machine's own token) — the two stores must never
 	// share credentials implicitly.
 	ForwardTokenPath string
+	// ForwardPriorityAdapters lists the source adapters whose queue items the
+	// forwarder sends before any other item (MEMOIRE_FORWARD_PRIORITY_ADAPTERS,
+	// comma-separated, default "claude-code", the hook-fed live adapter). Empty
+	// disables priority.
+	ForwardPriorityAdapters []string
 	// EmbedURL is the query-embedding service base URL (hybrid lane,
 	// D218), e.g. http://memoire-embed:37779. Empty leaves the hybrid
 	// lane unwired — search stays FTS-only regardless of any flag.
@@ -91,6 +97,104 @@ type ModelEndpoint struct {
 	APIKeyEnv string `json:"api_key_env"`
 	// Models is the per-endpoint model allowlist. A run must name a listed model.
 	Models []string `json:"models"`
+	// Profile is the endpoint's declared context geometry. Optional and
+	// additive: an entry without one behaves exactly as it did before
+	// profiles existed (docs/DERIVE-PROFILE-DESIGN.md).
+	Profile *DeriveProfile `json:"profile,omitempty"`
+}
+
+// DeriveThinking declares how the SERVING side is configured for the model's
+// thinking phase (llama-server --reasoning / --reasoning-budget). v1 is a
+// declaration, not an instruction: memoire records it in run provenance and
+// never sends it to the provider (docs/DERIVE-PROFILE-DESIGN.md §4).
+type DeriveThinking struct {
+	// Policy is the closed set on|off|budget.
+	Policy string `json:"policy"`
+	// BudgetTokens is the served reasoning budget. Required when Policy is
+	// "budget", rejected otherwise.
+	BudgetTokens int `json:"budget_tokens"`
+}
+
+// DeriveProfile is one endpoint's declared context geometry. It exists because
+// a byte-denominated prompt ceiling shared across models with different
+// tokenizers, contexts, and thinking behavior is a latent bug class: it let the
+// first derive-bench run send prompts that left the model no room to finish
+// (tmp/derive-bench/2026-08-24/autopsy-empty-content.md). The numbers are
+// per-endpoint DATA; the byte mechanism itself is unchanged.
+//
+// No tokenizer enters memoire: BytesPerToken is measured or declared, and bytes
+// stay the transport unit.
+type DeriveProfile struct {
+	// CtxTokens is the serving context window in tokens.
+	CtxTokens int `json:"ctx_tokens"`
+	// MaxCompletionTokens is the completion cap this endpoint is served with.
+	MaxCompletionTokens int `json:"max_completion_tokens"`
+	// BytesPerToken is the measured prompt-content ratio for this model's
+	// tokenizer. Declare it conservatively: it converts the token budget into
+	// the byte ceiling the prompt builder actually enforces.
+	BytesPerToken float64 `json:"bytes_per_token"`
+	// MarginTokens is the safety slack held back from the context.
+	MarginTokens int `json:"margin_tokens"`
+	// Thinking is the serving-side reasoning declaration, recorded as run
+	// provenance. Optional.
+	Thinking *DeriveThinking `json:"thinking,omitempty"`
+}
+
+// EffectiveMaxPromptBytes derives the byte ceiling from the declared token
+// geometry: floor((ctx − max_completion − margin) × bytes_per_token). The
+// invariant it enforces by construction is
+// prompt_tokens_est + max_completion_tokens + margin <= ctx_tokens.
+//
+// The subtraction happens first and the product is floored once: the bench's
+// Python port (bench/derive/benchlib.py) must compute the identical integer,
+// and a differently shaped expression over the same doubles need not.
+func (p *DeriveProfile) EffectiveMaxPromptBytes() int {
+	if p == nil {
+		return 0
+	}
+	room := p.CtxTokens - p.MaxCompletionTokens - p.MarginTokens
+	if room <= 0 {
+		return 0
+	}
+	return int(math.Floor(float64(room) * p.BytesPerToken))
+}
+
+// validateDeriveProfile fails closed on a profile that cannot describe a
+// runnable geometry. Every message names the endpoint and the field so the
+// operator can fix the registry without reading this code.
+func validateDeriveProfile(endpointID string, p DeriveProfile) error {
+	if p.CtxTokens <= 0 {
+		return fmt.Errorf("model endpoint %q profile: ctx_tokens must be > 0", endpointID)
+	}
+	if p.MaxCompletionTokens <= 0 {
+		return fmt.Errorf("model endpoint %q profile: max_completion_tokens must be > 0", endpointID)
+	}
+	if p.MarginTokens < 0 {
+		return fmt.Errorf("model endpoint %q profile: margin_tokens must be >= 0", endpointID)
+	}
+	if p.BytesPerToken <= 0 {
+		return fmt.Errorf("model endpoint %q profile: bytes_per_token must be > 0", endpointID)
+	}
+	if p.MaxCompletionTokens+p.MarginTokens >= p.CtxTokens {
+		return fmt.Errorf("model endpoint %q profile: max_completion_tokens (%d) + margin_tokens (%d) must be < ctx_tokens (%d) — the prompt needs room too",
+			endpointID, p.MaxCompletionTokens, p.MarginTokens, p.CtxTokens)
+	}
+	if p.Thinking == nil {
+		return nil
+	}
+	switch p.Thinking.Policy {
+	case "on", "off":
+		if p.Thinking.BudgetTokens != 0 {
+			return fmt.Errorf("model endpoint %q profile: thinking.budget_tokens is only valid with policy \"budget\", got policy %q", endpointID, p.Thinking.Policy)
+		}
+	case "budget":
+		if p.Thinking.BudgetTokens <= 0 {
+			return fmt.Errorf("model endpoint %q profile: thinking.policy \"budget\" requires budget_tokens > 0", endpointID)
+		}
+	default:
+		return fmt.Errorf("model endpoint %q profile: thinking.policy %q is not one of on|off|budget", endpointID, p.Thinking.Policy)
+	}
+	return nil
 }
 
 type modelEndpointsFile struct {
@@ -156,6 +260,15 @@ func Load() (Config, error) {
 	cfg.EmbedTokenFile = os.Getenv("MEMOIRE_EMBED_TOKEN_FILE")
 	cfg.ForwardURL = os.Getenv("MEMOIRE_FORWARD_URL")
 	cfg.ForwardTokenPath = env("MEMOIRE_FORWARD_TOKEN_FILE", filepath.Join(home, "forward-token"))
+	cfg.ForwardPriorityAdapters = []string{"claude-code"}
+	if v, ok := os.LookupEnv("MEMOIRE_FORWARD_PRIORITY_ADAPTERS"); ok {
+		cfg.ForwardPriorityAdapters = nil
+		for _, a := range strings.Split(v, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				cfg.ForwardPriorityAdapters = append(cfg.ForwardPriorityAdapters, a)
+			}
+		}
+	}
 	cfg.SkewAlertSeconds = 60
 	if v := os.Getenv("MEMOIRE_SKEW_ALERT_SECONDS"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -247,6 +360,16 @@ func LoadModelEndpoints(path string) ([]ModelEndpoint, error) {
 	}
 	if len(f.Endpoints) == 0 {
 		return nil, fmt.Errorf("model endpoints config %s has no endpoints", path)
+	}
+	// A profile is optional; a present one must be coherent. Absent profiles
+	// keep the registry parsing exactly as it did before they existed.
+	for _, ep := range f.Endpoints {
+		if ep.Profile == nil {
+			continue
+		}
+		if err := validateDeriveProfile(ep.EndpointID, *ep.Profile); err != nil {
+			return nil, fmt.Errorf("model endpoints config %s: %w", path, err)
+		}
 	}
 	return f.Endpoints, nil
 }

@@ -3,6 +3,40 @@
 # Copyright (C) 2026 Michel Tomas
 set -uo pipefail
 
+# The attribution fork (memoire-attribute-claude.py) is a headless session of its
+# own: its hooks stay silent so the fork is never captured or injected into.
+[[ -n "${MEMOIRE_ATTRIB_FORK:-}" ]] && exit 0
+
+# Master switch — session-start injection is OFF unless MEMOIRE_INJECT is
+# on|1|true. Off prints nothing at all (no block, no health header, no
+# operating notes), makes no network call, reads no token. Same convention as
+# the other opt-in switches (memoire-subagent-lib.sh sa_switch_on, and
+# memoire-trigger-lib.sh tr_leg_switch for the process-environment fallback):
+# the last assignment of the key in $MEMOIRE_HOME/capture-tick.env wins when the
+# file carries it; otherwise the process environment decides. The helper is
+# inlined: sourcing the lib here would run its setup (LC_ALL=C, clock reads)
+# on every start and change the on-path bytes. Stdin is drained first so the
+# harness never meets an EPIPE.
+inject_switch_on() {
+  local f="${MEMOIRE_HOME:-$HOME/.memoire}/capture-tick.env" key=MEMOIRE_INJECT line val
+  if [[ -r "$f" ]]; then
+    line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$f" 2>/dev/null | tail -n 1)" || line=""
+    if [[ -n "$line" ]]; then
+      val="${line#*=}"
+      val="${val%%#*}"
+      val="$(printf '%s' "$val" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^[\"']//" -e "s/[\"']\$//" | tr '[:upper:]' '[:lower:]')"
+      [[ "$val" == on || "$val" == 1 || "$val" == true ]]
+      return
+    fi
+  fi
+  val="${MEMOIRE_INJECT:-}"; val="${val,,}"
+  [[ "$val" == on || "$val" == 1 || "$val" == true ]]
+}
+if ! inject_switch_on; then
+  cat >/dev/null 2>&1 || true
+  exit 0
+fi
+
 # memoire-inject-claude.sh — SessionStart hook: emit recent semantic Memoire
 # observations for the current project as additional context.
 #
@@ -20,6 +54,12 @@ set -uo pipefail
 # project's .memoire (or MEMOIRE_INJECT_CONTENT=off) replaces block 1's
 # content with a search-on-subject rule; state headers and operating notes
 # keep riding.
+# L0010 (2026-11-01): Memoire no longer derives, and its default reads serve
+# raw rows only; both blocks read the frozen pre-Hindsight derived rows through
+# an explicit include_derived=true. Enabling injection re-surfaces them.
+# Off by default: with MEMOIRE_INJECT unset the script prints nothing (see the
+# master switch above); MEMOIRE_INJECT=on restores everything below, with every
+# knob below unchanged. Pull retrieval (search / MCP tools) is not affected.
 # Fail-open: any error exits 0, each block independently, so session start is
 # never blocked.
 
@@ -172,10 +212,10 @@ if [[ "$MRP_SOURCE" == "basename" ]]; then
     done
     printf '# [memoire] project identity — no .memoire file in this repo\n'
     if [[ -n "$SUGGESTED" ]]; then
-      printf 'Captures use fallback key "%s". Propose to the operator (their decision): create %s/.memoire with `project: %s`, then run memoire-project-move to fold rows captured under the old key.\n\n' \
+      printf 'Captures use fallback key "%s". Propose to the operator (their decision): create %s/.memoire with `project: %s`, then have them run the re-key procedure (shared manual ~/.agents/shared/memoire-rekey.md) to fold rows captured under the old key.\n\n' \
         "$PROJECT" "$GIT_ROOT" "$SUGGESTED"
     else
-      printf 'Captures use fallback key "%s". Propose to the operator (their decision): create %s/.memoire with an explicit `project:` key, then run memoire-project-move to fold rows captured under the old key.\n\n' \
+      printf 'Captures use fallback key "%s". Propose to the operator (their decision): create %s/.memoire with an explicit `project:` key, then have them run the re-key procedure (shared manual ~/.agents/shared/memoire-rekey.md) to fold rows captured under the old key.\n\n' \
         "$PROJECT" "$GIT_ROOT"
     fi
   fi
@@ -279,6 +319,7 @@ if CALL_M="$(net_call_timeout)"; then
   RESPONSE="$(curl -sf -m "$CALL_M" --get \
     --data-urlencode "project=$PROJECT" \
     --data-urlencode "exclude_kind=raw" \
+    --data-urlencode "include_derived=true" \
     --data-urlencode "include_proposed=true" \
     --data-urlencode "limit=$FETCH_LIMIT" \
     "$BASE_URL/v1/timeline" \
@@ -318,6 +359,7 @@ if [[ "$NOTES_ENABLED" != "0" ]] && CALL_M="$(net_call_timeout)"; then
   NOTES_RESPONSE="$(curl -sf -m "$CALL_M" --get \
     --data-urlencode "project=$PROJECT" \
     --data-urlencode "exclude_kind=raw" \
+    --data-urlencode "include_derived=true" \
     --data-urlencode "can_instruct=true" \
     --data-urlencode "limit=$(( NOTES_LIMIT + 1 ))" \
     "$BASE_URL/v1/timeline" \

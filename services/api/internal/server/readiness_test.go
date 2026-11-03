@@ -173,3 +173,30 @@ func TestHealthVersionIsBuildStamped(t *testing.T) {
 		t.Fatalf("hostile stamp reached the wire: version = %q", v)
 	}
 }
+
+// /v1/health stays 200 when the store fails (liveness must not depend on the
+// database), and a lifetime counter it could not read is null, never 0: a
+// consumer diffing lifetime counts must not see a fake reset.
+func TestHealthStoreFailureIsNullNotZero(t *testing.T) {
+	cfg, store := newReadinessEnv(t)
+	cfg.SkewAlertSeconds = 300
+	handler := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("health status with a closed store = %d, want 200", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"last_write_epoch", "redaction_contract_violations", "clock_skew_future_events"} {
+		v, ok := body[k]
+		if !ok || v != nil {
+			t.Fatalf("%s = %v (present %v), want null", k, v, ok)
+		}
+	}
+}

@@ -9,7 +9,7 @@ COPY services/ui/ ./
 # vite outDir is ../api/internal/ui/dist → /src/services/api/internal/ui/dist
 RUN npm run build
 
-FROM golang:1.25 AS build
+FROM golang:1.26.10-trixie@sha256:8099dc5fa5fa2ad6ff91d5504bca9be822f501e4ccba681eeb2536ee875db87d AS build
 WORKDIR /src
 COPY go.work ./
 COPY services/api/go.mod services/api/go.sum* ./services/api/
@@ -31,6 +31,13 @@ RUN CGO_ENABLED=1 go build -tags sqlite_fts5 \
 # image as localhost/memoire:latest and brick the API container
 # (cdk8s review round-1 finding 1).
 FROM debian:bookworm-slim AS api
+# Pull the bookworm point-release security updates into the image: the base
+# tag floats, but its snapshot lags the security archive by days, and the
+# fleet image-scan gate blocks on any CRITICAL/HIGH advisory WITH a fix
+# available (infra docs/image-scanning.md). libssh2 CVE-2026-58050 held the
+# lane red from 2026-09-07 to 2026-09-10 for exactly this reason.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/memoire-api /usr/local/bin/memoire-api
 COPY schema /app/schema
@@ -45,21 +52,26 @@ CMD ["memoire-api"]
 # the lane-fresh gate), snapshot custody leg. Carries the operational
 # binaries, the scripts they exec, and the shell toolchain the scripts
 # assume. Built as a separate target: podman build --target ops.
-FROM golang:1.25 AS opsbuild
+FROM golang:1.26.10-trixie@sha256:8099dc5fa5fa2ad6ff91d5504bca9be822f501e4ccba681eeb2536ee875db87d AS opsbuild
 WORKDIR /src
 COPY --from=build /src /src
 RUN CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-derive ./services/api/cmd/derive \
  && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-queue ./services/api/cmd/queue \
  && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-purge ./services/api/cmd/purge \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-raw-pack ./services/api/cmd/rawpack \
  && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-redact-derived ./services/api/cmd/redactderived \
  && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-mint-token ./services/api/cmd/minttoken \
- && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-pgshadow ./services/api/cmd/pgshadow
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-pgshadow ./services/api/cmd/pgshadow \
+ && CGO_ENABLED=1 go build -tags sqlite_fts5 -o /out/memoire-triage ./services/api/cmd/triage
 
 FROM debian:bookworm-slim AS ops
 # tzdata: the CronJobs' quiet-hours math runs `date +%H` under
 # TZ=Europe/Paris — a slim base without zoneinfo silently falls back to
 # UTC (round-1 finding 8).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Same security-update pull as the api stage, before the package install so
+# the installed set and the base share one snapshot.
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
       bash curl jq ca-certificates age zstd sqlite3 rsync openssh-client util-linux tzdata \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
@@ -74,6 +86,10 @@ RUN rm -rf /app/scripts/export
 # sees an absolute schema dir regardless of cwd.
 ENV MEMOIRE_SCHEMA_DIR=/app/schema
 ENV MEMOIRE_DERIVE_BIN=/usr/local/bin/memoire-derive
+# The triage sweep resolves its binary relative to the scripts dir by
+# default ($ROOT/bin/memoire-triage = /app/bin/...) — point it at the
+# installed binary, same seam as MEMOIRE_QUEUE_BIN.
+ENV MEMOIRE_TRIAGE_BIN=/usr/local/bin/memoire-triage
 # Capture adapters resolve the queue writer relative to the scripts dir
 # ($ROOT/bin/memoire-queue = /app/bin/...) — point them at the installed
 # binary (round-1 finding 7).

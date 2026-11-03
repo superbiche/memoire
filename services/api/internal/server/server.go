@@ -47,6 +47,7 @@ var routes = []route{
 	{http.MethodGet, "/v1/observations", func(h handlers.Handler) http.HandlerFunc { return h.ListObservations }},
 	{http.MethodGet, "/v1/observations/{id}", func(h handlers.Handler) http.HandlerFunc { return h.GetObservation }},
 	{http.MethodGet, "/v1/observations/{id}/review-log", func(h handlers.Handler) http.HandlerFunc { return h.ListObservationReviewLog }},
+	{http.MethodGet, "/v1/observations/{id}/usage", func(h handlers.Handler) http.HandlerFunc { return h.ListObservationUsage }},
 	{http.MethodPost, "/v1/observations/{id}/review", func(h handlers.Handler) http.HandlerFunc { return h.ReviewObservation }},
 	{http.MethodPost, "/v1/observations/{id}/accept", func(h handlers.Handler) http.HandlerFunc { return h.AcceptObservation }},
 	{http.MethodPost, "/v1/observations/{id}/reject", func(h handlers.Handler) http.HandlerFunc { return h.RejectObservation }},
@@ -56,10 +57,16 @@ var routes = []route{
 	{http.MethodPost, "/v1/observations/{id}/confirm", func(h handlers.Handler) http.HandlerFunc { return h.ConfirmObservation }},
 	{http.MethodPost, "/v1/observations/{id}/lapse", func(h handlers.Handler) http.HandlerFunc { return h.LapseObservation }},
 	{http.MethodPost, "/v1/observations/{id}/rewrite", func(h handlers.Handler) http.HandlerFunc { return h.RewriteObservation }},
+	{http.MethodPost, "/v1/observations/{id}/action", func(h handlers.Handler) http.HandlerFunc { return h.ApplyReviewAction }},
 	{http.MethodGet, "/v1/sessions", func(h handlers.Handler) http.HandlerFunc { return h.ListSessions }},
 	{http.MethodGet, "/v1/sessions/{id}", func(h handlers.Handler) http.HandlerFunc { return h.GetSession }},
 	{http.MethodPost, "/v1/sessions/{id}/lapse-remaining", func(h handlers.Handler) http.HandlerFunc { return h.LapseSessionRemaining }},
 	{http.MethodPost, "/v1/admin/lapse-expired", func(h handlers.Handler) http.HandlerFunc { return h.LapseExpired }},
+	{http.MethodGet, "/v1/triage/queue", func(h handlers.Handler) http.HandlerFunc { return h.ListTriageQueue }},
+	{http.MethodGet, "/v1/triage/validated", func(h handlers.Handler) http.HandlerFunc { return h.ListTriageValidated }},
+	{http.MethodGet, "/v1/triage/genres", func(h handlers.Handler) http.HandlerFunc { return h.TriageGenres }},
+	{http.MethodGet, "/v1/triage/graduation-candidates", func(h handlers.Handler) http.HandlerFunc { return h.TriageGraduationCandidates }},
+	{http.MethodGet, "/v1/triage/override-rates", func(h handlers.Handler) http.HandlerFunc { return h.TriageOverrideRates }},
 	{http.MethodGet, "/v1/embeddings/missing", func(h handlers.Handler) http.HandlerFunc { return h.EmbeddingsMissing }},
 	{http.MethodPut, "/v1/embeddings", func(h handlers.Handler) http.HandlerFunc { return h.EmbeddingsUpsert }},
 	{http.MethodGet, "/v1/embeddings/freshness", func(h handlers.Handler) http.HandlerFunc { return h.EmbeddingsFreshness }},
@@ -173,13 +180,28 @@ func requiredScope(r *http.Request) string {
 		(strings.HasSuffix(r.URL.Path, "/accept") || strings.HasSuffix(r.URL.Path, "/reject") || strings.HasSuffix(r.URL.Path, "/dispute") ||
 			strings.HasSuffix(r.URL.Path, "/elevate") || strings.HasSuffix(r.URL.Path, "/demote") ||
 			strings.HasSuffix(r.URL.Path, "/confirm") || strings.HasSuffix(r.URL.Path, "/lapse") ||
-			strings.HasSuffix(r.URL.Path, "/rewrite")) {
+			strings.HasSuffix(r.URL.Path, "/rewrite") || strings.HasSuffix(r.URL.Path, "/action")) {
 		return "admin"
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/lapse-remaining") {
 		return "admin"
 	}
 	if r.URL.Path == "/v1/admin/lapse-expired" {
+		return "admin"
+	}
+	// Event soft-delete is a cross-project visibility gesture (Fibery #616
+	// slice C, operator ruling 2026-10-07): every capture hook token carries
+	// write, so leaving DELETE on the write default let any hook token — or
+	// any hook token leaked into a transcript — hide any event. Admin, like
+	// the observation review verbs. The purge path (memoire-purge) never
+	// used this route.
+	if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/events/") {
+		return "admin"
+	}
+	// Triage reads carry full observation text across projects plus the
+	// judge's reasoning about it — the same operator/triage posture as the
+	// review log, admin on every verb including the GETs.
+	if strings.HasPrefix(r.URL.Path, "/v1/triage/") {
 		return "admin"
 	}
 	// Embeddings seam (D218): worker-only surface. The work list leaks

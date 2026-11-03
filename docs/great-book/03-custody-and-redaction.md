@@ -1,15 +1,15 @@
 # 3. Custody & redaction
-*Great Book v0.6 edition — 2026-07-25.*
+*Great Book v0.7 edition — 2026-11-02.*
 
 Chapter 2 said capture takes everything and never filters. This chapter is the
 bill for that promise.
 
 If you record every session with every agent across every project, you have
-built two things at once. One is a memory. The other is the most complete
-record of your working life that exists anywhere, sitting on a disk, in
-plaintext, indexed for fast retrieval. Both of those are true at the same time,
-and a memory system that only talks about the first one is not being honest
-with you.
+built two things at once. One is a record you can ask questions of. The other
+is the most complete account of your working life that exists anywhere, sitting
+on a disk, in plaintext, indexed for fast retrieval. Both of those are true at
+the same time, and a system that only talks about the first one is not being
+honest with you.
 
 So this chapter is about three questions with uncomfortable answers. What
 happens to a secret that gets captured. What "delete" actually means. And what,
@@ -17,145 +17,193 @@ as of this version, is genuinely not solved.
 
 ## Custody is total, and that is a decision
 
-The rule is stated in `docs/VOCABULARY.md` as binding law: **event custody is
-total; taste is applied at derivation and injection, never by deleting
-capture.** Raw events are kept without expiry. There is no TTL on `raw/`, no
-rotation, no automatic pruning — nothing in the service or the scripts removes
-a raw file on a schedule of its own. *(Edition correction, 2026-08-05: this
-edition stated the invariant as "no code path anywhere deletes from raw
-custody", which is stronger than the truth and contradicts this chapter's own
-purge section. `memoire-purge` does remove matched files from `raw/` — dry-run
-by default, double-gated, and quarantine-first by default: an age-encrypted
-archive is written before destruction unless the operator passes the explicit
-`--no-quarantine` escape (D151). The invariant that actually holds is the one above:
-deletion of raw custody is never automatic and never a background policy, only
-a deliberate operator act.)*
+The rule is binding in the project's vocabulary: **event custody is total.**
+Raw events are kept without expiry. There is no TTL on `raw/`, no rotation, no
+automatic pruning — nothing in the service or the scripts destroys a raw record
+on a schedule of its own. The one tool that removes matched files from `raw/`
+is `memoire-purge`, which is dry-run by default, double-gated, and
+quarantine-first by default: an age-encrypted archive is written before
+destruction unless the operator passes the explicit `--no-quarantine` escape
+(D151). Deletion of custody is never automatic and never a background policy;
+it is a deliberate operator act.
 
 The reason is that selective capture is a decision made at the worst possible
-moment. At capture time nobody knows which session will matter. A filter
-written today encodes today's guess about tomorrow's relevance, and when the
-guess is wrong the evidence is simply gone, with no record that it ever
-existed. Total custody moves every judgment downstream, where it is reversible.
+moment. At capture time nobody knows which session will matter. A filter written
+today encodes today's guess about tomorrow's relevance, and when the guess is
+wrong the evidence is simply gone, with no record that it ever existed. Total
+custody moves every judgment downstream, where it is reversible.
 
-The counterweight is that raw events are **not projected by default**. There is
-no full-text index over raw events at all — only observations have an FTS
-surface — and the agent-facing surfaces exclude the `raw` kind by default, the
-MCP tools and the injector both setting `exclude_kind=raw` unless the caller
-clears it. So the raw layer is durable and reachable, but it does not leak into
-search results, injection blocks, or model prompts unless something explicitly
-asks for it. Custody and exposure are separate axes, and keeping them separate
-is what makes total custody survivable.
+Custody has three layers, and it helps to name them:
 
-Note that this fence is about *raw events*, not about unreviewed observations.
-Derived observations start in `proposed`, and proposed is not hidden: the MCP
-tools and the injector return it by default, marked `~`, while plain HTTP reads
-return `accepted` only unless the caller opts in. Chapter 2 gives the
-per-surface rule. Low trust is displayed here, not suppressed — the thing
-custody keeps out of the projection is the unprocessed raw layer.
+- **`raw/`** — one file per first-seen envelope, exactly as the queue held it
+  after redaction. This is the replay source: a store can be rebuilt from it.
+  The drainer writes the raw copy *before* the event row, and skips the copy
+  only for an exact repeat of an already-stored event (L0007), so first write
+  wins and a stored event always has custody behind it.
+- **The `events` table** — the event as a row: producer, project, session,
+  type, times, text and payload. It keeps everything, forever, unless purged.
+- **The raw projection** — one `kind=raw` observation per event, written in
+  the same transaction, carrying the same text, so reads and search do not scan
+  payloads. This layer is *not* custody. It is a convenience copy that can be
+  rebuilt from `events`, which is why a future decision to keep it small is
+  possible without touching the two layers above it (chapter 2 says where that
+  stands: an authorized experiment, not behaviour).
+
+Custody and exposure are separate axes. The default read surfaces return the
+raw projection — exact text, tool output, ids, dates — bounded by `days` or
+`occurred_after` if the caller asks. What they never do by default is return
+derived rows, which are a different thing and are retired (chapter 2).
+
+### Packs
+
+Flat files do not scale: the hub once ran out of inodes with 3.28 million files
+in `raw/`, one per POST (L0006). `memoire-raw-pack` packs each closed UTC day
+of envelopes into immutable compressed parts named `pack-YYYY-MM-DD.NNN.tar.zst`
+inside `raw/`, at most 200,000 members each, after a two-day grace. The rules
+are the interesting part:
+
+- Parts are **immutable**. A late-arriving envelope for an already-packed day
+  goes into the day's next part; only purge and an explicit rollback
+  (`--unpack`) remove a part name, and both advance the custody generation
+  first.
+- Every reader — replay, purge, the retroactive sweep, the snapshot — goes
+  through one walker that yields flat and packed files in one global name order,
+  each name once, with the same bytes and times, and refuses duplicates or
+  conflicts. `memoire-raw-pack --verify` prints a digest of the whole store that
+  is identical before and after packing.
+- Writes are verify-then-rename from a staging area *beside* `raw/`, never
+  inside it, and flat files are deleted only after the part is published and
+  checked.
+- Parts are plaintext compressed archives on the custody volume, which is
+  encrypted at rest on the hub. That deviates from the original policy of
+  age-encrypting archives at creation, by ruling (L0006): every read path would
+  have needed the key, which either sits on the same volume (no shred value) or
+  makes every purge wait for an off-machine key. The snapshot and quarantine
+  copies are age-encrypted.
+- The packer, purge, replay, the sweep and the snapshot share one custody lock,
+  and the packer refuses to run while a purge is half-finished.
 
 ## Redaction happens before the file exists
 
-The obvious place to strip secrets from a memory system is at read time, or at
-derivation, or in a nightly cleanup job. All three are wrong, and the reason is
-mechanical: by the time any of them runs, the secret has already been written
-to a queue file, copied into raw custody, and committed to the database. You
-are now scrubbing three surfaces and hoping you found them all.
+The obvious place to strip secrets from a record is at read time, or in a
+nightly cleanup job. Both are wrong, and the reason is mechanical: by the time
+either runs, the secret has already been written to a queue file, copied into
+raw custody, and committed to the database. You are now scrubbing three
+surfaces and hoping you found them all.
 
 Memoire redacts **at the source**, inside the queue writer, before the pending
 file is created. The consequence is stated in the code as plainly as it can be:
 neither the queue, nor the raw custody copies, nor the database ever holds the
-value. There is nothing to scrub afterwards because nothing was written. The
-ruleset is versioned (`redact-v1`), it runs over the event's text, payload, and
-metadata, it annotates the metadata with what it hit, and it is on by default
-— `MEMOIRE_REDACT=0` turns it off, which is a thing you should have a reason
-for.
+value. There is nothing to scrub afterwards because nothing was written.
 
-The rules are ordinary patterns, and knowing which ones exist tells you what
-this does and does not protect you from: PEM private-key blocks, JSON web
-tokens, AWS access keys, OpenAI keys, GitHub tokens including fine-grained
-personal access tokens, GitLab tokens, Slack tokens, bearer values in an
-`Authorization` header, and assignments to any variable whose name contains
-`SECRET`, `TOKEN`, `PASSWORD`, `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, or
-`CREDENTIAL`. That is a good list and it is not a complete one — a credential
-with a bespoke shape in a variable named `foo` will pass straight through. This
-is a backstop against the common accidents, not a guarantee.
+The ruleset is no longer Memoire's own. It is the shared fleet contract
+`redact-v7`, implemented once in a separate public Go module, Caviar, which
+Memoire's `internal/redact` package only forwards to; a rule change is a Caviar
+release and a version bump here, never an edit in this tree. The redactor runs
+over the event's text, payload and metadata, using explicit patterns and
+bounded capture procedures — no entropy guessing, no model calls. It annotates
+the envelope's metadata with what it hit and the rules version, and it is on by
+default: `MEMOIRE_REDACT=0` turns it off, which is a thing you should have a
+reason for.
 
-A match is replaced by `[REDACTED:<rule>:<hash8>]`, where the hash is a keyed
-HMAC of the secret, using a key generated per-installation at
-`~/.memoire/redaction-key` (mode `0600`). That design does more than it looks:
-the marker names *which* rule fired, so you can audit the ruleset's behavior;
-and because the digest is keyed and stable, the same secret produces the same
-marker everywhere, so you can tell whether two events leaked the same
+It **fails closed**. If the scrub cannot finish — a document nested past the
+depth limit — or the redaction key cannot be loaded, the write is refused and
+nothing reaches the queue. A redactor that falls back to writing the original
+when it errs protects nobody on the day it errs.
+
+The rules are ordinary patterns, and knowing the families tells you what this
+does and does not protect you from: private-key blocks, JSON web tokens, cloud
+and API keys with recognizable prefixes, source-host and chat-service tokens,
+bearer values in an `Authorization` header, and assignments to any variable or
+key whose name says it is a secret, token, password, key or credential. That is
+a good list and it is not a complete one — a credential with a bespoke shape in
+a variable named `foo` will pass straight through. This is a backstop against
+the common accidents, not a guarantee, and Caviar says the same of itself. The
+exact table is in Caviar, not here.
+
+A match is replaced by `[REDACTED:<rule>:<hash8>]`, where the hash is the first
+eight hex characters of an HMAC-SHA256 of the secret, keyed by a per-installation
+key generated at `$MEMOIRE_HOME/redaction-key` (mode `0600`). That does more than
+it looks: the marker names *which* rule fired, so you can audit the ruleset's
+behavior; and because the digest is keyed and stable, the same secret produces
+the same marker everywhere, so you can tell whether two events leaked the same
 credential or two different ones — without the store holding either.
 
-This law was ruled on 2026-07-02, as ruling 7 of `docs/GOVERNANCE-DESIGN.md`,
-and it overturned that document's own proposal. The design had put redaction on
-the API side; the operator overruled it, and the driver was not theoretical.
-The ruling records it in one line: Claude Code hooks were shipping the contents
-of changed secret files into the API *that day*. API-side redaction would have
-been a scrub after the fact of something the hook had already written to disk.
-The correction was flagged as the highest-priority implementation item in the
-design, and it has been live continuously since.
+This law was ruled on 2026-07-02, and it overturned the design document's own
+proposal. The design had put redaction on the API side; the operator overruled
+it, and the driver was not theoretical: Claude Code hooks were shipping the
+contents of changed secret files into the API *that day*. API-side redaction
+would have been a scrub after the fact of something the hook had already
+written to disk.
 
-One detail of that mechanism is worth pulling out because it generalizes. Some
-producers are contractually required to pre-redact before they hand anything
-over — the evidence adapter from the sibling project is one, by the contract in
-`docs/LIAISON-EVIDENCE-CONTRACT.md`. If the backstop redactor fires on an event
-from that adapter, the producer broke its contract. So the event is stamped as
-a contract violation, and the count is surfaced on `GET /v1/health` as
-`redaction_contract_violations`. And the stamp is **queue-writer-owned**: a
+One detail generalizes. Some producers are contractually required to pre-redact
+before they hand anything over — the evidence adapter from the sibling project
+is one (chapter 5). If the backstop redactor fires on an event from that
+adapter, the producer broke its contract. So the event is stamped as a contract
+violation, and the count is surfaced on `GET /v1/health` as
+`redaction_contract_violations`. The stamp is **queue-writer-owned**: a
 producer-supplied violation field is stripped unconditionally, redaction on or
 off, so a client cannot forge a clean bill of health for itself. A guard whose
 subject can set its own result is not a guard.
 
+The envelope also records which rules version stamped it. Older stock — an
+earlier `redact-v*` stamp, or none — is where to start looking when a rules
+bump means the stored corpus should be re-swept. `memoire-redact-derived` is
+that tool. Despite its name it has nothing to do with derived observations: it
+re-applies the current ruleset in place to the *stored rows* that were derived
+from raw custody — events, the observations table including the raw projection,
+and the audit-bearing text columns — in one repeatable-read transaction on
+PostgreSQL, dry-run by default, double-gated by `--apply` and
+`MEMOIRE_REDACT_DERIVED_APPLY=yes`. It does not rewrite `raw/` files; that is
+the retroactive sweep's job, below.
+
 ## Deleting is a visibility act
 
-`DELETE /v1/events/{id}` does not erase anything. It marks the row deleted —
-soft-delete columns, with a default `deleted_at_epoch IS NULL` filter applied to
-reads — and the row stops being returned. The bytes remain in the database and
-in raw custody.
+`DELETE /v1/events/{id}` does not erase anything. It marks the event and its
+projection row deleted — soft-delete columns, with a default
+`deleted_at_epoch IS NULL` filter applied to reads — and the row stops being
+returned. The bytes remain in the database and in raw custody. The route needs
+`admin` scope: every capture hook carries `write`, and a leaked hook token must
+not be able to hide events.
 
 This is called **visibility deletion**, and the project has been deliberate
-about never claiming more than that. Soft-delete shipped in the first version
-precisely so the distinction would be built in from the start rather than
-retrofitted after someone assumed otherwise.
-
-If you actually need the bytes gone, that is a different tool and a deliberate
-act. `memoire-purge` performs a hard delete that ignores soft-delete visibility
-entirely. What makes it trustworthy is the completeness of its reach, because a
-purge that misses one surface is worse than no purge — it produces confidence
-without erasure:
+about never claiming more than that. If you actually need the bytes gone, that
+is a different tool and a deliberate act. `memoire-purge` performs a hard
+delete that ignores soft-delete visibility. What makes it trustworthy is the
+completeness of its reach, because a purge that misses one surface is worse than
+no purge — it produces confidence without erasure:
 
 - It selects by project, by event ids, or by observation ids.
 - It cascades: the raw projection, source-linked observations, the review log,
   source links, and — on a project selector — sessions, derivation runs,
   project roots, and identity alerts.
-- It scans **all four file surfaces**: `raw/`, and the queue's `pending/`,
-  `inflight/`, and `failed/` directories including their error sidecars. Queue
-  envelopes are matched through the drainer's own normalization, so an event
-  that has not been ingested yet is still found.
+- It scans **all four file surfaces**: `raw/` (flat and packed), and the queue's
+  `pending/`, `inflight/` and `failed/` directories including their error
+  sidecars. Queue envelopes are matched through the drainer's own normalization,
+  so an event that has not been ingested yet is still found.
 - Matched files are quarantined under age encryption and then removed,
   all-or-error.
-- It runs through a phased, crash-safe intent journal (`pre-commit`, then
-  `committed`) reconciled against the database, so an interrupted purge can be
-  resumed with `--resume-intent` rather than leaving the store in an unknown
-  state. A corrupt custody manifest stops a destructive run.
-- It writes an audit tombstone (`purge.apply`) and bumps the custody
-  generation. The generation bump is what makes purge propagate to mirrors,
-  below.
-- `--vacuum` is the compaction lever: a WAL truncate checkpoint and a `VACUUM`
-  after the hard deletes, with full-text consistency preserved by the schema's
-  delete triggers.
+- It runs through a phased, crash-safe intent journal reconciled against the
+  database, so an interrupted purge can be resumed with `--resume-intent`
+  rather than leaving the store in an unknown state. A corrupt custody manifest
+  stops a destructive run.
+- It writes an audit tombstone and bumps the custody generation, which is what
+  makes purge propagate to mirrors, below.
 
-Like every destructive tool here, it is dry-run by default, double-gated
-(`--apply` plus `MEMOIRE_PURGE_APPLY=yes`), and refuses to run beside a live
-`memoire-api` or `memoire-derive` process.
+Like every destructive tool here, it is dry-run by default and double-gated
+(`--apply` plus `MEMOIRE_PURGE_APPLY=yes`). On SQLite it refuses to run beside a
+live `memoire-api` or `memoire-derive` process. On the PostgreSQL hub a process
+check cannot see other pods, so it refuses instead without
+`--i-have-quiesced-the-hub`, the operator's attestation that the hub is scaled
+down and its store jobs suspended; the tool never scales anything itself.
 
-The honest scope of the claim, as recorded in the conformance table: **secret
-deletion is solved at application level.** The physical-media caveat — that a
-deleted extent on a modern filesystem and SSD is not the same as a destroyed
-one — is documented in the purge package and is not something an application
-can solve.
+The honest scope of the claim: **secret deletion is solved at application
+level.** Two physical caveats ride with it. On SQLite, `--vacuum` compacts the
+file; on PostgreSQL the tool does not vacuum (autovacuum reclaims dead tuples),
+and database backups and write-ahead-log archives keep the deleted data until
+their own retention expires. And a deleted extent on a modern filesystem or SSD
+is not a destroyed one. Neither is something an application can solve; both are
+named in the tool's own report.
 
 ## The retroactive sweep, and what it cost
 
@@ -173,159 +221,113 @@ destroyed, and destroying them is a separate act performed after the archive
 has been verified.
 
 It ran on 2026-07-18, first as a copy-run against a duplicate of the store
-(D143), then live the same night on an explicit operator go-ahead (D144).
-The numbers: **277,430 files scanned, 670 carrying hits, 2,066 individual
+(D143), then live the same night on an explicit operator go-ahead (D144). The
+numbers: **277,430 files scanned, 670 carrying hits, 2,066 individual
 redactions, reconciliation balanced**, in about seven minutes of downtime. The
 generation was swapped and the originals were shredded after the 2.3 GB archive
 verified. That archive is the crypto-shred handle — the originals are
-recoverable only while its age key exists.
+recoverable only while its age key exists. The stored database rows were swept
+the following night with `memoire-redact-derived` (D145): 773 rows, convergence
+verified to zero.
 
-The derived stores were swept the following night with `memoire-redact-derived`
-(D145): 773 rows, 670 events and 103 observations, convergence verified to
-zero, about twenty-five minutes of downtime. Both tools take the service down
-rather than working around it, which is the right trade for an operation you
-run once.
-
-Two things about that sequence deserve to be said rather than smoothed over.
-
-First, a **sequencing drift was retroactively accepted**. The policy required
-assistant-turn ingest to wait until the sweep completed. It did not: roughly
-115,000 assistant-turn events (78,579 from Claude Code, 29,459 from Codex,
-6,258 from Qwen, 661 from opencode) went live before the live sweep ran. The
-operator accepted the drift on 2026-07-18, and the reasoning is specific rather
-than convenient — defense-at-source had been guarding every one of those new
-writes since 2026-07-02, and the copy-run proved zero leak-through after
-activation, so the exposure was always and only the pre-2026-07-02 corpus that
-the sweep targeted, which the ingest did not change. The same ruling ordered
-the live sweep that night.
-
-Second, a **standing caveat** came out of the derived sweep and has not been
-closed: `derivation_runs.input_hash` was not recomputed. Historical
-re-derivations can therefore mint new runs and duplicate proposed observations
-rather than deduplicating against the old ones. Redacting the derived store is
-not the same as rebuilding it, and the policy's derived-store *rebuild* step —
-re-deriving observations from the redacted generation — still has no dedicated
-tooling.
+A **sequencing drift** was retroactively accepted. The policy required
+assistant-turn ingest to wait until the sweep completed; roughly 115,000
+assistant-turn events went live before the live sweep ran. The operator accepted
+the drift on 2026-07-18, and the reasoning is specific rather than convenient —
+defense-at-source had been guarding every one of those new writes since
+2026-07-02, and the copy-run proved zero leak-through after activation, so the
+exposure was always and only the pre-2026-07-02 corpus that the sweep targeted.
 
 ## Mirrors, and the only lever that gives you time-to-gone
 
-Off-machine copies are governed by `docs/MIRROR-PROTOCOL.md`, which is the
-contract of record for the remote-custody gate. Its rules, briefly:
+Off-machine copies are governed by the project's mirror protocol, the contract
+of record for the remote-custody gate. Its rules, briefly:
 
 Mirrors receive **snapshot artifacts, never the live store** — nothing tails or
 replicates the live database, queue, or raw directories. Every artifact set is
-**generation-stamped**, in its path and in a plaintext manifest, and an
-artifact without a generation stamp must not be synced. **Purge propagates by
-replacement**: a purge bumps the generation, and the next snapshot run drops
-the old generation from staging while the push removes it from the landing
-zone, which never accumulates superseded generations. Sync is **push-only** —
-mirrors never write back into any Memoire surface, and the push identity is
-locked to its landing zone. Before any restore, manifest hash verification is
-mandatory rather than hygienic.
+**generation-stamped**, in its path and in a plaintext manifest, and an artifact
+without a generation stamp must not be synced. **Purge propagates by
+replacement**: a purge bumps the generation, and the next snapshot run drops the
+old generation from staging while the push removes it from the landing zone.
+Sync is **push-only** — mirrors never write back into any Memoire surface.
+Before any restore, manifest hash verification is mandatory rather than
+hygienic.
 
-Then there is rule 4, which is where the protocol stops promising and starts
+Then there is the rule where the protocol stops promising and starts
 confessing. The original promise was bounded remote retention: N artifact sets,
 a computable time-to-gone by file deletion. **On the actual pipeline that
 promise is unsatisfiable.** The transport archives rather than deletes:
 overwritten files accumulate in an archive directory, deleted files are never
-deleted remotely, and nothing prunes the archive. So the remote *file* lifecycle
-is unbounded, and the protocol says so in those words instead of restating a
-promise it cannot keep.
+deleted remotely, and nothing prunes the archive. So the remote *file*
+lifecycle is unbounded, and the protocol says so instead of restating a promise
+it cannot keep (ratified at D156).
 
-What carries time-to-gone instead is rule 5, the encryption layer. Every
-artifact is age-encrypted to a dedicated snapshot key **before it leaves the
-machine** — the transport's own encryption is not enough, because its keys give
-Memoire no shred handle. The lever is a **crypto-shred**: mint a new keypair,
-replace the recipient, run the snapshot and push (the tooling detects the
-recipient change and re-encrypts every staged artifact, and a matching
-generation never skips re-encryption), verify the push completed, and only
-*then* destroy the old key in both of its custody locations. Every pre-rotation
-remote artifact, including the archive copies the pipeline will never delete,
-becomes unreadable ciphertext.
+What carries time-to-gone instead is the encryption layer. Every artifact is
+age-encrypted to a dedicated snapshot key **before it leaves the machine**. The
+lever is a **crypto-shred**: mint a new keypair, replace the recipient, run the
+snapshot and push (the tooling detects the recipient change and re-encrypts
+every staged artifact), verify the push completed, and only *then* destroy the
+old key in both of its custody locations. Every pre-rotation remote artifact,
+including the archive copies the pipeline will never delete, becomes
+unreadable ciphertext. The order is the contract: destroying the old key before
+a verified post-rotation push destroys the live restore chain.
 
-The order is the contract, and getting it wrong is catastrophic in the
-ordinary direction: destroying the old key before a verified post-rotation push
-destroys the live restore chain.
+On the hub, the snapshot job runs `--push --raw-only`. It handles raw custody,
+which no database operator backs up for you. The database leg is not the
+snapshot's job there: CloudNativePG archives continuously with point-in-time
+recovery, and two backup systems for the same data is two things to keep correct
+(chapter 4).
 
-The protocol closes on a section called **Failure honesty**, and it is the part
-worth copying into any system you build. Between a purge and the next push,
+The protocol closes on **failure honesty**. Between a purge and the next push,
 purged data exists in the landing zone's previous artifact set. Between a purge
 and a key rotation, purged data exists on mirrors as ciphertext under a live
-key. Rule 7 forces both states to be *named in the purge record*: if the
-crypto-shred lever was not exercised, the purge record must state plainly that
-pre-purge ciphertext remains on mirrors under a live key, and until that is
-journaled the purge is complete locally but **open remotely** and must be
-reported that way.
+key. If the crypto-shred lever was not exercised, the purge record must say so
+plainly, and until that is journaled the purge is complete locally but **open
+remotely** and must be reported that way.
 
 ## What is not solved
 
-A release-grade manual that lists only capabilities is a sales document. Here
-is the current state of the unfinished work, taken from the conformance table
-that maps every clause of the retention and redaction policy (ruled 2026-07-07
-as liaison:D97) to its implementation status. That table is drift-guarded by
-`scripts/tests/retention-conformance-test.sh`, which asserts every status cell
-and additionally probes for the mechanical artifact any "implemented" or
-"manual-tooling" row claims — so a row cannot quietly disagree with the code.
-It was last verified on 2026-07-18.
+A manual that lists only capabilities is a sales document. Here is the current
+state of the unfinished work, drawn from the retention and redaction
+conformance table (which maps every clause of the ruled policy, liaison:D97, to
+its status) and from the code.
 
-- **Cold archives do not exist.** The policy calls for monthly compressed cold
-  archives that replace live data. There is no tooling for it. The snapshot
-  tooling produces *additive* mirror artifacts; it reads the store and deletes
-  nothing, so it is a backup surface and not a retention lever.
-- **Archive encryption is therefore also absent**, in the sense that there are
-  no cold archives to encrypt. The pattern exists — the retro-sweep's
-  quarantine tarball is age-encrypted at creation — but as manual tooling for a
-  different job.
+- **Cold archives exist, in a different shape than the policy.** The policy
+  called for monthly, age-encrypted archives at creation. What exists is daily
+  plaintext compressed parts on an encrypted volume (L0006). Nothing is
+  pruned, by design.
 - **The non-local custody gate has no enforcement mechanism.** It is policy
-  plus a table, and nothing in code stops someone from violating it. *(Edition
-  correction, 2026-08-05: this edition also said the gate was held closed by
-  the absence of any sync, and that the age-encrypted-artifact condition was
-  unmet. The snapshot tooling has since overtaken both: it produces
-  age-encrypted, generation-namespaced database and raw-custody artifacts and
-  pushes them off-site in three phases; the hub schedules that push nightly
-  for raw custody only (`--raw-only` — the database leg is owned by
-  CloudNativePG's continuous archiving, as chapter 4 describes). So artifacts
-  do leave the machine, encrypted, and the
-  age-encrypted-artifact condition is met. What has not changed is the part
-  this bullet is about — the gate is still policy plus a table, with no
-  mechanism behind it.)*
-- **Mirror rules 4 and 5 were amended against the real pipeline.** The
-  amendment was flagged as pending in the protocol rather than silently
-  rewritten, which is the correct handling. *(Edition correction, 2026-08-05:
-  the operator ratified that amendment on 2026-07-20 (D156, ruling 1) —
-  remote file-level retention is unsatisfiable on a copy-only pipeline, so
-  rotation of the dedicated snapshot key is the purge-propagation lever of
-  record. The protocol now carries the ratified status; this edition's
-  "pending" was already stale when it was published.)*
-- **The derived-store rebuild has no tooling**, and the un-recomputed input
-  hashes mean a historical re-derivation would mint duplicates.
+  plus a table; nothing in code stops someone from violating it. What does exist
+  is the encrypted, generation-stamped snapshot pipeline, so the
+  encrypted-artifact condition is met.
+- **The remote file lifecycle is unbounded.** The off-site transport never
+  deletes, and its archive directory has no pruning tooling. Crypto-shred is
+  therefore the only time-to-gone lever, and a second mirror destination is
+  proposed and not wired.
+- **PostgreSQL backups outlive a purge.** The purge tool deletes live rows; the
+  continuous archive and base backups keep them until their retention expires.
 - **Physical erasure is out of scope.** Application-level deletion is what is
   claimed; media-level destruction is not.
-- **The off-site pipeline has unfinished edges.** Its archive directory has no
-  pruning tooling, which is what makes the remote file lifecycle unbounded; a
-  second mirror destination is proposed and not wired; and the pipeline's own
-  nightly sweep has a known unresolved health fault. None of these break the
-  crypto-shred lever, which is precisely why that lever rather than file
-  deletion is the thing the protocol leans on.
+- **The conformance table lags.** It was last verified on 2026-08-23 and
+  predates the packs, the hub's snapshot push and the retirement of the
+  derivation lane; at least one row still describes a gate as held by the
+  absence of any sync. Treat a status cell as a claim with a date, not as the
+  current truth.
+- **The window on the raw projection is an experiment, not a behaviour.** L0010
+  authorizes measuring whether projection rows (and their indexes) for old
+  events can be removed while `events` and `raw/` stay whole, with a rehydration
+  step to rebuild a range on demand. Until the experiment reports and a
+  rehydration contract exists, nothing is evicted. This chapter will be
+  revised after it.
 
 Two smaller things are worth knowing rather than discovering. The audit log is
 **not** purged — purge tombstones survive the data they describe, on purpose, so
-that "this was deleted" remains answerable afterwards. And the conformance
-table's own "last verified" stamp reads 2026-07-18, which predates some of the
-mirror work it evaluates; at least one condition marked unmet may simply be
-unreconfirmed rather than genuinely open. A table that tells you when it was
-last checked is more useful than one that implies it is always current, but
-read the date.
-
-There is also one thing that is solved for this repository's operator and
-explicitly **not** shipped. Quarantine key custody here involves a password
-vault and a printed paper copy, wired through operator-personal infrastructure
-that is not part of Memoire and that this repository never reads. The
-conformance table carries a release note saying so directly: if the project is
-released, users get the sweep's `--age-recipient` flag and nothing else — key
-generation, custody, and backup are explicitly theirs, and the accompanying
-documentation must say so. This chapter is that documentation, and this is it
-saying so.
+that "this was deleted" remains answerable afterwards. And one thing is solved
+for this repository's operator and explicitly **not** shipped: quarantine key
+custody here involves a password vault and a printed paper copy, wired through
+operator-personal infrastructure that is not part of Memoire. If you run the
+retroactive sweep or purge with quarantine, you get the `--age-recipient` flag
+and nothing else — key generation, custody and backup are yours.
 
 ---
 

@@ -105,6 +105,19 @@ type searchHit struct {
 	OccurredAtEpoch int64  `json:"occurred_at_epoch"`
 	Provenance      string `json:"provenance,omitempty"`
 	CanInstruct     int    `json:"can_instruct"`
+	// Siblings are the hit's co-derived observations (same derivation run)
+	// that the API attached. The MCP server renders them and never fetches
+	// them: it stays a thin adapter over the HTTP surface.
+	Siblings []observationSibling `json:"siblings,omitempty"`
+}
+
+// observationSibling mirrors the API's textless sibling pointer
+// (db.ObservationSibling).
+type observationSibling struct {
+	ID          int64  `json:"id"`
+	Kind        string `json:"kind"`
+	ReviewState string `json:"review_state"`
+	CanInstruct int    `json:"can_instruct"`
 }
 
 type hitsResponse struct {
@@ -255,8 +268,44 @@ func compactLines(hits []searchHit) string {
 	lines := make([]string, 0, len(hits))
 	for _, h := range hits {
 		lines = append(lines, compactLine(h))
+		if line := siblingContinuationLine(h.Siblings); line != "" {
+			lines = append(lines, line)
+		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// siblingContinuationLine renders a hit's run-siblings as one indented
+// continuation line under the compact line, indented by two spaces:
+//
+//	↳ same run: [204165] task~, [204164] task~!
+//
+// `~` marks unreviewed (proposed or lapsed), `!` marks can_instruct=1 — the
+// same two markers the compact line uses. The compact line itself does not
+// change: memoire:D0238 pinned its field count, so the siblings ride their
+// own line. No text travels, so a caller spends memoire_get_observations
+// only on the ids it wants.
+//
+// Returns "" when the hit has no siblings, so a hit without any renders
+// exactly as before. The shape is written twice — once here, once in the
+// API's context renderer, which is a separate Go module — and
+// docs/INJECTION-AND-SEARCH.md is its single source.
+func siblingContinuationLine(siblings []observationSibling) string {
+	if len(siblings) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(siblings))
+	for _, sib := range siblings {
+		marker := ""
+		if sib.ReviewState == "proposed" || sib.ReviewState == "lapsed" {
+			marker = "~"
+		}
+		if sib.CanInstruct == 1 {
+			marker += "!"
+		}
+		parts = append(parts, fmt.Sprintf("[%d] %s%s", sib.ID, sib.Kind, marker))
+	}
+	return "  ↳ same run: " + strings.Join(parts, ", ")
 }
 
 func truncate(s string, n int) string {

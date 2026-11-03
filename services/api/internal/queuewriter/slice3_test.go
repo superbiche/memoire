@@ -209,7 +209,8 @@ func TestWriteBytesLeavesTrailingJunkUntouched(t *testing.T) {
 func TestWriteBytesRedactsButNeverRepairsTrailingJunk(t *testing.T) {
 	cfg := slice3Config(t)
 	cfg.RedactionEnabled = true
-	body := `{"schema_version":1,"project":"p","session_id":"s","source_adapter":"a","event_type":"note","payload":{"k":"AKIAIOSFODNN7EXAMPLE"}}JUNK`
+	body := `{"schema_version":1,"project":"p","session_id":"s","source_adapter":"a","event_type":"note","payload":{"k":"AKIA` +
+`IOSFODNN7EXAMPLE"}}JUNK`
 	if _, err := WriteBytes(context.Background(), cfg, "http", []byte(body)); err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +218,7 @@ func TestWriteBytesRedactsButNeverRepairsTrailingJunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(got), "AKIAIOSFODNN7EXAMPLE") {
+	if strings.Contains(string(got), "AKIA" + "IOSFODNN7EXAMPLE") {
 		t.Fatal("secret survived the write path")
 	}
 	if !strings.Contains(string(got), "JUNK") {

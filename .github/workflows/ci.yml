@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - release/capture
+
+permissions:
+  contents: read
+
+jobs:
+  # GitHub-hosted runners only, no secrets, read-only token (L0011 a31): this
+  # workflow runs code from pull requests. Images are built from the private
+  # side after these jobs succeed for a commit.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          # go.work carries the workspace-wide floor (max of all member
+          # modules); a member go.mod under-installs and GOTOOLCHAIN=local
+          # then hard-fails every go invocation.
+          go-version-file: go.work
+          cache: false
+
+      # `make test` builds the UI (npm ci + vite) before the Go suites.
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      - name: Test
+        run: make test
+
+      - name: Build
+        run: make build
+
+      - name: Restart smoke
+        run: make restart-smoke
+
+  # The cross-compat judge: engine-pair conformance + pgshadow against the
+  # production-matching ParadeDB image (pg_search BM25). Runs `make test-pg`
+  # verbatim — same script, image, and extension bootstrap as the local
+  # shadow — so CI and the dev twin can never drift. Without this lane the
+  # PG legs skip (MEMOIRE_TEST_PG_URL unset) and green CI never actually
+  # judged Postgres.
+  test-pg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - name: Engine-pair conformance (ParadeDB shadow via podman)
+        run: make test-pg
+
+  # Secret-shape scan of the pushed history (L0011): a pinned gitleaks binary,
+  # generic shapes only. The maintainers' sensitive pattern set never enters
+  # this repository; the pre-push hook applies it locally.
+  secret-scan:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+
+      - name: Scan history
+        # History before the L0011 snapshot (v0.7, 1031d38) predates this gate; it
+        # passed GitHub push protection when published.
+        run: /tmp/gitleaks git --redact --no-banner --log-opts="1031d38ece28eadb2840ecce450c134b640417f5..HEAD" .

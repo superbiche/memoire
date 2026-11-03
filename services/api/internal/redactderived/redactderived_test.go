@@ -17,7 +17,8 @@ import (
 	"memoire/services/api/internal/redact"
 )
 
-const obsHashedText = "rotate ghp_zyxwvutsrqponmlkjihgfedcba9876543210 now"
+const obsHashedText = "rotate ghp_" +
+	"zyxwvutsrqponmlkjihgfedcba9876543210 now"
 
 // Fixture through the real migration chain (db.Open runs schema/*.sql, so
 // FTS triggers and 0007 governance triggers are live — the test proves the
@@ -38,23 +39,38 @@ func openFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	for _, s := range fixtureStmts(t) {
+		if _, err := conn.Exec(s); err != nil {
+			t.Fatalf("fixture: %v\n%s", err, s)
+		}
+	}
+	return dbPath
+}
 
+// fixtureStmts is the seed shared by the SQLite fixture and the Postgres
+// engine-pair fixture (redactderived_pg_test.go): the same rows on both
+// engines, so the two reports and the two redacted stores must agree.
+func fixtureStmts(t *testing.T) []string {
+	t.Helper()
 	obsHash, err := derive.CanonicalContentHash("memoire", "task", obsHashedText)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// All secret-shaped values below are synthetic test fixtures.
-	stmts := []string{
+	return []string{
 		`INSERT INTO sessions(session_id, project, client, started_at_epoch, meta_json)
 		 VALUES ('s1', 'memoire', 'cc', 100,
 		         '{"note":"API_KEY=\"faketestsecretvalue1\""}')`,
 		`INSERT INTO events(idempotency_key, session_id, project, source_adapter, event_type, cwd,
 		                    payload_json, text, occurred_at_epoch, received_at_epoch)
 		 VALUES ('k1', 's1', 'memoire', 'claude-code', 'PostToolUse',
-		         '/home/x/sk-testfakecwd123456789012345/repo',
-		         '{"cmd":"export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789"}',
-		         'the key is sk-testfake123456789012345678 right here', 100, 100)`,
+		         '/home/x/sk-` +
+		         `testfakecwd123456789012345/repo',
+		         '{"cmd":"export GITHUB_TOKEN=ghp_` +
+		         `abcdefghijklmnopqrstuvwxyz0123456789"}',
+		         'the key is sk-` +
+		         `testfake123456789012345678 right here', 100, 100)`,
 		`INSERT INTO events(idempotency_key, session_id, project, source_adapter, event_type, cwd,
 		                    payload_json, text, occurred_at_epoch, received_at_epoch)
 		 VALUES ('k2', 's1', 'memoire', 'claude-code', 'PostToolUse', '/home/x/repo',
@@ -62,7 +78,8 @@ func openFixture(t *testing.T) string {
 		         'already handled: [REDACTED:openai-key:deadbeef] and op://vault/item', 100, 100)`,
 		`INSERT INTO observations(project, session_id, kind, text, occurred_at_epoch, created_at_epoch,
 		                          review_state, provenance)
-		 VALUES ('memoire', 's1', 'fact', 'aws key AKIAABCDEFGHIJKLMNOP was used', 100, 100,
+		 VALUES ('memoire', 's1', 'fact', 'aws key AKIA` +
+		         `ABCDEFGHIJKLMNOP was used', 100, 100,
 		         'accepted', 'inferred')`,
 		`INSERT INTO observations(project, session_id, kind, text, occurred_at_epoch, created_at_epoch,
 		                          review_state, provenance, can_instruct)
@@ -83,12 +100,6 @@ func openFixture(t *testing.T) string {
 		`INSERT INTO project_roots(project, root, source, first_seen_epoch, last_seen_epoch)
 		 VALUES ('memoire', '/home/x/dev/memoire', 'registry', 100, 100)`,
 	}
-	for _, s := range stmts {
-		if _, err := conn.Exec(s); err != nil {
-			t.Fatalf("fixture: %v\n%s", err, s)
-		}
-	}
-	return dbPath
 }
 
 // keyPath returns a path to an EXISTING redaction key (the tool refuses to
@@ -160,7 +171,8 @@ func TestPreflightBlocksSecretShapedIdentityPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := conn.Exec(`INSERT INTO project_identity_alerts(project, root, known_root, source, first_seen_epoch, last_seen_epoch)
-		VALUES ('memoire', '/home/x/sk-testfakeroot1234567890123/repo', '/home/x/dev/memoire', 'basename', 100, 100)`); err != nil {
+		VALUES ('memoire', '/home/x/sk-` +
+		`testfakeroot1234567890123/repo', '/home/x/dev/memoire', 'basename', 100, 100)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.Close(); err != nil {
@@ -225,7 +237,7 @@ func TestApplyRedactsAllSurfacesAndConverges(t *testing.T) {
 	dbPath := openFixture(t)
 	kp := keyPath(t)
 
-	if n := ftsCount(t, dbPath, "AKIAABCDEFGHIJKLMNOP"); n != 1 {
+	if n := ftsCount(t, dbPath, "AKIA" + "ABCDEFGHIJKLMNOP"); n != 1 {
 		t.Fatalf("fixture FTS must find the planted AWS key, got %d", n)
 	}
 
@@ -239,11 +251,11 @@ func TestApplyRedactsAllSurfacesAndConverges(t *testing.T) {
 
 	after := snapshot(t, dbPath)
 	for _, secret := range []string{
-		"sk-testfake123456789012345678",
-		"sk-testfakecwd123456789012345",
-		"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-		"ghp_zyxwvutsrqponmlkjihgfedcba9876543210",
-		"AKIAABCDEFGHIJKLMNOP",
+		"sk-" + "testfake123456789012345678",
+		"sk-" + "testfakecwd123456789012345",
+		"ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789",
+		"ghp_" + "zyxwvutsrqponmlkjihgfedcba9876543210",
+		"AKIA" + "ABCDEFGHIJKLMNOP",
 		"glpat-faketoken1234567890abc",
 		"faketokenabcdef123456",
 		"faketestsecretvalue1",
@@ -300,7 +312,7 @@ func TestApplyRedactsAllSurfacesAndConverges(t *testing.T) {
 	}
 
 	// FTS synced through the external-content AU trigger.
-	if n := ftsCount(t, dbPath, "AKIAABCDEFGHIJKLMNOP"); n != 0 {
+	if n := ftsCount(t, dbPath, "AKIA" + "ABCDEFGHIJKLMNOP"); n != 0 {
 		t.Fatalf("FTS still finds the AWS key after apply: %d", n)
 	}
 	if n := ftsCount(t, dbPath, "REDACTED"); n == 0 {
@@ -398,8 +410,16 @@ func TestTargetsCoverAllTextColumns(t *testing.T) {
 			"input_hash": true, "status": true, "model": true, "endpoint_id": true},
 		"sessions":               {"session_id": true, "project": true, "client": true, "principal_id": true},
 		"observation_review_log": {"from_state": true, "to_state": true, "actor": true, "action": true},
+		// Triage suggestions (0017): only reason_text quotes content. The
+		// rest are closed vocabularies and lane identity — verdict, genre
+		// slug, prompt version, model, actor, A/B arm.
+		"observation_triage_suggestions": {"prompt_version": true, "model": true, "actor": true,
+			"suggested_verdict": true, "reason_genre": true, "arm": true},
 		"audit_log": {"principal_id": true, "credential_id": true, "request_id": true,
 			"action": true, "resource_type": true, "resource_id": true},
+		// Attribution usage (0019): only reason quotes content; the rest are
+		// keys and the closed verdict vocabulary.
+		"observation_usage": {"session_id": true, "project": true, "verdict": true},
 	}
 
 	for table, cols := range enrolled {

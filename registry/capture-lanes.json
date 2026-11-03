@@ -1,0 +1,104 @@
+{
+  "schema": "memoire-capture-lanes/1",
+  "doc": "Memoire's declaration of which capture lane serves each fleet harness (liaison docs/design/HARNESS-PARITY.md § 2, B1: the harness inventory resolves agents and commands to harnesses; Memoire owns the decision whether a route has a verified native capture lane). Keys are the canonical harness ids of ~/.agents/harnesses.json. `native` is the lane for sessions run on the harness itself: `hooks` (hook scripts on the harness settings surface), `rollout-sweep` / `store-sweep` (a systemd user timer sweeping the harness's own session store, gated by an env flag in ~/.memoire/capture-tick.env), `extension` (a payload file copied onto the harness), or `none` with `applicable` — `false` when the harness has no native session at all (the route is n/a with the reason), `true` when native sessions exist but no reader does (a GAP, never n/a: an unimplemented applicable route stays red until implemented or covered by a filed upstream request). `acpx` names the lane for sessions driven through acpx: `boundaries` when the native lane already captures the turns (the journal adds prompt/result boundaries only), `journal` when the acpx journal is the only record (full capture). scripts/memoire-coverage.py validates every lane live and publishes ~/.agents/coverage/memoire.json; scripts/memoire-capture-acpx.sh derives boundaries-only mode from `acpx: boundaries` through the inventory's agent ownership — the former NATIVE_ADAPTERS shell list is gone.",
+  "harnesses": {
+    "cc": {
+      "native": {
+        "lane": "hooks",
+        "surface": "~/.claude/settings.json",
+        "scripts": [
+          "scripts/memoire-capture-claude.sh"
+        ],
+        "events": [
+          "UserPromptSubmit",
+          "PostToolUse",
+          "PostToolUseFailure"
+        ],
+        "timer": "memoire-capture-tick.timer",
+        "doc": "hook capture per prompt/tool plus the transcript tick (memoire-capture-claude-transcripts.sh)"
+      },
+      "acpx": "boundaries"
+    },
+    "codex": {
+      "native": {
+        "lane": "rollout-sweep",
+        "enable_env": "MEMOIRE_CAPTURE_CODEX",
+        "timer": "memoire-capture-codex-tick.timer",
+        "scripts": [
+          "scripts/memoire-capture-codex-rollout.sh",
+          "scripts/memoire-capture-codex-tick.sh"
+        ],
+        "doc": "rollout JSONL sweep under ~/.codex/sessions"
+      },
+      "acpx": "boundaries"
+    },
+    "qwen": {
+      "native": {
+        "lane": "rollout-sweep",
+        "enable_env": "MEMOIRE_CAPTURE_QWEN",
+        "timer": "memoire-capture-qwen-tick.timer",
+        "scripts": [
+          "scripts/memoire-capture-qwen-rollout.sh",
+          "scripts/memoire-capture-qwen-tick.sh"
+        ],
+        "doc": "chat JSONL sweep under ~/.qwen/projects"
+      },
+      "acpx": "journal",
+      "acpx_doc": "qwen-code has no acpx agent in the inventory; the lane is declared for completeness and is n/a while that holds"
+    },
+    "opencode": {
+      "native": {
+        "lane": "store-sweep",
+        "enable_env": "MEMOIRE_CAPTURE_OPENCODE",
+        "timer": "memoire-capture-opencode-tick.timer",
+        "scripts": [
+          "scripts/memoire-capture-opencode.sh",
+          "scripts/memoire-capture-opencode-tick.sh"
+        ],
+        "doc": "OpenCode SQLite store sweep"
+      },
+      "acpx": "boundaries"
+    },
+    "pi": {
+      "native": {
+        "lane": "extension",
+        "surface": "~/.pi/agent/extensions/memoire.js",
+        "source": "scripts/pi-extension/memoire.js",
+        "doc": "the extension queues entries on agent_settled"
+      },
+      "acpx": "boundaries"
+    },
+    "antigravity": {
+      "native": {
+        "lane": "none",
+        "applicable": false,
+        "reason": "Antigravity runs in the fleet only through acpx (isolated profile, no interactive CLI session store declared); the acpx journal is the record"
+      },
+      "acpx": "journal"
+    },
+    "muse": {
+      "native": {
+        "lane": "store-sweep",
+        "enable_env": "MEMOIRE_CAPTURE_MUSE",
+        "timer": "memoire-capture-muse-tick.timer",
+        "scripts": [
+          "scripts/memoire-capture-muse.sh",
+          "scripts/memoire-capture-muse-tick.sh"
+        ],
+        "doc": "Muse Code session-store sweep (~/.local/share/muse/sessions, root and subagent session.jsonl) decoded through `muse export`; capture-all plus turn projection; verified live 2026-10-17 (first tick 21:32 CEST, 19 units, 2867 events, 0 failed)"
+      },
+      "acpx": "boundaries"
+    }
+  },
+  "acpx_lane": {
+    "script": "scripts/memoire-capture-acpx.sh",
+    "exclusion_file": "~/.config/memoire/acpx-exclude",
+    "cursor": "~/.memoire/cursors/acpx-capture.json",
+    "timer": "memoire-capture-acpx-tick.timer",
+    "doc": "The acpx journal adapter is run by memoire-capture-acpx-tick.timer (installed by scripts/capture-acpx-tick-timer.sh install, gated by MEMOIRE_CAPTURE_ACPX=on in ~/.memoire/capture-tick.env). Before 2026-10-15 the lane advanced only when run by hand.",
+    "enable_env": "MEMOIRE_CAPTURE_ACPX",
+    "runner": "scripts/memoire-capture-acpx-tick.sh",
+    "installer": "scripts/capture-acpx-tick-timer.sh",
+    "queue_bin": "bin/memoire-queue"
+  }
+}

@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -54,6 +55,13 @@ type Store struct {
 	// is a quality upgrade, never a hard dependency (D157 release
 	// consideration).
 	hasPGSearch bool
+	// lastWrite is the highest received_at_epoch this process knows of:
+	// seeded from the exact max off the probe path, raised by every committed
+	// ingest and by the newest row HealthStats reads. It lets /v1/health
+	// report the max-receipt last write without scanning events. Until the
+	// seed lands, HealthStats reports the value as unknown.
+	lastWrite atomic.Int64
+	seed      lastWriteSeed
 	// hasPGVector is true when the Postgres deployment carries the
 	// provisioned vector lane (pgvector table + HNSW index, D218).
 	// Absence is graceful everywhere — hybrid fusion simply stays off.
@@ -167,6 +175,17 @@ type ObservationRecord struct {
 	CanEvidence       int     `json:"can_evidence"`
 	NeedsConfirmation int     `json:"needs_confirmation"`
 	NoiseCandidate    int     `json:"noise_candidate"`
+	// SupersedesID names the row this one replaced, when it replaced one: an
+	// operator rewrite (memoire:D146) or a later derivation cut restating an
+	// earlier cut's observation with more information (Fibery #344). The
+	// column has existed since schema/0001 and was write-only until #344 —
+	// filiation was recorded and unreadable. One pointer, no traversal: the
+	// chain read at retrieval is #335's job.
+	SupersedesID *int64 `json:"supersedes_id,omitempty"`
+	// Usage is the attribution-at-Stop aggregate (usage.go), attached by the
+	// read handlers that show it; nil when no memory_usage event names the
+	// row, which the UI must render as "no signal", not as zero use.
+	Usage *UsageSummary `json:"usage,omitempty"`
 }
 
 type ObservationReviewLogRecord struct {
@@ -332,15 +351,15 @@ type IngestResult struct {
 }
 
 type SearchHit struct {
-	ID              int64   `json:"id"`
-	SessionID       string  `json:"session_id,omitempty"`
-	Project         string  `json:"project"`
-	Kind            string  `json:"kind"`
-	ReviewState     string  `json:"review_state"`
-	SourceAdapter   string  `json:"source_adapter,omitempty"`
-	EventType       string  `json:"event_type,omitempty"`
-	Text    string `json:"text,omitempty"`
-	Snippet string `json:"snippet"`
+	ID            int64  `json:"id"`
+	SessionID     string `json:"session_id,omitempty"`
+	Project       string `json:"project"`
+	Kind          string `json:"kind"`
+	ReviewState   string `json:"review_state"`
+	SourceAdapter string `json:"source_adapter,omitempty"`
+	EventType     string `json:"event_type,omitempty"`
+	Text          string `json:"text,omitempty"`
+	Snippet       string `json:"snippet"`
 	// CapturedAtEpoch carries the observation's occurred_at_epoch under a
 	// misleading legacy name. It stays for back-compat — the review UI, the
 	// inject scripts and the parity tests read `captured_at_epoch` — and
@@ -356,6 +375,28 @@ type SearchHit struct {
 	Rank           float64 `json:"rank,omitempty"`
 	NoiseCandidate int     `json:"noise_candidate"`
 	CanInstruct    int     `json:"can_instruct"`
+	// DerivationRunID names the derivation run that produced the
+	// observation (schema/0004). Since Fibery #343 a run is one rhythm
+	// segment, so the run id is the story unit a hit belongs to. Empty for
+	// raw capture projections and for rows derived before the column.
+	DerivationRunID string `json:"derivation_run_id,omitempty"`
+	// Siblings are the other observations of the same derivation run —
+	// the co-derived story around this hit (Fibery #335). Handlers attach
+	// them after the search lanes return; the lanes never fill them. No
+	// text travels in a sibling, so the redaction and privacy surface is
+	// unchanged.
+	Siblings []ObservationSibling `json:"siblings,omitempty"`
+}
+
+// ObservationSibling is a textless pointer to a run-sibling observation.
+// It carries only what a consumer needs to decide whether to spend a
+// per-id fetch: the id, the kind, the governance state and the elevation
+// flag.
+type ObservationSibling struct {
+	ID          int64  `json:"id"`
+	Kind        string `json:"kind"`
+	ReviewState string `json:"review_state"`
+	CanInstruct int    `json:"can_instruct"`
 }
 
 // syncOccurredAt fills the legacy CapturedAtEpoch alias from the value the
@@ -368,6 +409,12 @@ type ObservationFilter struct {
 	SessionID       string `json:"session_id,omitempty"`
 	Kind            string `json:"kind,omitempty"`
 	ExcludeKind     string `json:"exclude_kind,omitempty"`
+	// OccurredAfterEpoch, when positive, bounds results to observations
+	// whose occurred_at_epoch is at or after it: the L0010 dated read
+	// window. Zero is no bound, additive like Limit; the handler layer
+	// parses and rejects malformed or negative values before the filter is
+	// ever built, so the store only ever sees a sane epoch.
+	OccurredAfterEpoch int64 `json:"occurred_after,omitempty"`
 	ReviewState     string `json:"review_state,omitempty"`
 	DerivationRunID string `json:"derivation_run_id,omitempty"`
 	Limit           int    `json:"limit,omitempty"`
@@ -393,6 +440,12 @@ type ObservationFilter struct {
 	// true on a store without a wired vector lane stays FTS-only (the
 	// lane preconditions always win over the wish).
 	Hybrid *bool `json:"hybrid,omitempty"`
+	// IncludeAgentAccepted lifts the feed actor-gate (triage lane v1, R-D)
+	// for reads that must show the operator everything — the review and
+	// browse surfaces. Every read leaves it false, which is the fail-closed
+	// default: an accepted row whose accept transition was rendered by an
+	// `agent:*` actor is feed-INELIGIBLE. See agentAcceptedExclusion.
+	IncludeAgentAccepted bool `json:"include_agent_accepted,omitempty"`
 }
 
 type ObservationReviewLogFilter struct {
@@ -408,6 +461,21 @@ type Stats struct {
 	LastWriteEpoch          int64 `json:"last_write_epoch"`
 	DBBytes                 int64 `json:"db_bytes"`
 	WALBytes                int64 `json:"wal_bytes"`
+	// LastWriteKnown is false when LastWriteEpoch is only a lower bound
+	// (HealthStats before its exact seed has landed). Stats always sets it.
+	LastWriteKnown bool `json:"-"`
+}
+
+// lastWriteSeed runs the exact max(received_at_epoch) scan for HealthStats
+// in the background, at most one at a time, retrying after a failure. Close
+// cancels a running scan.
+type lastWriteSeed struct {
+	mu      sync.Mutex
+	done    atomic.Bool
+	running bool
+	next    time.Time
+	cancel  context.CancelFunc
+	closed  bool
 }
 
 type Credential struct {
@@ -479,10 +547,30 @@ func openPostgres(dsn, schemaPGDir string) (*Store, error) {
 		return nil, err
 	}
 	handle := dbc{conn: conn, eng: EnginePostgres}
+	// D0249: PG store must be C-collated (SQLite BINARY parity). Checked
+	// BEFORE migrate so a mis-collated database never receives our DDL —
+	// fail-loud, not half-materialized.
+	if err := checkPGCollation(context.Background(), handle); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("REFUSING to open Postgres store: %w", err)
+	}
 	store := &Store{db: handle, rdb: handle, engine: EnginePostgres}
-	if err := store.migrate(schemaPGDir); err != nil {
+	// Schema appliers are serialized fleet-wide (2026-08-27 deadlock: two
+	// derive CronJobs opening at :03 re-ran 0001_baseline.sql concurrently and
+	// deadlocked). Taken AFTER the collation preflight on purpose — a
+	// mis-collated database is refused without ever queueing for the lock.
+	// Not deferred: the error branches close the pool before returning, and a
+	// deferred release would then run against a closed pool.
+	release, err := AcquirePGMigrateLock(context.Background(), conn)
+	if err != nil {
 		_ = conn.Close()
 		return nil, err
+	}
+	merr := store.migrate(schemaPGDir)
+	release()
+	if merr != nil {
+		_ = conn.Close()
+		return nil, merr
 	}
 	// Capability probe only — Open never provisions and never fails for
 	// pg_search reasons (round-1 finding 1: the optional quality upgrade
@@ -493,38 +581,181 @@ func openPostgres(dsn, schemaPGDir string) (*Store, error) {
 	return store, nil
 }
 
+// pgCollationOK is the decision half of the D0249 preflight: a memoire
+// Postgres store orders TEXT bytewise, like SQLite's BINARY collation. Only
+// "C" and its byte-identical alias "POSIX" qualify. Everything else —
+// including the frequently-confused "C.UTF-8", which is a UTF-8 locale and
+// NOT C ordering — is out of contract.
+func pgCollationOK(datcollate string) bool {
+	return datcollate == "C" || datcollate == "POSIX"
+}
+
+// pgLocaleProviderOK is the provider half of the D0249 preflight (review
+// residual 3, closed structurally): on PG15+ `datcollate` alone is blind —
+// an ICU-provider database can report datcollate='C' while ICU governs
+// ordering. Only the libc provider ('c', where datcollate is authoritative)
+// and the PG17+ builtin provider pinned to the 'C' locale order bytewise.
+// Everything else — ICU ('i') included — is out of contract.
+func pgLocaleProviderOK(provider, datlocale string) bool {
+	switch provider {
+	case "c":
+		return true
+	case "b":
+		return datlocale == "C"
+	default:
+		return false
+	}
+}
+
+// checkPGCollation refuses to open a Postgres store whose database is not
+// C-collated (memoire:D0249). A deployment mistake must not disguise itself
+// as a working store that silently orders text differently from SQLite and
+// from the replay port, so this fails startup instead of warning. The
+// refusal names the found and required collation and never the DSN.
+func checkPGCollation(ctx context.Context, conn dbc) error {
+	var datcollate string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT datcollate FROM pg_database WHERE datname = current_database()`).Scan(&datcollate); err != nil {
+		return fmt.Errorf("collation preflight: %w", err)
+	}
+	if !pgCollationOK(datcollate) {
+		return fmt.Errorf(`Postgres store out of contract (memoire:D0249): database collation is %q, memoire requires "C" (bytewise order, SQLite BINARY parity); recreate the database with LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0 and re-copy`, datcollate)
+	}
+
+	// Provider leg: pg_database.datlocprovider exists from PG15. Probing the
+	// catalog first keeps pre-15 servers (libc-only, datcollate authoritative)
+	// on the fast path without driver-specific undefined-column inspection.
+	var one int
+	err := conn.QueryRowContext(ctx,
+		`SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_database'::regclass AND attname = 'datlocprovider'`).Scan(&one)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("collation preflight: %w", err)
+	}
+	var provider string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT datlocprovider::text FROM pg_database WHERE datname = current_database()`).Scan(&provider); err != nil {
+		return fmt.Errorf("collation preflight: %w", err)
+	}
+	var datlocale string
+	if provider == "b" {
+		// The builtin provider is PG17+, where pg_database.datlocale exists.
+		if err := conn.QueryRowContext(ctx,
+			`SELECT COALESCE(datlocale, '') FROM pg_database WHERE datname = current_database()`).Scan(&datlocale); err != nil {
+			return fmt.Errorf("collation preflight: %w", err)
+		}
+	}
+	if !pgLocaleProviderOK(provider, datlocale) {
+		return fmt.Errorf(`Postgres store out of contract (memoire:D0249): database locale provider is %q, memoire requires libc with "C" collation (an ICU- or non-C-builtin-provider database can order text differently from SQLite BINARY even when datcollate reads "C"); recreate the database with LOCALE_PROVIDER libc LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0 and re-copy`, provider)
+	}
+	return nil
+}
+
+// bm25IndexState is the catalog snapshot of the pg_search BM25 index on
+// THE observations table. Two exact definitions are in force (a20 = A,
+// 2026-11-01): the original (id, text) index, and v2, which carries the
+// read-filter columns so pg_search can push the observationWhere
+// predicates INTO the Tantivy query instead of re-checking them as a
+// heap_filter (on the ~3M-row hub that heap_filter is the 12-15 s). Any
+// other relation under the two reserved names — a different definition,
+// an invalid (failed-build) index — is not usable and not droppable by
+// the reindex command.
+type bm25IndexState struct {
+	old, v2 bool // an index under that name exists
+	oldDef  bool // exists with the exact old definition + key_field=id (any validity)
+	v2Def   bool // exists with the exact v2 definition + key_field=id (any validity)
+	oldOK   bool // exists, valid, ready, exact old definition + key_field=id
+	v2OK    bool // exists, valid, ready, exact v2 definition + key_field=id
+}
+
+// The exact index definitions as rendered by pg_get_indexdef, with only
+// the schema qualification of the table left as a LIKE wildcard
+// (verified against ParadeDB 18-v0.24.3, the hub's image): the pdb
+// literal cast renders double-parenthesised, the reloption renders
+// UNQUOTED (key_field=id, not key_field='id').
+const (
+	bm25IndexOldName = "idx_observations_bm25"
+	bm25IndexV2Name  = "idx_observations_bm25_v2"
+
+	bm25IndexLikeOld = "CREATE INDEX " + bm25IndexOldName +
+		" ON %.observations USING bm25 (id, text) WITH (key_field=id)"
+	bm25IndexLikeV2 = "CREATE INDEX " + bm25IndexV2Name +
+		" ON %.observations USING bm25 (id, text, ((kind)::pdb.literal), ((project)::pdb.literal), ((review_state)::pdb.literal), ((session_id)::pdb.literal), ((derivation_run_id)::pdb.literal), occurred_at_epoch, deleted_at_epoch, noise_candidate, can_instruct) WITH (key_field=id)"
+)
+
+// pgSearchIndexV2Columns is the v2 index definition — the read-filter
+// surface of observationWhere: kind, project, review_state, session_id,
+// derivation_run_id as pdb.literal text columns (the cast is what makes
+// the bare `col = ?` clause pushable; NULL stays NULL, nothing is folded
+// to the empty string), and occurred_at_epoch, deleted_at_epoch,
+// noise_candidate, can_instruct as numeric columns.
+const pgSearchIndexV2Columns = "(id, text, (kind::pdb.literal), (project::pdb.literal), (review_state::pdb.literal), " +
+	"(session_id::pdb.literal), (derivation_run_id::pdb.literal), " +
+	"occurred_at_epoch, deleted_at_epoch, noise_candidate, can_instruct)"
+
+func pgSearchIndexState(ctx context.Context, conn interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (bm25IndexState, error) {
+	var st bm25IndexState
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&n); err != nil {
+		return st, err
+	}
+	if n == 0 {
+		return st, nil
+	}
+	err := conn.QueryRowContext(ctx, `SELECT
+			COALESCE(bool_or(ic.relname = '`+bm25IndexOldName+`'), false),
+			COALESCE(bool_or(ic.relname = '`+bm25IndexOldName+`'
+				AND am.amname = 'bm25'
+				AND pg_get_indexdef(i.indexrelid) LIKE '`+bm25IndexLikeOld+`'
+				AND EXISTS (SELECT 1 FROM unnest(ic.reloptions) o WHERE o = 'key_field=id')), false),
+			COALESCE(bool_or(ic.relname = '`+bm25IndexOldName+`'
+				AND i.indisvalid AND i.indisready
+				AND am.amname = 'bm25'
+				AND pg_get_indexdef(i.indexrelid) LIKE '`+bm25IndexLikeOld+`'
+				AND EXISTS (SELECT 1 FROM unnest(ic.reloptions) o WHERE o = 'key_field=id')), false),
+			COALESCE(bool_or(ic.relname = '`+bm25IndexV2Name+`'), false),
+			COALESCE(bool_or(ic.relname = '`+bm25IndexV2Name+`'
+				AND am.amname = 'bm25'
+				AND pg_get_indexdef(i.indexrelid) LIKE '`+bm25IndexLikeV2+`'
+				AND EXISTS (SELECT 1 FROM unnest(ic.reloptions) o WHERE o = 'key_field=id')), false),
+			COALESCE(bool_or(ic.relname = '`+bm25IndexV2Name+`'
+				AND i.indisvalid AND i.indisready
+				AND am.amname = 'bm25'
+				AND pg_get_indexdef(i.indexrelid) LIKE '`+bm25IndexLikeV2+`'
+				AND EXISTS (SELECT 1 FROM unnest(ic.reloptions) o WHERE o = 'key_field=id')), false)
+		FROM pg_index i
+		JOIN pg_class ic ON ic.oid = i.indexrelid
+		JOIN pg_am am ON am.oid = ic.relam
+		WHERE i.indrelid = 'observations'::regclass
+		  AND ic.relname IN ('`+bm25IndexOldName+`', '`+bm25IndexV2Name+`')`).Scan(&st.old, &st.oldDef, &st.oldOK, &st.v2, &st.v2Def, &st.v2OK)
+	if err != nil {
+		return st, err
+	}
+	return st, nil
+}
+
 // pgSearchIndexUsable is the single validator for the BM25 setup, shared
 // by the Open-time capability probe and the provisioning postcondition
 // (round-2 finding N1). It is anchored to THE observations table the
 // session resolves ('observations'::regclass — not a name match across
 // schemas), requires a valid+ready index under the bm25 access method,
-// the exact indexed attributes, and the key_field=id reloption. Any
+// one of the two exact accepted definitions, and the key_field=id
+// reloption. It accepts EITHER definition so the API runs on the old
+// index before the operator swap and on v2 after it (a20 = A); any
 // error means "not usable".
 func pgSearchIndexUsable(ctx context.Context, conn interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }) bool {
-	var n int
-	if err := conn.QueryRowContext(ctx,
-		`SELECT count(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&n); err != nil || n == 0 {
-		return false
-	}
-	var ok bool
-	err := conn.QueryRowContext(ctx, `SELECT
-			i.indisvalid AND i.indisready
-			AND am.amname = 'bm25'
-			AND pg_get_indexdef(i.indexrelid) LIKE '%USING bm25 (id, text)%'
-			AND EXISTS (
-				SELECT 1 FROM unnest(ic.reloptions) o WHERE o = 'key_field=id'
-			)
-		FROM pg_index i
-		JOIN pg_class ic ON ic.oid = i.indexrelid
-		JOIN pg_am am ON am.oid = ic.relam
-		WHERE i.indrelid = 'observations'::regclass
-		  AND ic.relname = 'idx_observations_bm25'`).Scan(&ok)
+	st, err := pgSearchIndexState(ctx, conn)
 	if err != nil {
 		return false
 	}
-	return ok
+	return st.oldOK || st.v2OK
 }
 
 // detectPGSearch is the Open-time capability probe: read-only, never
@@ -541,12 +772,23 @@ func detectPGSearch(conn dbc) bool {
 // assertions.
 func (s *Store) HasPGSearch() bool { return s.hasPGSearch }
 
-// ProvisionPGSearchIndex creates the BM25 index when the pg_search
-// extension is installed (clean no-op otherwise). This is the DEPLOYMENT
+// ProvisionPGSearchIndex provisions the BM25 index at the deployment
 // step — called from pgshadow Apply and test provisioning, deliberately
 // never from Open (round-1 finding 1: app-path DDL made the optional
-// upgrade a blocking startup dependency).
+// upgrade a blocking startup dependency). Clean no-op without the
+// pg_search extension. Post-a20 (2026-11-01, the one-one-time exception
+// to "migrations additive" granted for this index only):
+//   - a FRESH table (no index, no rows) gets v2 directly;
+//   - a table that already holds the old (id, text) index is NOT rebuilt
+//     here — on a multi-million-row store that build is an operator step
+//     (ReindexBM25Index), never an apply side-effect;
+//   - a table with rows but no index at all, and an index under either
+//     reserved name that is not its exact definition or is invalid,
+//     fail LOUD instead of touching anything.
 func ProvisionPGSearchIndex(ctx context.Context, conn *sql.DB) error {
+	// Clean no-op without the extension (the pre-2026-07-22 contract): a
+	// plain-Postgres deployment falls back to tsvector ranking and the
+	// pdb.* DDL below would fail with "schema pdb does not exist".
 	var n int
 	if err := conn.QueryRowContext(ctx,
 		`SELECT count(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&n); err != nil {
@@ -555,18 +797,303 @@ func ProvisionPGSearchIndex(ctx context.Context, conn *sql.DB) error {
 	if n == 0 {
 		return nil
 	}
-	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_observations_bm25
-		ON observations USING bm25 (id, text) WITH (key_field='id')`); err != nil {
+	st, err := pgSearchIndexState(ctx, conn)
+	if err != nil {
+		return err
+	}
+	switch {
+	case st.v2OK:
+		return nil
+	case st.oldOK:
+		return nil
+	case st.old && !st.oldDef:
+		return fmt.Errorf("bm25 index provisioning postcondition failed: %s exists but is not the expected pg_search index on observations(id, text) with key_field=id — inspect it before running reindex-bm25", bm25IndexOldName)
+	case st.v2 && !st.v2Def:
+		return fmt.Errorf("bm25 index provisioning postcondition failed: %s exists but is not the expected v2 definition — inspect it before running reindex-bm25", bm25IndexV2Name)
+	case st.old || st.v2:
+		// exact definition but invalid (a failed build): not rebuilt
+		// implicitly — reindex-bm25 drops the leftover and rebuilds.
+		which := bm25IndexOldName
+		if st.v2 {
+			which = bm25IndexV2Name
+		}
+		return fmt.Errorf("bm25 index provisioning postcondition failed: %s exists but is not valid+ready (a failed build) — run memoire-pgshadow reindex-bm25 to drop the leftover and rebuild", which)
+	}
+	var hasRows bool
+	if err := conn.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM observations)`).Scan(&hasRows); err != nil {
+		return err
+	}
+	if hasRows {
+		return fmt.Errorf("bm25 index provisioning postcondition failed: observations carries rows but has no bm25 index at all — provisioning does not build the index implicitly on a data-bearing table (a large build is an operator step); run memoire-pgshadow reindex-bm25")
+	}
+	if _, err := conn.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS `+bm25IndexV2Name+
+		` ON observations USING bm25 `+pgSearchIndexV2Columns+
+		` WITH (key_field='id')`); err != nil {
 		return err
 	}
 	// Postcondition (round-2 finding N1): IF NOT EXISTS matches by NAME
 	// only, so a pre-existing wrong relation under this name would make
-	// provisioning "succeed" while search later errors. The same validator
-	// the capability probe uses must pass here, or deployment fails loudly.
-	if !pgSearchIndexUsable(ctx, conn) {
-		return errors.New("bm25 index provisioning postcondition failed: idx_observations_bm25 exists but is not the expected pg_search index on observations(id, text) with key_field=id")
+	// provisioning "succeed" while search later errors. The same
+	// validator the capability probe uses must pass here, or deployment
+	// fails loudly.
+	st2, err := pgSearchIndexState(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if !st2.v2OK {
+		return fmt.Errorf("bm25 index provisioning postcondition failed: %s was created but does not validate as the expected v2 pg_search index", bm25IndexV2Name)
 	}
 	return nil
+}
+
+// ReindexBM25Index is the explicit operator step that swaps the BM25
+// index (a20 = A, 2026-11-01): it builds v2 CONCURRENTLY beside whatever
+// is present, verifies it is valid+ready (dropping an invalid leftover
+// and failing loudly otherwise), then DROPs the old index
+// CONCURRENTLY. Both indexes coexist the whole build (disk note,
+// RUNBOOK), and pg_search serves reads from EITHER definition, so the
+// swap is online — no window of unsearchability, no restart (the
+// capability is probed at Open and the planner picks the index per
+// query; a running hub starts using v2 as soon as the old one is
+// gone).
+//
+// Idempotence, by (v2, old) state:
+//   - v2 valid, old absent: no-op;
+//   - v2 valid, old present (an interrupted first run): resume — drop
+//     the old only, no rebuild (the v2 index OID is untouched);
+//   - old present, v2 absent: build v2, verify, drop old;
+//   - no index at all: build v2, verify;
+//   - v2 present but not valid+ready: drop the invalid leftover first
+//     (a normal DROP INDEX — a failed CONCURRENTLY build leaves an
+//     invalid index that must not be read), then the build path;
+//   - either name held by a relation that is NOT the exact expected
+//     definition: fail loudly and change nothing (an unknown object
+//     under a reserved name is the operator's to inspect).
+//
+// The build is NOT in a transaction (CONCURRENTLY forbids it); the
+// command still takes the schema-applier advisory lock (the same key
+// openPostgres and pgshadow.Apply take) so it never races another
+// DDL applier. A pinned session carries explicit lock_timeout and
+// statement_timeout sized for a large concurrent build: lock_timeout
+// bounds the wait for the final AccessExclusive pass while writers
+// continue (fail loud, re-run); statement_timeout is a backstop that
+// turns a wedged build into a loud error, not a hang.
+func ReindexBM25Index(ctx context.Context, conn *sql.DB, dryRun bool) (string, error) {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM pg_extension WHERE extname = 'pg_search'`).Scan(&n); err != nil {
+		return "", fmt.Errorf("reindex-bm25: read extension: %w", err)
+	}
+	if n == 0 {
+		return "", fmt.Errorf("reindex-bm25: the pg_search extension is not installed in this database — there is no BM25 index to swap (CREATE EXTENSION pg_search is an operator step, then re-run)")
+	}
+	if dryRun {
+		// Advisory snapshot: the dry run reads the catalog WITHOUT taking
+		// the schema-applier lock (a dry run must never serialize against
+		// a running apply) and says so in its output — the real run
+		// re-reads state under the lock and may derive a different plan
+		// (a20 = A, F2).
+		st, err := pgSearchIndexState(ctx, conn)
+		if err != nil {
+			return "", fmt.Errorf("reindex-bm25: read index state: %w", err)
+		}
+		report, _, _, err := bm25ReindexPlan(st)
+		if err != nil {
+			return "", err
+		}
+		return report + "reindex-bm25: dry-run: nothing executed (advisory snapshot: taken WITHOUT the schema-applier lock; the real run re-reads state under the lock and may derive a different plan)\n", nil
+	}
+	return reindexBM25Execute(ctx, conn)
+}
+
+// bm25ReindexSteps is the plan derived from one catalog read.
+type bm25ReindexSteps struct {
+	dropInvalidV2 bool
+	buildV2       bool
+	dropOld       bool
+}
+
+// bm25ReindexPlan derives the swap steps from a catalog read and renders
+// the operator report. It fails loud on a reserved name carrying an
+// unrecognized definition (an operator-minted index this command must
+// not touch). The end state (v2 valid, old absent) is the no-op. The
+// plan is derived from whatever read it is handed: the real run hands
+// it the state read UNDER the schema-applier lock, so the steps can
+// never describe a state a concurrent run has already finished
+// (a20 = A, F2); the dry run hands it the advisory snapshot.
+func bm25ReindexPlan(st bm25IndexState) (string, bool, bm25ReindexSteps, error) {
+	switch {
+	case st.old && !st.oldDef:
+		return "", false, bm25ReindexSteps{}, fmt.Errorf("reindex-bm25: %s exists but is not the expected (id, text) pg_search definition — it is not the index this command swaps; inspect and remove it first", bm25IndexOldName)
+	case st.v2 && !st.v2Def:
+		return "", false, bm25ReindexSteps{}, fmt.Errorf("reindex-bm25: %s exists but is not the expected v2 pg_search definition — it is not the index this command manages; inspect and remove it first", bm25IndexV2Name)
+	}
+	steps := bm25ReindexSteps{}
+	switch {
+	case st.v2OK && !st.old:
+		// already at the end state
+	default:
+		steps.dropInvalidV2 = st.v2 && !st.v2OK
+		steps.buildV2 = !st.v2OK
+		steps.dropOld = st.old
+	}
+	noop := !steps.dropInvalidV2 && !steps.buildV2 && !steps.dropOld
+	var b strings.Builder
+	fmt.Fprintf(&b, "reindex-bm25: state: %s=%s %s=%s\n",
+		bm25IndexOldName, stateLabel(st.old, st.oldDef, st.oldOK),
+		bm25IndexV2Name, stateLabel(st.v2, st.v2Def, st.v2OK))
+	if noop {
+		fmt.Fprintln(&b, "reindex-bm25: no-op: v2 already valid, old absent")
+		return b.String(), true, steps, nil
+	}
+	fmt.Fprintf(&b, "reindex-bm25: plan (lock_timeout=%s statement_timeout=%s, not in a transaction):\n",
+		bm25ReindexLockTimeout, bm25ReindexStatementTimeout)
+	step := 0
+	if steps.dropInvalidV2 {
+		step++
+		fmt.Fprintf(&b, "reindex-bm25:   %d. DROP INDEX CONCURRENTLY %s  (invalid leftover from a failed build — concurrent, never a plain DROP: that would stall every reader behind an open writer)\n", step, bm25IndexV2Name)
+	}
+	if steps.buildV2 {
+		step++
+		fmt.Fprintf(&b, "reindex-bm25:   %d. CREATE INDEX CONCURRENTLY %s ON observations USING bm25 %s WITH (key_field='id')\n", step, bm25IndexV2Name, pgSearchIndexV2Columns)
+	}
+	if steps.buildV2 {
+		step++
+		fmt.Fprintf(&b, "reindex-bm25:   %d. verify %s is valid+ready (an invalid leftover is dropped and the run fails loud)\n", step, bm25IndexV2Name)
+	}
+	if steps.dropOld {
+		step++
+		fmt.Fprintf(&b, "reindex-bm25:   %d. DROP INDEX CONCURRENTLY %s\n", step, bm25IndexOldName)
+	}
+	return b.String(), false, steps, nil
+}
+
+func stateLabel(present, def, ok bool) string {
+	switch {
+	case !present:
+		return "absent"
+	case !def:
+		return "present (UNRECOGNIZED definition)"
+	case !ok:
+		return "present (invalid)"
+	default:
+		return "present (valid)"
+	}
+}
+
+// bm25ReindexLockTimeout bounds the wait for the final exclusive pass of
+// CREATE INDEX CONCURRENTLY while writers continue; past it the run
+// fails loud (SQLSTATE 55P03) and the operator re-runs — it never hangs.
+// bm25ReindexStatementTimeout is the backstop for the build itself
+// (measured 2.55 s per 1M synthetic rows on a 16-worker workstation,
+// v2 ≈ 11% of the heap size; the multi-million-row hub with real raw
+// text scales off the heap, but stays far below hours).
+// Every drop in the swap path is CONCURRENTLY (a20 = A, F1): a plain
+// DROP INDEX queues an AccessExclusiveLock on observations, and behind
+// any open writer that pending exclusive request blocks EVERY new read
+// (AccessShare requests queue behind it) for up to lock_timeout — a
+// 30-minute hub-wide read stall for a bookkeeping statement.
+var (
+	bm25ReindexLockTimeout      = 30 * time.Minute
+	bm25ReindexStatementTimeout = 6 * time.Hour
+	bm25ReindexDDLCreate        = "CREATE INDEX CONCURRENTLY " + bm25IndexV2Name +
+		" ON observations USING bm25 " + pgSearchIndexV2Columns + " WITH (key_field='id')"
+	bm25ReindexDDLDropOld       = "DROP INDEX CONCURRENTLY " + bm25IndexOldName
+	bm25ReindexDDLDropInvalidV2 = "DROP INDEX CONCURRENTLY " + bm25IndexV2Name
+)
+
+// reindexBM25Execute runs the swap on ONE pinned session (a20 = A, F2):
+// the session takes the schema-applier advisory lock, then reads the
+// catalog, derives the steps, sets the DDL timeouts, runs the DDL and
+// verifies — ALL under the lock. The pre-lock plan was the race: a
+// queued second invocation derived its steps from a state a concurrent
+// run had already finished (v2 invalid, old present) and would have
+// dropped the freshly valid v2 the first run had built. Re-deriving
+// under the lock turns that second run into the no-op the operator
+// expects. database/sql pools connections, so the whole sequence must
+// ride the one pinned session (a plain ExecContext could put the lock
+// and the DDL on different sessions); the session is discarded (not
+// returned to the pool) because it carries the explicit timeouts. All
+// DDL statements are autocommit — CONCURRENTLY must not run inside a
+// transaction.
+func reindexBM25Execute(ctx context.Context, conn *sql.DB) (string, error) {
+	c, err := conn.Conn(ctx)
+	if err != nil {
+		return "", fmt.Errorf("reindex-bm25: pin session: %w", err)
+	}
+	release, err := AcquirePGMigrateLockOn(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	st, err := pgSearchIndexState(ctx, c)
+	if err != nil {
+		return "", fmt.Errorf("reindex-bm25: read index state (under the lock): %w", err)
+	}
+	report, noop, steps, err := bm25ReindexPlan(st)
+	if err != nil {
+		return "", err
+	}
+	if noop {
+		return report, nil
+	}
+	// The DDL bounds take over from the applier's 300s acquisition window:
+	// lock_timeout bounds the wait for the concurrent DDL while writers
+	// continue (a loud 55P03 past it, never a hang), statement_timeout is
+	// the build backstop. They take no placeholders; integer = ms.
+	if _, err := c.ExecContext(ctx, fmt.Sprintf("SET lock_timeout = %d", bm25ReindexLockTimeout.Milliseconds())); err != nil {
+		return "", fmt.Errorf("reindex-bm25: set lock_timeout: %w", err)
+	}
+	if _, err := c.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = %d", bm25ReindexStatementTimeout.Milliseconds())); err != nil {
+		return "", fmt.Errorf("reindex-bm25: set statement_timeout: %w", err)
+	}
+	if steps.dropInvalidV2 {
+		if _, err := c.ExecContext(ctx, bm25ReindexDDLDropInvalidV2); err != nil {
+			return "", fmt.Errorf("reindex-bm25: drop invalid %s: %w", bm25IndexV2Name, err)
+		}
+	}
+	if steps.buildV2 {
+		if _, err := c.ExecContext(ctx, bm25ReindexDDLCreate); err != nil {
+			// a failed CONCURRENTLY build can leave an invalid index
+			// behind: drop the leftover (best effort) so the next run
+			// starts from the state the operator expects, then fail loud.
+			if st, stErr := pgSearchIndexState(context.Background(), c); stErr == nil && st.v2 && !st.v2OK {
+				if _, dErr := c.ExecContext(context.Background(), bm25ReindexDDLDropInvalidV2); dErr != nil {
+					return "", fmt.Errorf("reindex-bm25: build failed and the invalid leftover could not be dropped either (build: %v; drop: %v)", err, dErr)
+				}
+			}
+			return "", fmt.Errorf("reindex-bm25: build failed (the invalid leftover, if any, was dropped; re-run): %w", err)
+		}
+		st, err := pgSearchIndexState(ctx, c)
+		if err != nil {
+			return "", fmt.Errorf("reindex-bm25: verify after build: %w", err)
+		}
+		if !st.v2OK {
+			if st.v2 && !st.v2OK {
+				if _, dErr := c.ExecContext(context.Background(), bm25ReindexDDLDropInvalidV2); dErr != nil {
+					return "", fmt.Errorf("reindex-bm25: %s built but is not valid+ready, and dropping the invalid leftover failed (drop: %v)", bm25IndexV2Name, dErr)
+				}
+			}
+			return "", fmt.Errorf("reindex-bm25: %s built but is not valid+ready (invalid leftover dropped; re-run)", bm25IndexV2Name)
+		}
+	}
+	if steps.dropOld {
+		if _, err := c.ExecContext(ctx, bm25ReindexDDLDropOld); err != nil {
+			return "", fmt.Errorf("reindex-bm25: drop old index: %w", err)
+		}
+		st, err := pgSearchIndexState(ctx, c)
+		if err != nil {
+			return "", fmt.Errorf("reindex-bm25: verify after drop: %w", err)
+		}
+		if st.old {
+			return "", fmt.Errorf("reindex-bm25: %s still present after DROP INDEX CONCURRENTLY", bm25IndexOldName)
+		}
+		if !st.v2OK {
+			return "", fmt.Errorf("reindex-bm25: %s no longer validates after the swap", bm25IndexV2Name)
+		}
+	}
+	return report, nil
 }
 
 // OpenReadOnly opens an OBSERVER store: no migrations, no provisioning,
@@ -607,6 +1134,13 @@ func OpenReadOnly(path string) (*Store, error) {
 			return nil, err
 		}
 		handle := dbc{conn: conn, eng: EnginePostgres}
+		// D0249 warn-path (operator-ruled 2026-08-23): an observer must be
+		// able to open a misconfigured store to observe it, so a contract
+		// violation is LOUD but never blocking here — the refusal belongs to
+		// the write authority (openPostgres) alone.
+		if err := checkPGCollation(context.Background(), handle); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: observer open of out-of-contract store: %v\n", err)
+		}
 		store := &Store{db: handle, rdb: handle, engine: EnginePostgres}
 		store.hasPGSearch = detectPGSearch(handle)
 		store.hasPGVector = detectPGVector(handle)
@@ -684,6 +1218,12 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 func (s *Store) Close() error {
+	s.seed.mu.Lock()
+	s.seed.closed = true
+	if s.seed.cancel != nil {
+		s.seed.cancel()
+	}
+	s.seed.mu.Unlock()
 	rerr := s.rdb.Close()
 	werr := s.db.Close()
 	if werr != nil {
@@ -1076,7 +1616,7 @@ func (s *Store) ListDerivationRuns(ctx context.Context, filter DerivationRunFilt
 }
 
 func (s *Store) InsertDerivedObservation(ctx context.Context, in DerivedObservationInput) (DerivedObservationResult, error) {
-	res, _, err := s.insertDerivedObservationGated(ctx, in, nil)
+	res, _, err := s.insertDerivedObservationGated(ctx, in, nil, nil)
 	return res, err
 }
 
@@ -1090,12 +1630,74 @@ func (s *Store) InsertDerivedObservation(ctx context.Context, in DerivedObservat
 // insert performed. When none are live, the insert proceeds and liveMatchID
 // is 0.
 func (s *Store) InsertDerivedObservationUnlessMatchedLive(ctx context.Context, in DerivedObservationInput, matchedIDs []int64) (DerivedObservationResult, int64, error) {
-	return s.insertDerivedObservationGated(ctx, in, matchedIDs)
+	return s.insertDerivedObservationGated(ctx, in, matchedIDs, nil)
 }
 
-func (s *Store) insertDerivedObservationGated(ctx context.Context, in DerivedObservationInput, matchedIDs []int64) (DerivedObservationResult, int64, error) {
+// DeriveSupersedeActor is the attributable system actor for a
+// derivation-time supersede (Fibery #344), in the LapseTTLActor mould: the
+// review-log row on the target names the mechanism, never a human.
+const DeriveSupersedeActor = "system:derive-supersede"
+
+// ObservationSupersedeOffer is the caller's PER-TARGET offer to supersede a
+// gate-matched row instead of being rejected against it (Fibery #344). The
+// gate classifies in Go; the store decides, because only the store can hold
+// the target's state and the insert in one transaction.
+//
+// Metadata replaces the input's meta_json when THIS offer is the one that
+// wins, so the persisted supersede block (target id and the three scores)
+// describes the supersede that actually happened. A run whose offer loses the
+// CAS therefore never carries a supersede block for a supersede it did not
+// perform.
+type ObservationSupersedeOffer struct {
+	TargetID int64
+	Metadata json.RawMessage
+}
+
+// DerivedObservationGateResult reports which of the gate's three outcomes the
+// transaction took. Exactly one of the three shapes:
+//
+//   - LiveMatchID > 0: rejected. No row was written, and the rejection stands
+//     on that row's in-transaction liveness (D212, unchanged).
+//   - SupersededID > 0: Result is the new proposed row, carrying
+//     supersedes_id, and the named target moved to superseded in the same
+//     transaction with its own review-log and audit rows.
+//   - both zero: an ordinary write.
+type DerivedObservationGateResult struct {
+	Result       DerivedObservationResult
+	LiveMatchID  int64
+	SupersededID int64
+}
+
+// InsertDerivedObservationSuperseding is the gated insert with the supersede
+// outcome available (Fibery #344). With no offers it behaves EXACTLY like
+// InsertDerivedObservationUnlessMatchedLive — same liveness check, same
+// rejection, same write — which is what the -no-supersede kill switch relies
+// on.
+//
+// When the row the transaction finds live carries an offer, the store attempts
+// the supersede: a compare-and-set to `superseded` guarded on the target still
+// being `proposed` AND live. The CAS predicate is narrower than the D208
+// verdict triple by construction, not by omission: `proposed` with
+// can_instruct=1 or provenance=user_confirmed is unreachable (elevation and
+// confirm both require `accepted`), so state plus liveness IS the full
+// snapshot for a proposed row. Zero rows affected means a concurrent writer
+// moved the target between the gate's read and this UPDATE; the outcome then
+// falls back to the ordinary gate decision re-taken against FRESH in-tx
+// state — never a duplicate insert, never a supersede of a row nobody
+// checked.
+func (s *Store) InsertDerivedObservationSuperseding(ctx context.Context, in DerivedObservationInput, matchedIDs []int64, offers []ObservationSupersedeOffer) (DerivedObservationGateResult, error) {
+	res, live, superseded, err := s.insertDerivedObservationSuperseding(ctx, in, matchedIDs, offers)
+	return DerivedObservationGateResult{Result: res, LiveMatchID: live, SupersededID: superseded}, err
+}
+
+func (s *Store) insertDerivedObservationGated(ctx context.Context, in DerivedObservationInput, matchedIDs []int64, offers []ObservationSupersedeOffer) (DerivedObservationResult, int64, error) {
+	res, live, _, err := s.insertDerivedObservationSuperseding(ctx, in, matchedIDs, offers)
+	return res, live, err
+}
+
+func (s *Store) insertDerivedObservationSuperseding(ctx context.Context, in DerivedObservationInput, matchedIDs []int64, offers []ObservationSupersedeOffer) (DerivedObservationResult, int64, int64, error) {
 	if err := in.Validate(); err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
 	now := time.Now().Unix()
 	if in.CreatedAtEpoch > 0 {
@@ -1104,7 +1706,7 @@ func (s *Store) insertDerivedObservationGated(ctx context.Context, in DerivedObs
 	if in.OccurredAtEpoch == 0 {
 		occurred, err := s.maxOccurredAtForEvents(ctx, in.SourceEventIDs)
 		if err != nil {
-			return DerivedObservationResult{}, 0, err
+			return DerivedObservationResult{}, 0, 0, err
 		}
 		in.OccurredAtEpoch = occurred
 	}
@@ -1130,40 +1732,80 @@ func (s *Store) insertDerivedObservationGated(ctx context.Context, in DerivedObs
 
 	// App-level invariant check (mirrors DB trigger).
 	if err := appInvariantCheck(in.Provenance, in.CanInstruct); err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
 	// Store-level provenance validation (contract: Derived observation insert).
 	if !allowedProvenance(in.Provenance) {
-		return DerivedObservationResult{}, 0, fmt.Errorf("invalid provenance %q: must be one of observed, inferred, user_confirmed, imported, generated", in.Provenance)
+		return DerivedObservationResult{}, 0, 0, fmt.Errorf("invalid provenance %q: must be one of observed, inferred, user_confirmed, imported, generated", in.Provenance)
 	}
 	if !allowedDerivationProvenance(in.Provenance) {
-		return DerivedObservationResult{}, 0, fmt.Errorf("invalid derivation provenance %q: must be one of observed, inferred, generated", in.Provenance)
+		return DerivedObservationResult{}, 0, 0, fmt.Errorf("invalid derivation provenance %q: must be one of observed, inferred, generated", in.Provenance)
 	}
 	if err := validateUsePolicy(in.Provenance, in.CanInstruct); err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
 	defer tx.Rollback()
 
-	if live, err := firstLiveObservation(ctx, tx, matchedIDs); err != nil {
-		return DerivedObservationResult{}, 0, err
-	} else if live > 0 {
-		return DerivedObservationResult{}, live, nil
+	// The gate's decision, in one transaction (Fibery #344 extends the D212
+	// shape rather than replacing it): a live matched row still blocks the
+	// insert, unless the caller offered to supersede that row AND the CAS
+	// below finds it exactly as the gate read it.
+	live, err := firstLiveObservation(ctx, tx, matchedIDs)
+	if err != nil {
+		return DerivedObservationResult{}, 0, 0, err
+	}
+	var supersedeTarget int64
+	if live > 0 {
+		offer, offered := supersedeOfferFor(offers, live)
+		if !offered {
+			return DerivedObservationResult{}, live, 0, nil
+		}
+		casHook("derive-supersede", live)
+		casRes, err := tx.ExecContext(ctx, `UPDATE observations SET review_state = 'superseded'
+			WHERE id = ? AND review_state = 'proposed' AND deleted_at_epoch IS NULL`, live)
+		if err != nil {
+			return DerivedObservationResult{}, 0, 0, err
+		}
+		affected, err := casRes.RowsAffected()
+		if err != nil {
+			return DerivedObservationResult{}, 0, 0, err
+		}
+		if affected == 0 {
+			// The target moved between the gate's read and this UPDATE. Re-take
+			// the ordinary decision against FRESH in-transaction state: if it
+			// (or a lower-scored match) is still live, this candidate is
+			// rejected exactly as it would have been today; if nothing is live
+			// any more, the insert proceeds ungated. Either way no supersede
+			// happened and no row was written twice.
+			refreshed, rerr := firstLiveObservation(ctx, tx, matchedIDs)
+			if rerr != nil {
+				return DerivedObservationResult{}, 0, 0, rerr
+			}
+			if refreshed > 0 {
+				return DerivedObservationResult{}, refreshed, 0, nil
+			}
+		} else {
+			supersedeTarget = live
+			if len(offer.Metadata) > 0 {
+				meta = offer.Metadata
+			}
+		}
 	}
 
 	if err := ensureDerivationRunExists(ctx, tx, in.DerivationRunID); err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
 
 	downgraded := false
 	if reviewState == "accepted" {
 		overlap, err := acceptedOverlapExists(ctx, tx, in.Project, in.Kind, in.ContentHash, in.SourceEventIDs)
 		if err != nil {
-			return DerivedObservationResult{}, 0, err
+			return DerivedObservationResult{}, 0, 0, err
 		}
 		if overlap {
 			reviewState = "proposed"
@@ -1179,28 +1821,75 @@ func (s *Store) insertDerivedObservationGated(ctx context.Context, in DerivedObs
 	err = tx.QueryRowContext(ctx, `INSERT INTO observations(
 		event_id, project, session_id, kind, text, source_adapter, event_type,
 		occurred_at_epoch, created_at_epoch, principal_id, confidence, meta_json,
-		review_state, derivation_run_id, content_hash, provenance, can_instruct, can_evidence, needs_confirmation, noise_candidate
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+		review_state, derivation_run_id, content_hash, provenance, can_instruct, can_evidence, needs_confirmation, noise_candidate,
+		supersedes_id
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 		nil, in.Project, nullString(in.SessionID), in.Kind, in.Text, nullString(in.SourceAdapter), nullString(in.EventType),
 		in.OccurredAtEpoch, now, principal, confidence, string(meta), reviewState, in.DerivationRunID, in.ContentHash,
-		nullString(in.Provenance), in.CanInstruct, in.CanEvidence, in.NeedsConfirmation, boolInt(in.NoiseCandidate)).Scan(&observationID)
+		nullString(in.Provenance), in.CanInstruct, in.CanEvidence, in.NeedsConfirmation, boolInt(in.NoiseCandidate),
+		nullInt64(supersedeTarget)).Scan(&observationID)
 	if err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
+	// Source-event links are THIS run's own (Fibery #344): a later cut has
+	// events of its own, unlike a rewrite, which copies the original's
+	// because an operator statement has none.
 	for _, eventID := range in.SourceEventIDs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO observation_source_events(observation_id, event_id, created_at_epoch)
 			VALUES (?, ?, ?)`, observationID, eventID, now); err != nil {
-			return DerivedObservationResult{}, 0, err
+			return DerivedObservationResult{}, 0, 0, err
+		}
+	}
+	if supersedeTarget > 0 {
+		// The target's transition is attributable and auditable in both
+		// directions, mirroring RewriteObservation: a review-log row on the
+		// target under the system actor, and an audit entry naming the
+		// successor. proposed -> superseded stays OUT of
+		// validateReviewTransition: like rewrite, this is its own verb with
+		// its own precondition (the CAS above), and the public state machine
+		// is not widened (memoire:D146).
+		if _, err := tx.ExecContext(ctx, `INSERT INTO observation_review_log(
+			observation_id, from_state, to_state, actor, reason_text, occurred_at_epoch
+		) VALUES (?, 'proposed', 'superseded', ?, ?, ?)`,
+			supersedeTarget, DeriveSupersedeActor,
+			fmt.Sprintf("superseded by derivation run %s", in.DerivationRunID), now); err != nil {
+			return DerivedObservationResult{}, 0, 0, err
+		}
+		auth, _ := authctx.From(ctx)
+		detailsJSON, err := json.Marshal(map[string]any{
+			"superseded_by":     observationID,
+			"derivation_run_id": in.DerivationRunID,
+			"from_state":        "proposed",
+		})
+		if err != nil {
+			return DerivedObservationResult{}, 0, 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(
+			principal_id, credential_id, request_id, action, resource_type, resource_id, details_json, created_at_epoch
+		) VALUES (?, ?, ?, 'observation.supersede', 'observation', ?, ?, ?)`,
+			nullString(auth.PrincipalID), nullString(auth.CredentialID), nullString(auth.RequestID),
+			fmt.Sprint(supersedeTarget), string(detailsJSON), now); err != nil {
+			return DerivedObservationResult{}, 0, 0, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return DerivedObservationResult{}, 0, err
+		return DerivedObservationResult{}, 0, 0, err
 	}
 	return DerivedObservationResult{
 		ID:                     observationID,
 		ReviewState:            reviewState,
 		DowngradedFromAccepted: downgraded,
-	}, 0, nil
+	}, 0, supersedeTarget, nil
+}
+
+// supersedeOfferFor finds the offer for a target id, if the caller made one.
+func supersedeOfferFor(offers []ObservationSupersedeOffer, targetID int64) (ObservationSupersedeOffer, bool) {
+	for _, o := range offers {
+		if o.TargetID == targetID {
+			return o, true
+		}
+	}
+	return ObservationSupersedeOffer{}, false
 }
 
 // firstLiveObservation returns the first id (in the given order) that is a
@@ -1400,6 +2089,30 @@ func (s *Store) AuditCount(ctx context.Context, action string) (int64, error) {
 	return count, err
 }
 
+// IsNoOpDuplicate reports whether ingesting in would write NOTHING: its
+// idempotency key is already stored AND its session row exists (Ingest's
+// duplicate path otherwise still inserts the session). The drainer skips
+// the raw/ custody copy of such an item (operator ruling a65): replaying
+// raw/ reproduces the store without it, first write wins.
+func (s *Store) IsNoOpDuplicate(ctx context.Context, in EventInput) (bool, error) {
+	if in.SourceAdapter == "" && in.ProducerID != "" {
+		in.SourceAdapter = in.ProducerID
+	}
+	payload := in.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage(`{}`)
+	}
+	key := in.IdempotencyKey(payload)
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM events WHERE idempotency_key = ?) +
+		(SELECT count(*) FROM sessions WHERE session_id = ?)`, key, in.SessionID).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n == 2, nil
+}
+
 func (s *Store) Ingest(ctx context.Context, in EventInput) (IngestResult, error) {
 	if in.SourceAdapter == "" && in.ProducerID != "" {
 		in.SourceAdapter = in.ProducerID
@@ -1493,9 +2206,15 @@ func (s *Store) Ingest(ctx context.Context, in EventInput) (IngestResult, error)
 	if err := recordProjectRootTx(ctx, tx, in.Project, payload, now); err != nil {
 		return IngestResult{}, err
 	}
+	if in.EventType == EventTypeMemoryUsage {
+		if err := s.projectMemoryUsageTx(ctx, tx, id, in, payload, occurred); err != nil {
+			return IngestResult{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return IngestResult{}, err
 	}
+	s.noteWrite(now)
 	return IngestResult{ID: id, ReceivedAtEpoch: now}, nil
 }
 
@@ -1586,7 +2305,7 @@ type ProjectIdentityAlert struct {
 // Text renders the operator-facing alert line (liaison:D239 item 5 wording).
 func (a ProjectIdentityAlert) Text() string {
 	return fmt.Sprintf(
-		"memoire identity conflict: key %q is arriving from %s (source %s, %d events) but is already used by %s — capture continues unblocked; create .memoire / set MEMOIRE_PROJECT there, then run memoire-project-move to fold the rows",
+		"memoire identity conflict: key %q is arriving from %s (source %s, %d events) but is already used by %s — capture continues unblocked; create .memoire / set MEMOIRE_PROJECT there, then have the operator run the re-key procedure (see the shared manual ~/.agents/shared/memoire-rekey.md; the SQLite-era scripts/memoire-project-move.sh does not apply to the Postgres hub) to fold the rows",
 		a.Project, a.Root, a.Source, a.EventCount, a.KnownRoot)
 }
 
@@ -1772,10 +2491,18 @@ type SessionObservationSummary struct {
 	Kind        string `json:"kind"`
 	Text        string `json:"text"`
 	ReviewState string `json:"review_state"`
+	// DerivationRunID is the run that wrote the row, EMPTY when it has none —
+	// an operator rewrite carries no run, and a row written outside the model
+	// path may not either. The near-dup gate's supersede outcome needs it to
+	// tell an EARLIER run's proposal from one this same run wrote moments ago
+	// (Fibery #344 review round-1 F1): a stale-running takeover REUSES the run
+	// id, so "not from this response" was not the same statement as "from an
+	// earlier run".
+	DerivationRunID string `json:"derivation_run_id,omitempty"`
 }
 
 // ListSessionObservationsForDerivation returns the session's existing
-// observations, newest first, capped at limit (0 means no cap). ALL
+// observations, newest first, capped at limit (0 means no cap). Nearly all
 // non-deleted review states are included — lapsed and rejected content is
 // deliberately visible so re-derivation neither resurrects reviewed-away
 // text nor re-proposes it (operator-ruled 2026-08-02). Soft-deleted rows
@@ -1783,13 +2510,24 @@ type SessionObservationSummary struct {
 // event text verbatim (Ingest writes one per event), and a derivation's
 // whole job is restating event content — comparing candidates against raw
 // mirrors would reject every good derivation of a captured prompt.
+//
+// SUPERSEDED rows are excluded too (Fibery #344). A superseded row's content
+// lives on in its successor by construction — an operator rewrite replaced it,
+// or a later cut restated it with containment >= 0.80 — and the successor is
+// in this same list. Listing both spends prompt bytes and gate comparisons on
+// a stale link, and a candidate rejected against a superseded row would be
+// rejected against text the store itself no longer surfaces.
 func (s *Store) ListSessionObservationsForDerivation(ctx context.Context, project, sessionID string, limit int) ([]SessionObservationSummary, error) {
 	if project == "" || sessionID == "" {
 		return nil, errors.New("project and session_id are required")
 	}
-	q := `SELECT id, kind, text, review_state FROM observations
+	// COALESCE, not a nullable scan: derivation_run_id is NULL for rows with no
+	// run (rewrite successors), and the gate's same-run comparison must see an
+	// empty string there rather than a scan error or a fabricated match.
+	q := `SELECT id, kind, text, review_state, COALESCE(derivation_run_id, '') FROM observations
 		WHERE project = ? AND session_id = ? AND deleted_at_epoch IS NULL
 		  AND kind <> 'raw'
+		  AND review_state <> 'superseded'
 		ORDER BY id DESC`
 	args := []any{project, sessionID}
 	if limit > 0 {
@@ -1804,7 +2542,7 @@ func (s *Store) ListSessionObservationsForDerivation(ctx context.Context, projec
 	var out []SessionObservationSummary
 	for rows.Next() {
 		var rec SessionObservationSummary
-		if err := rows.Scan(&rec.ID, &rec.Kind, &rec.Text, &rec.ReviewState); err != nil {
+		if err := rows.Scan(&rec.ID, &rec.Kind, &rec.Text, &rec.ReviewState, &rec.DerivationRunID); err != nil {
 			return nil, err
 		}
 		out = append(out, rec)
@@ -1827,7 +2565,7 @@ func (s *Store) GetObservationWithFilter(ctx context.Context, id int64, filter O
 	rec, err := s.getObservation(ctx, `SELECT o.id, o.event_id, o.project, o.session_id, o.kind, o.text,
 		o.source_adapter, o.event_type, o.occurred_at_epoch, o.created_at_epoch, o.deleted_at_epoch,
 		o.principal_id, o.confidence, o.review_state, o.derivation_run_id, o.content_hash,
-		o.provenance, o.can_instruct, o.can_evidence, o.needs_confirmation, o.noise_candidate
+		o.provenance, o.can_instruct, o.can_evidence, o.needs_confirmation, o.noise_candidate, o.supersedes_id
 		FROM observations o
 		WHERE o.id = ? AND `+where, args...)
 	if err != nil {
@@ -1910,7 +2648,7 @@ func (s *Store) ListObservations(ctx context.Context, filter ObservationFilter) 
 	rows, err := s.rdb.QueryContext(ctx, `SELECT o.id, o.event_id, o.project, o.session_id, o.kind, o.text,
 		o.source_adapter, o.event_type, o.occurred_at_epoch, o.created_at_epoch, o.deleted_at_epoch,
 		o.principal_id, o.confidence, o.review_state, o.derivation_run_id, o.content_hash,
-		o.provenance, o.can_instruct, o.can_evidence, o.needs_confirmation, o.noise_candidate
+		o.provenance, o.can_instruct, o.can_evidence, o.needs_confirmation, o.noise_candidate, o.supersedes_id
 		FROM observations o`+s.reviewQueueIndexHint(filter)+`
 		WHERE `+where+`
 		`+orderBy+`
@@ -2662,12 +3400,86 @@ func (s *Store) ListSessions(ctx context.Context, project string, proposedOnly b
 	return out, rows.Err()
 }
 
-// ApplyObservationReviewAction applies a flag-only review action (evidence-only,
-// restrict-scope, mark-stale) without changing review_state. It writes a review
-// log entry recording the action.
+// Review actions are the memoire:D125 flag-only path: they change FLAGS, not
+// review_state, and are recorded as append-only entries through the `action`
+// column on observation_review_log. Widening review_state with a pseudo-state
+// per verb was rejected there; adding an action VALUE here is the extension
+// point that ruling left open.
+//
+// The triage actions carry the operator's ENCOUNTER with a row whose state
+// already says what they want it to say. A TTL-lapsed row the operator reads
+// and agrees with cannot travel the lapse route — lapsed -> lapsed is not a
+// legal transition and must not become one — so without an action the human
+// ruling would be discarded, the suggestion would stay pending forever, and
+// the row would re-pin the queue on every load.
+const (
+	ReviewActionEvidenceOnly  = "evidence-only"
+	ReviewActionRestrictScope = "restrict-scope"
+	ReviewActionMarkStale     = "mark-stale"
+	// ReviewActionMarkNoise flags noise the judge missed. The operator's
+	// genre slug rides reason_text, prefixed, so the manual channel persists
+	// in an existing audited field.
+	ReviewActionMarkNoise = "mark-noise"
+	// ReviewActionAffirmLapse is "I read this lapsed row and it stays
+	// lapsed" — no flag changes at all, purely the record that a human
+	// encountered it.
+	ReviewActionAffirmLapse = "triage-affirm-lapse"
+	// ReviewActionDeclineElevation is the stage-2 decline: the operator
+	// read the confirm/elevate suggestion and is not taking it. Without it
+	// a declined suggestion could never leave "pending", and a verdict
+	// class that can never resolve is a metric that cannot be read.
+	ReviewActionDeclineElevation = "triage-decline-elevation"
+	// ReviewActionAffirmCurrent is "I read this and it already says what
+	// the judge suggested" — a row already confirmed or already elevated.
+	// The apply is a no-op on the row, but the ENCOUNTER is not: without a
+	// record the suggestion sits pending forever and the row keeps coming
+	// back, which is the same failure the lapsed encounter had.
+	ReviewActionAffirmCurrent = "triage-affirm-current"
+	// ReviewActionNotNoise is the de-noise pool's KEEP override: the
+	// operator read a row the machine condemned as noise and is taking it
+	// back out of the condemned batch. It does DOUBLE DUTY.
+	//
+	// (a) It marks the row's noise signal HANDLED, so the row leaves the
+	// de-noise pool permanently and returns to the ordinary triage queue,
+	// where the real accept/lapse question is still open. That is why it
+	// deliberately does NOT count as a queue-handling ruling the way
+	// mark-noise and triage-affirm-lapse do — a kept row has been rescued,
+	// not ruled on.
+	//
+	// (b) It is the override signal for the NOISE verdict class. A keep is
+	// exactly the flip a noise-lapse suggestion can suffer, and it is the
+	// same flip the graduation falsifier reads: one row the operator kept is
+	// one row a graduated genre would have destroyed unseen.
+	//
+	// It changes NO flag. `noise_candidate` is derivation's recorded opinion
+	// and clearing it would rewrite what derivation said; the keep is
+	// recorded as the append-only encounter it is, and the de-noise
+	// predicate reads the action rather than the flag.
+	ReviewActionNotNoise = "not-noise"
+)
+
+func reviewActions() []string {
+	return []string{ReviewActionEvidenceOnly, ReviewActionRestrictScope, ReviewActionMarkStale,
+		ReviewActionMarkNoise, ReviewActionAffirmLapse, ReviewActionDeclineElevation,
+		ReviewActionAffirmCurrent, ReviewActionNotNoise}
+}
+
+// IsTriageReviewAction reports whether an action is one of the triage
+// encounter actions — the ones that count as a human RULING on a suggestion,
+// as opposed to the older governance flag edits, which say nothing about a
+// suggested verdict.
+func IsTriageReviewAction(action string) bool {
+	return action == ReviewActionMarkNoise || action == ReviewActionAffirmLapse ||
+		action == ReviewActionDeclineElevation || action == ReviewActionAffirmCurrent ||
+		action == ReviewActionNotNoise
+}
+
+// ApplyObservationReviewAction applies a flag-only review action without
+// changing review_state. It writes a review log entry recording the action.
 func (s *Store) ApplyObservationReviewAction(ctx context.Context, id int64, action, reasonText string) (ObservationRecord, error) {
-	if !inSlice(action, "evidence-only", "restrict-scope", "mark-stale") {
-		return ObservationRecord{}, fmt.Errorf("review action must be one of evidence-only, restrict-scope, mark-stale, got %q", action)
+	if !inSlice(action, reviewActions()...) {
+		return ObservationRecord{}, fmt.Errorf("review action must be one of %s, got %q",
+			strings.Join(reviewActions(), ", "), action)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2700,6 +3512,16 @@ func (s *Store) ApplyObservationReviewAction(ctx context.Context, id int64, acti
 		updates = append(updates, "can_instruct = 0")
 		updates = append(updates, "can_evidence = 0")
 		updates = append(updates, "needs_confirmation = 1")
+	case ReviewActionMarkNoise:
+		updates = append(updates, "noise_candidate = 1")
+	case ReviewActionAffirmLapse, ReviewActionDeclineElevation, ReviewActionAffirmCurrent,
+		ReviewActionNotNoise:
+		// No flag changes: the entry IS the record. See the guarded
+		// snapshot re-read below, which stands in for the CAS these have
+		// no columns to perform. `not-noise` in particular must NOT clear
+		// `noise_candidate`: that flag is derivation's recorded opinion,
+		// and the keep is the operator's answer to it, not an erasure of
+		// it.
 	}
 
 	casHook("review-action", id)
@@ -2723,6 +3545,20 @@ func (s *Store) ApplyObservationReviewAction(ctx context.Context, id int64, acti
 			if ferr != nil {
 				return ObservationRecord{}, ferr
 			}
+			return ObservationRecord{}, stateConflict(nil, fresh,
+				"state changed concurrently: review_state is %q", fresh.ReviewState)
+		}
+	} else {
+		// A no-column action still must not log against a stale snapshot:
+		// re-read the governance triple INSIDE the transaction and conflict
+		// if it moved. This is the CAS these actions cannot express as an
+		// UPDATE, written as the guard it is rather than skipped.
+		fresh, ferr := getObservationForReview(ctx, tx, id)
+		if ferr != nil {
+			return ObservationRecord{}, ferr
+		}
+		if fresh.ReviewState != current.ReviewState || fresh.Provenance != current.Provenance ||
+			fresh.CanInstruct != current.CanInstruct {
 			return ObservationRecord{}, stateConflict(nil, fresh,
 				"state changed concurrently: review_state is %q", fresh.ReviewState)
 		}
@@ -2963,6 +3799,11 @@ func (s *Store) DeleteEvent(ctx context.Context, id int64) error {
 	return tx.Commit()
 }
 
+// ErrInvalidQuery marks a search query the store rejects by its own
+// validation (empty after FTS sanitizing). The handler maps it to 400; any
+// other search error is a store fault and maps to 500.
+var ErrInvalidQuery = errors.New("invalid search query")
+
 func (s *Store) Search(ctx context.Context, q, project string, limit int) ([]SearchHit, error) {
 	return s.SearchWithFilter(ctx, q, ObservationFilter{Project: project, Limit: limit})
 }
@@ -2970,7 +3811,7 @@ func (s *Store) Search(ctx context.Context, q, project string, limit int) ([]Sea
 func (s *Store) SearchWithFilter(ctx context.Context, q string, filter ObservationFilter) ([]SearchHit, error) {
 	match := SanitizeFTS(q)
 	if match == "" {
-		return nil, errors.New("empty search query")
+		return nil, fmt.Errorf("%w: empty search query", ErrInvalidQuery)
 	}
 	filter.Limit = normalizeLimit(filter.Limit, 20, 200)
 	if s.hybridActive(filter) {
@@ -2982,8 +3823,50 @@ func (s *Store) SearchWithFilter(ctx context.Context, q string, filter Observati
 // searchFTS is the FTS lane, exactly the pre-hybrid SearchWithFilter body.
 // limit is explicit because the hybrid path fetches a deeper candidate
 // list (hybridLaneK) than the caller's limit before fusion.
+// bm25SearchHeadPG / bm25SearchTailPG are the pg_search search SELECT of
+// record (the searchFTS bm25 branch, single-query and the two-stage inner
+// alike), split around the WHERE clause: <head> + where + <tail>. The
+// EXPLAIN tests (a20 = A) wrap these exact strings, so the asserted plan
+// is the plan of the production query, not a re-derivation of it.
+const (
+	bm25SearchHeadPG = `SELECT o.id, COALESCE(o.session_id, ''), o.project,
+		o.kind, o.review_state, COALESCE(o.source_adapter, ''), COALESCE(o.event_type, ''),
+		o.text, COALESCE(pdb.snippet(o.text, start_tag => '[', end_tag => ']'), ''),
+		o.occurred_at_epoch, pdb.score(o.id)::float8, o.noise_candidate, o.can_instruct,
+		COALESCE(o.provenance, ''), COALESCE(o.derivation_run_id, '')
+		FROM observations o
+		WHERE o.text ||| ? AND `
+	bm25SearchTailPG = `
+		ORDER BY pdb.score(o.id) DESC, o.id DESC
+		LIMIT ?`
+)
+
 func (s *Store) searchFTS(ctx context.Context, match string, filter ObservationFilter, limit int) ([]SearchHit, error) {
-	where, filterArgs := observationWhere(filter, "o")
+	base, gate, filterArgs := observationWhereSplit(filter, "o")
+	if s.engine == EnginePostgres && s.hasPGSearch && gate != "" {
+		// The feed actor-gate is fail-closed and rides every shape (D257:
+		// the predicate stays exclusion-shaped until a deliberate ruling
+		// moves it — including on kind='raw, where a migrated corpus can
+		// carry the pair the current API cannot write). But the NOT
+		// EXISTS is the one non-pushable predicate of the v2 index: in
+		// the inner read's WHERE it demotes the default shape to a
+		// full-fetch scan plus anti-join (measured 489 ms unbounded
+		// / 521 ms 30-day at 1M synthetic vs 25.5 / 26.9 for the
+		// gate-free Top-K inner; docs/RUNBOOK.md BM25 swap section). So on the bm25
+		// branch the gate moves to the outer of a two-stage read: the
+		// inner fetches the top M by the full (score DESC, id DESC)
+		// order — the Top-K scan, gate-free — and the outer applies the
+		// same NOT EXISTS on the ≤ M rows, keeping the order and LIMIT k
+		// (a20 = A, round-3 F4). The other branches keep the single
+		// query: the tsvector twin hoists the anti-join clean (no
+		// heap_filter either way), and the SQLite FTS lane's early-stop
+		// rank order is not the property at risk.
+		return s.searchBM25TwoStage(ctx, match, base, filterArgs, limit)
+	}
+	where := base
+	if gate != "" {
+		where = base + " AND " + gate
+	}
 	var query string
 	var args []any
 	if s.engine == EnginePostgres && s.hasPGSearch {
@@ -2993,18 +3876,12 @@ func (s *Store) searchFTS(ctx context.Context, match string, filter ObservationF
 		// the same candidate semantics as SanitizeFTS + FTS5, with bm25
 		// scoring (IDF included, the thing tsvector ranking lacks).
 		// pdb.snippet carries the [/]-bracket shape of FTS5 snippet().
+		// Gate-free shape only: the gated default read takes the two-stage
+		// return above.
 		args = append(args, ftsToMatchText(match))
 		args = append(args, filterArgs...)
 		args = append(args, limit)
-		query = `SELECT o.id, COALESCE(o.session_id, ''), o.project,
-		o.kind, o.review_state, COALESCE(o.source_adapter, ''), COALESCE(o.event_type, ''),
-		o.text, COALESCE(pdb.snippet(o.text, start_tag => '[', end_tag => ']'), ''),
-		o.occurred_at_epoch, pdb.score(o.id)::float8, o.noise_candidate, o.can_instruct,
-		COALESCE(o.provenance, '')
-		FROM observations o
-		WHERE o.text ||| ? AND ` + where + `
-		ORDER BY pdb.score(o.id) DESC, o.id DESC
-		LIMIT ?`
+		query = bm25SearchHeadPG + where + bm25SearchTailPG
 	} else if s.engine == EnginePostgres {
 		// tsvector twin of the FTS5 read: same sanitized tokens, same OR
 		// semantics, GIN-driven candidates. Two bm25-alignment choices from
@@ -3034,7 +3911,7 @@ func (s *Store) searchFTS(ctx context.Context, match string, filter ObservationF
 		o.kind, o.review_state, COALESCE(o.source_adapter, ''), COALESCE(o.event_type, ''),
 		o.text, ts_headline('simple', o.text, q, 'StartSel=[, StopSel=], MaxWords=16, MinWords=1'),
 		o.occurred_at_epoch, ts_rank_cd(o.text_tsv, q, 5)::float8, o.noise_candidate, o.can_instruct,
-		COALESCE(o.provenance, '')
+		COALESCE(o.provenance, ''), COALESCE(o.derivation_run_id, '')
 		FROM observations o, websearch_to_tsquery('simple', ?) q
 		WHERE o.text_tsv @@ q AND ` + where + `
 		ORDER BY ts_rank_cd(o.text_tsv, q, 5) DESC, o.id DESC
@@ -3054,7 +3931,7 @@ func (s *Store) searchFTS(ctx context.Context, match string, filter ObservationF
 		query = `SELECT o.id, COALESCE(o.session_id, ''), o.project,
 		o.kind, o.review_state, COALESCE(o.source_adapter, ''), COALESCE(o.event_type, ''),
 		o.text, snippet(observations_fts, 0, '[', ']', '...', 16), o.occurred_at_epoch, bm25(observations_fts), o.noise_candidate, o.can_instruct,
-		COALESCE(o.provenance, '')
+		COALESCE(o.provenance, ''), COALESCE(o.derivation_run_id, '')
 		FROM observations_fts
 		CROSS JOIN observations o ON o.id = observations_fts.rowid
 		WHERE observations_fts MATCH ? AND ` + where + `
@@ -3066,17 +3943,216 @@ func (s *Store) searchFTS(ctx context.Context, match string, filter ObservationF
 		return nil, err
 	}
 	defer rows.Close()
+	return scanFTSHits(rows)
+}
 
+// scanFTSHits maps the 15-column search projection (the shared shape of
+// searchFTS's three lanes and the two-stage bm25 read) into SearchHit rows.
+func scanFTSHits(rows *sql.Rows) ([]SearchHit, error) {
 	var hits []SearchHit
 	for rows.Next() {
 		var h SearchHit
-		if err := rows.Scan(&h.ID, &h.SessionID, &h.Project, &h.Kind, &h.ReviewState, &h.SourceAdapter, &h.EventType, &h.Text, &h.Snippet, &h.OccurredAtEpoch, &h.Rank, &h.NoiseCandidate, &h.CanInstruct, &h.Provenance); err != nil {
+		if err := rows.Scan(&h.ID, &h.SessionID, &h.Project, &h.Kind, &h.ReviewState, &h.SourceAdapter, &h.EventType, &h.Text, &h.Snippet, &h.OccurredAtEpoch, &h.Rank, &h.NoiseCandidate, &h.CanInstruct, &h.Provenance, &h.DerivationRunID); err != nil {
 			return nil, err
 		}
 		h.syncOccurredAt()
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
+}
+
+// bm25TwoStageWindowCap bounds the two-stage read's inner window: past it
+// the exclusion density is pathological (almost the whole candidate top is
+// agent-accepted) and the read falls back to the single-query form — exact,
+// the pre-a20 plan. 100k rows keeps that fallback in the seconds, not the
+// minutes, on the hub, while still out-reaching any realistic feed
+// (k ≤ 200). Package var (not const) so the test can shrink it to
+// exercise the clamp/fallback branch (round-4 F7); production never
+// rewrites it.
+var bm25TwoStageWindowCap = 100000
+
+// bm25TwoStageQuerySQL is the two-stage read of record (a20 = A, round-3
+// F4; one-statement form since round-4 F6). One SQL statement returns the
+// gated hits AND the inner-window occupancy from the SAME snapshot: the
+// window is a CTE (`w`) referenced twice — the gated branch and the
+// occupancy count — so the planner materializes it ONCE and both read the
+// same buffer. The round-3 form took the occupancy from a separate
+// statement (a later snapshot): a concurrent delete/purge between the two
+// could certify an underfilled window the read had seen full, and the
+// read would return short. The occupancy rides a sentinel row (the only
+// NULL-id row: a UNION ALL member fed by the one-row occupancy CTE), so
+// it is reported even when zero rows survive the gate — and it sorts last
+// (NULLS LAST) and is cut by the LIMIT exactly when k real rows survive
+// (the one case where it is not needed). The explicit column list names
+// the window's positional projection; the outer's score is the inner's
+// float8 — the exact image of the inner's order key (this engine's
+// pdb.score is float4, and float4 → float8 is exact) — so the order is
+// the total order and the read returns exactly the top-k eligible rows
+// of the single-query form.
+func bm25TwoStageQuerySQL(base string) string {
+	return `WITH w AS (` + bm25SearchHeadPG + base + bm25SearchTailPG + `),
+	wn AS (SELECT count(*) AS n FROM w)
+	SELECT g.id, g.session_id, g.project, g.kind, g.review_state,
+		g.source_adapter, g.event_type, g.text, g.snippet, g.occurred_at_epoch,
+		g.score, g.noise_candidate, g.can_instruct, g.provenance,
+		g.derivation_run_id, g.occ
+	FROM (
+		SELECT r.id, r.session_id, r.project, r.kind, r.review_state,
+			r.source_adapter, r.event_type, r.text, r.snippet,
+			r.occurred_at_epoch, r.score, r.noise_candidate, r.can_instruct,
+			r.provenance, r.derivation_run_id, NULL::bigint AS occ
+		FROM w r(id, session_id, project, kind, review_state,
+			source_adapter, event_type, text, snippet, occurred_at_epoch,
+			score, noise_candidate, can_instruct, provenance, derivation_run_id)
+		WHERE ` + agentAcceptedExclusion("r") + `
+		UNION ALL
+		SELECT NULL, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text,
+			NULL::text, NULL::text, NULL::text, NULL::bigint, NULL::float8,
+			NULL::int, NULL::int, NULL::text, NULL::text, wn.n
+		FROM wn
+	) g
+	ORDER BY g.score DESC NULLS LAST, g.id DESC NULLS LAST
+	LIMIT ?`
+}
+
+// bm25TwoStageAfterWindow is a test-only seam (round-4 F6 regression):
+// called after each window's single-statement read and before the
+// underfill decision. Nil in production. The test rewrites it to inject a
+// mutation between the read and the decision: a design that re-introduced
+// the separate occupancy probe would see the mutation (its probe is a
+// later snapshot) and certify an underfilled window; the one-statement
+// form cannot, because the decision uses the occupancy captured in the
+// statement's own snapshot.
+var bm25TwoStageAfterWindow func(ctx context.Context, s *Store, m int, n int)
+
+// searchBM25TwoStage is the PG bm25 read with the feed actor-gate in the
+// outer query (a20 = A, round-3 F4; D257's fail-closed predicate). It is
+// exact by construction: in the (score DESC, id DESC) total order,
+// whenever k rows survive the gate inside the window they are exactly the
+// top-k eligible — the k-th eligible sits at or inside the window iff the
+// window holds it, and everything above it in the order is in the window
+// with it — and a window that does not fill IS the whole candidate set.
+// The window starts at max(4k, 100) and grows x4 — clamped to
+// bm25TwoStageWindowCap, so no window larger than the cap is ever
+// executed (round-4 F7) — while the top keeps underfilling; at the cap
+// the read falls back to the single-query form (the gate in the inner's
+// WHERE — the pre-a20 shape).
+func (s *Store) searchBM25TwoStage(ctx context.Context, match, base string, filterArgs []any, limit int) ([]SearchHit, error) {
+	m := 4 * limit
+	if m < 100 {
+		m = 100
+	}
+	for {
+		hits, n, err := s.bm25TwoStageRead(ctx, match, base, filterArgs, m, limit)
+		if err != nil {
+			return nil, err
+		}
+		if bm25TwoStageAfterWindow != nil {
+			bm25TwoStageAfterWindow(ctx, s, m, n)
+		}
+		if len(hits) >= limit {
+			return hits, nil
+		}
+		// Fewer than k survivors: the sentinel (present exactly in this
+		// case — see the query) carries the window's occupancy from THIS
+		// statement: the window CTE is materialized once and the count and
+		// the gate read the same buffer, so a concurrent delete cannot
+		// certify an underfilled window the read saw full (round-4 F6:
+		// the round-3 two statements took two snapshots).
+		if n < 0 {
+			return nil, errors.New("two-stage bm25 read: underfilled window without its occupancy sentinel")
+		}
+		if n < m {
+			// Not full: the window held every candidate in this snapshot,
+			// so the gate ran over all of them — the result is the
+			// complete eligible set (or its top k), in the total order.
+			return hits, nil
+		}
+		if m >= bm25TwoStageWindowCap {
+			// Pathological exclusion density: fall back to the single
+			// query — exact, the pre-a20 plan.
+			return s.bm25GateedRead(ctx, match, base, filterArgs, limit)
+		}
+		next := 4 * m
+		if next > bm25TwoStageWindowCap {
+			next = bm25TwoStageWindowCap
+		}
+		m = next
+	}
+}
+
+// bm25TwoStageRead runs one window of the two-stage read: one statement
+// returns the gated hits (≤ k) and the window's occupancy (the sentinel
+// row; -1 when the sentinel was cut by the LIMIT — which only happens
+// when k real rows survived, i.e. the occupancy is not needed).
+func (s *Store) bm25TwoStageRead(ctx context.Context, match, base string, filterArgs []any, m, k int) ([]SearchHit, int, error) {
+	args := make([]any, 0, len(filterArgs)+3)
+	args = append(args, ftsToMatchText(match))
+	args = append(args, filterArgs...)
+	args = append(args, m, k)
+	rows, err := s.rdb.QueryContext(ctx, bm25TwoStageQuerySQL(base), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var hits []SearchHit
+	occupancy := -1
+	for rows.Next() {
+		// Pointer targets: the sentinel row (the only NULL-id row) is
+		// NULL in every data column, and a NULL in a REAL row would be
+		// a schema violation (the head COALESCEs the nullable columns),
+		// so both are checked after the scan.
+		var id, occ *int64
+		var sessionID, project, kind, reviewState *string
+		var sourceAdapter, eventType, text, snippet *string
+		var occurred *int64
+		var rank *float64
+		var noise, instruct *int
+		var provenance, runID *string
+		if err := rows.Scan(&id, &sessionID, &project, &kind, &reviewState, &sourceAdapter, &eventType,
+			&text, &snippet, &occurred, &rank, &noise, &instruct, &provenance, &runID, &occ); err != nil {
+			return nil, 0, err
+		}
+		if id == nil {
+			// The occupancy sentinel: the only NULL-id row.
+			if occ != nil {
+				occupancy = int(*occ)
+			}
+			continue
+		}
+		if sessionID == nil || project == nil || kind == nil || reviewState == nil || sourceAdapter == nil ||
+			eventType == nil || text == nil || snippet == nil || occurred == nil || rank == nil ||
+			noise == nil || instruct == nil || provenance == nil || runID == nil {
+			return nil, 0, fmt.Errorf("two-stage bm25 read: NULL in a real row (id %d)", *id)
+		}
+		h := SearchHit{
+			ID: *id, SessionID: *sessionID, Project: *project, Kind: *kind,
+			ReviewState: *reviewState, SourceAdapter: *sourceAdapter, EventType: *eventType,
+			Text: *text, Snippet: *snippet, OccurredAtEpoch: *occurred, Rank: *rank,
+			NoiseCandidate: *noise, CanInstruct: *instruct, Provenance: *provenance,
+			DerivationRunID: *runID,
+		}
+		h.syncOccurredAt()
+		hits = append(hits, h)
+	}
+	return hits, occupancy, rows.Err()
+}
+
+// bm25GateedRead is the single-query form — the gate in the inner read's
+// WHERE (the pre-a20 plan: the full candidate fetch with the hash
+// anti-join). Exact; the fallback of searchBM25TwoStage past the window
+// cap.
+func (s *Store) bm25GateedRead(ctx context.Context, match, base string, filterArgs []any, limit int) ([]SearchHit, error) {
+	args := make([]any, 0, len(filterArgs)+2)
+	args = append(args, ftsToMatchText(match))
+	args = append(args, filterArgs...)
+	args = append(args, limit)
+	rows, err := s.rdb.QueryContext(ctx, bm25SearchHeadPG+base+" AND "+agentAcceptedExclusion("o")+bm25SearchTailPG, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanFTSHits(rows)
 }
 
 func (s *Store) Timeline(ctx context.Context, project string, limit int) ([]SearchHit, error) {
@@ -3089,7 +4165,7 @@ func (s *Store) TimelineWithFilter(ctx context.Context, filter ObservationFilter
 	args = append(args, filter.Limit)
 	rows, err := s.rdb.QueryContext(ctx, `SELECT o.id, COALESCE(o.session_id, ''), o.project,
 		o.kind, o.review_state, COALESCE(o.source_adapter, ''), COALESCE(o.event_type, ''), o.text, o.occurred_at_epoch, o.noise_candidate, o.can_instruct,
-		COALESCE(o.provenance, '')
+		COALESCE(o.provenance, ''), COALESCE(o.derivation_run_id, '')
 		FROM observations o WHERE `+where+`
 		ORDER BY o.occurred_at_epoch DESC, o.id DESC
 		LIMIT ?`, args...)
@@ -3100,7 +4176,7 @@ func (s *Store) TimelineWithFilter(ctx context.Context, filter ObservationFilter
 	var hits []SearchHit
 	for rows.Next() {
 		var h SearchHit
-		if err := rows.Scan(&h.ID, &h.SessionID, &h.Project, &h.Kind, &h.ReviewState, &h.SourceAdapter, &h.EventType, &h.Snippet, &h.OccurredAtEpoch, &h.NoiseCandidate, &h.CanInstruct, &h.Provenance); err != nil {
+		if err := rows.Scan(&h.ID, &h.SessionID, &h.Project, &h.Kind, &h.ReviewState, &h.SourceAdapter, &h.EventType, &h.Snippet, &h.OccurredAtEpoch, &h.NoiseCandidate, &h.CanInstruct, &h.Provenance, &h.DerivationRunID); err != nil {
 			return nil, err
 		}
 		h.syncOccurredAt()
@@ -3109,6 +4185,18 @@ func (s *Store) TimelineWithFilter(ctx context.Context, filter ObservationFilter
 	return hits, rows.Err()
 }
 
+// newestRowReceiptQuery reads received_at_epoch of the newest event row through
+// the primary key: an index lookup on both engines. It is a lower bound on the
+// max receipt only, because ingest accepts caller-supplied receipt stamps
+// (forwarded, retried and backfilled envelopes arrive out of order).
+const newestRowReceiptQuery = `SELECT COALESCE((SELECT received_at_epoch FROM events ORDER BY id DESC LIMIT 1), 0)`
+
+// maxReceiptQuery is the exact last write: a full scan of events (no index on
+// received_at_epoch). Never on a probe path.
+const maxReceiptQuery = `SELECT COALESCE(max(received_at_epoch), 0) FROM events`
+
+// Stats is the exact store census behind GET /v1/stats. The counts are full
+// scans of events and observations: never call it from a probe path.
 func (s *Store) Stats(ctx context.Context, dbPath string) (Stats, error) {
 	var st Stats
 	queries := map[*int64]string{
@@ -3116,22 +4204,101 @@ func (s *Store) Stats(ctx context.Context, dbPath string) (Stats, error) {
 		&st.ObservationCount:        `SELECT count(*) FROM observations WHERE deleted_at_epoch IS NULL`,
 		&st.DeletedEventCount:       `SELECT count(*) FROM events WHERE deleted_at_epoch IS NOT NULL`,
 		&st.DeletedObservationCount: `SELECT count(*) FROM observations WHERE deleted_at_epoch IS NOT NULL`,
-		&st.LastWriteEpoch:          `SELECT COALESCE(max(received_at_epoch), 0) FROM events`,
+		&st.LastWriteEpoch:          maxReceiptQuery,
 	}
+	st.LastWriteKnown = true
 	for dest, q := range queries {
 		if err := s.rdb.QueryRowContext(ctx, q).Scan(dest); err != nil {
 			return Stats{}, err
 		}
 	}
+	if err := s.sizeStats(ctx, dbPath, &st); err != nil {
+		return Stats{}, err
+	}
+	return st, nil
+}
+
+// HealthStats fills only the fields GET /v1/health reports (LastWriteEpoch,
+// DBBytes, WALBytes), with no synchronous table scan: the liveness probe
+// calls /v1/health. LastWriteEpoch is the max receipt this process knows of,
+// and LastWriteKnown says whether the exact seed has landed; before that the
+// value is a lower bound. Each call starts the background seed if it is not
+// done, not running and not waiting out a retry delay. On error the fields
+// read so far are still returned.
+func (s *Store) HealthStats(ctx context.Context, dbPath string) (Stats, error) {
+	s.startLastWriteSeed()
+	var st Stats
+	var newest int64
+	err := s.rdb.QueryRowContext(ctx, newestRowReceiptQuery).Scan(&newest)
+	if err == nil {
+		s.noteWrite(newest)
+	}
+	// done before lastWrite: the seed publishes its max, then done, so a true
+	// done read first guarantees the next load includes the seeded max.
+	st.LastWriteKnown = s.seed.done.Load()
+	st.LastWriteEpoch = s.lastWrite.Load()
+	if err != nil {
+		return st, err
+	}
+	if err := s.sizeStats(ctx, dbPath, &st); err != nil {
+		return st, err
+	}
+	return st, nil
+}
+
+const (
+	// lastWriteSeedTimeout bounds one exact max scan behind HealthStats.
+	lastWriteSeedTimeout = 5 * time.Minute
+	// lastWriteSeedRetry is the delay before a failed seed is retried.
+	lastWriteSeedRetry = time.Minute
+)
+
+func (s *Store) startLastWriteSeed() {
+	if s.seed.done.Load() {
+		return
+	}
+	s.seed.mu.Lock()
+	defer s.seed.mu.Unlock()
+	if s.seed.done.Load() || s.seed.running || s.seed.closed || time.Now().Before(s.seed.next) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lastWriteSeedTimeout)
+	s.seed.running, s.seed.cancel = true, cancel
+	go func() {
+		defer cancel()
+		var max int64
+		err := s.rdb.QueryRowContext(ctx, maxReceiptQuery).Scan(&max)
+		if err == nil {
+			s.noteWrite(max)
+		}
+		s.seed.mu.Lock()
+		defer s.seed.mu.Unlock()
+		s.seed.running, s.seed.cancel = false, nil
+		if err == nil {
+			s.seed.done.Store(true)
+		} else {
+			s.seed.next = time.Now().Add(lastWriteSeedRetry)
+		}
+	}()
+}
+
+// noteWrite raises lastWrite to epoch; it never lowers it.
+func (s *Store) noteWrite(epoch int64) {
+	for {
+		cur := s.lastWrite.Load()
+		if epoch <= cur || s.lastWrite.CompareAndSwap(cur, epoch) {
+			return
+		}
+	}
+}
+
+func (s *Store) sizeStats(ctx context.Context, dbPath string, st *Stats) error {
 	if s.engine == EnginePostgres {
 		// dbPath is a DSN here; size comes from the server instead of the
 		// filesystem. WALBytes stays 0 — Postgres WAL is instance-wide and
 		// CNPG-managed, not a per-store health number.
-		if err := s.rdb.QueryRowContext(ctx,
-			`SELECT pg_database_size(current_database())`).Scan(&st.DBBytes); err != nil {
-			return Stats{}, err
-		}
-		return st, nil
+		return s.rdb.QueryRowContext(ctx,
+			`SELECT pg_database_size(current_database())`).Scan(&st.DBBytes)
 	}
 	if info, err := os.Stat(dbPath); err == nil {
 		st.DBBytes = info.Size()
@@ -3139,7 +4306,7 @@ func (s *Store) Stats(ctx context.Context, dbPath string) (Stats, error) {
 	if info, err := os.Stat(dbPath + "-wal"); err == nil {
 		st.WALBytes = info.Size()
 	}
-	return st, nil
+	return nil
 }
 
 // CountRedactionContractViolations counts ingested events carrying the
@@ -3196,6 +4363,52 @@ func (s *Store) CountDerivationRunsByStatus(ctx context.Context) ([]DeriveRunSta
 	return out, rows.Err()
 }
 
+// DeriveRunOutcome is one recent derivation-run row reduced to what failure
+// classification needs: the ledger status and the run metadata that carries
+// the failure detail. Neither field ever reaches an unauthenticated surface —
+// the caller folds them into a compiled-in vocabulary first (D224).
+type DeriveRunOutcome struct {
+	Status   string
+	Metadata json.RawMessage
+}
+
+// RecentDeriveRunOutcomes returns the newest `limit` derivation runs in
+// ledger order (newest first), computed from derivation_runs at read time —
+// no summary table (memoire:D165/D245: a cache that can lie). Ordering is
+// the deterministic supersede ordering, not the coarser listing one: a sweep
+// mints many runs inside one second, and a consecutive-failure streak read
+// off an arbitrary within-second permutation would be noise.
+//
+// Cost note: a failed or partial run retains its raw provider response in
+// meta_json (memoire:D44), so a window of a few hundred rows can carry
+// megabytes. That is why this is a TTL-cached, owner-budgeted /metrics
+// query and never a per-probe one; capping the window is the only bound.
+func (s *Store) RecentDeriveRunOutcomes(ctx context.Context, limit int) ([]DeriveRunOutcome, error) {
+	limit = normalizeLimit(limit, 200, 1000)
+	rows, err := s.rdb.QueryContext(ctx,
+		`SELECT status, meta_json FROM derivation_runs
+		 ORDER BY created_at_epoch DESC, COALESCE(created_at_ns, 0) DESC, id DESC
+		 LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DeriveRunOutcome
+	for rows.Next() {
+		var status string
+		var meta sql.NullString
+		if err := rows.Scan(&status, &meta); err != nil {
+			return nil, err
+		}
+		rec := DeriveRunOutcome{Status: status}
+		if meta.Valid {
+			rec.Metadata = json.RawMessage(meta.String)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
 // CountFutureSkewEvents is the memoire:D152 one-sided future-skew alert
 // source: events whose occurred_at_epoch is AHEAD of received_at_epoch by
 // more than threshold seconds are unambiguous producer clock faults. The lag
@@ -3243,7 +4456,7 @@ func (s *Store) getDerivationRun(ctx context.Context, query string, args ...any)
 
 func scanObservationRecord(scanner interface{ Scan(...any) error }) (ObservationRecord, error) {
 	var rec ObservationRecord
-	var eventID, deletedAt sql.NullInt64
+	var eventID, deletedAt, supersedesID sql.NullInt64
 	var sessionID, sourceAdapter, eventType, principal, derivationRunID, contentHash, provenance sql.NullString
 	var confidence sql.NullFloat64
 	var canInstruct, canEvidence, needsConfirmation, noiseCandidate int
@@ -3252,9 +4465,14 @@ func scanObservationRecord(scanner interface{ Scan(...any) error }) (Observation
 		&sourceAdapter, &eventType, &rec.OccurredAtEpoch, &rec.CreatedAtEpoch, &deletedAt,
 		&principal, &confidence, &rec.ReviewState, &derivationRunID, &contentHash,
 		&provenance, &canInstruct, &canEvidence, &needsConfirmation, &noiseCandidate,
+		&supersedesID,
 	)
 	if err != nil {
 		return ObservationRecord{}, err
+	}
+	if supersedesID.Valid {
+		id := supersedesID.Int64
+		rec.SupersedesID = &id
 	}
 	if eventID.Valid {
 		rec.EventID = eventID.Int64
@@ -3327,13 +4545,21 @@ func getObservationForReview(ctx context.Context, tx dbtx, id int64) (Observatio
 	row := tx.QueryRowContext(ctx, `SELECT o.id, o.event_id, o.project, o.session_id, o.kind, o.text,
 		o.source_adapter, o.event_type, o.occurred_at_epoch, o.created_at_epoch, o.deleted_at_epoch,
 		o.principal_id, o.confidence, o.review_state, o.derivation_run_id, o.content_hash,
-		o.provenance, o.can_instruct, o.can_evidence, o.needs_confirmation, o.noise_candidate
+		o.provenance, o.can_instruct, o.can_evidence, o.needs_confirmation, o.noise_candidate, o.supersedes_id
 		FROM observations o
 		WHERE o.id = ?`, id)
 	return scanObservationRecord(row)
 }
 
-func observationWhere(filter ObservationFilter, alias string) (string, []any) {
+// observationWhereSplit is observationWhere's clause builder split around
+// the feed actor-gate: it returns the pushable base (every clause except
+// the gate) and the gate itself ("" when the caller opted in or the
+// shape's band cannot carry accepted rows). observationWhere is their
+// byte-identical join — the gate is appended last in the builder's
+// clause order — so no other caller's SQL text changes. The PG bm25
+// search uses the split form to keep the gate OUT of the inner read
+// (a20 = A, round-3 F4).
+func observationWhereSplit(filter ObservationFilter, alias string) (string, string, []any) {
 	var clauses []string
 	var args []any
 	if filter.Project != "" {
@@ -3341,7 +4567,16 @@ func observationWhere(filter ObservationFilter, alias string) (string, []any) {
 		args = append(args, filter.Project)
 	}
 	if filter.SessionID != "" {
-		clauses = append(clauses, `COALESCE(`+alias+`.session_id, '') = ?`)
+		// Bare equality, not COALESCE(...,'') = ?: the parameter is
+		// non-empty by the branch guard, and for a non-empty value the
+		// two forms are semantically identical on BOTH engines (a NULL or
+		// an empty session_id fails the test either way) — so the
+		// coalesce buys nothing and costs the pushdown: pg_search can
+		// only push a predicate that matches an indexed expression, and
+		// (session_id::pdb.literal) is one while
+		// COALESCE(session_id,'') is not (a20 = A: the v2 index carries
+		// the session column for exactly this clause).
+		clauses = append(clauses, alias+`.session_id = ?`)
 		args = append(args, filter.SessionID)
 	}
 	if filter.Kind != "" {
@@ -3351,6 +4586,10 @@ func observationWhere(filter ObservationFilter, alias string) (string, []any) {
 	if filter.ExcludeKind != "" {
 		clauses = append(clauses, alias+`.kind != ?`)
 		args = append(args, filter.ExcludeKind)
+	}
+	if filter.OccurredAfterEpoch > 0 {
+		clauses = append(clauses, alias+`.occurred_at_epoch >= ?`)
+		args = append(args, filter.OccurredAfterEpoch)
 	}
 	if filter.DerivationRunID != "" {
 		clauses = append(clauses, alias+`.derivation_run_id = ?`)
@@ -3397,7 +4636,54 @@ func observationWhere(filter ObservationFilter, alias string) (string, []any) {
 	if !filter.IncludeNoise {
 		clauses = append(clauses, alias+`.noise_candidate = 0`)
 	}
-	return strings.Join(clauses, " AND "), args
+	// Feed actor-gate (triage lane v1, R-D). Exclusion-shaped and
+	// fail-closed: a row is feed-INELIGIBLE iff its accept transition was
+	// rendered by an `agent:*` actor. Rules-born accepted rows carry NO
+	// review-log accept entry at all and human accepts carry a credential
+	// actor, so both keep eligibility — the clause is a no-op over today's
+	// corpus and the gate exists so a future machine verdict is
+	// structurally excluded from the feed until a deliberate ruling moves
+	// the predicate. It rides wherever `accepted` can be in the result set,
+	// which is the band the liaison feed reads through
+	// (`GET /v1/observations?review_state=accepted`) as well as the default
+	// injection band.
+	if !filter.IncludeAgentAccepted && reviewStateBandIncludesAccepted(filter) {
+		return strings.Join(clauses, " AND "), agentAcceptedExclusion(alias), args
+	}
+	return strings.Join(clauses, " AND "), "", args
+}
+
+// observationWhere is observationWhereSplit combined: base + the gate,
+// byte-identical to the pre-split clause join (the gate is the builder's
+// last clause), so every caller of this function sees unchanged SQL.
+func observationWhere(filter ObservationFilter, alias string) (string, []any) {
+	base, gate, args := observationWhereSplit(filter, alias)
+	if gate != "" {
+		return base + " AND " + gate, args
+	}
+	return base, args
+}
+
+// reviewStateBandIncludesAccepted reports whether the resolved review-state
+// band can contain accepted rows. An explicitly-requested non-accepted state
+// (the proposed queue, the lapsed pool) never needs the anti-join, which
+// keeps the 0008 partial-index plans untouched.
+func reviewStateBandIncludesAccepted(filter ObservationFilter) bool {
+	if filter.ReviewState != "" {
+		return filter.ReviewState == "accepted"
+	}
+	return true
+}
+
+// agentAcceptedExclusion is the feed predicate of record (R-D). It is an
+// anti-join rather than a stored flag: the review log is the source of the
+// fact, and a column mirroring it would be a cache that can lie
+// (memoire:D245). `LIKE 'agent:%'` reads identically on both engines.
+func agentAcceptedExclusion(alias string) string {
+	return `NOT EXISTS (SELECT 1 FROM observation_review_log rl
+		WHERE rl.observation_id = ` + alias + `.id
+		  AND rl.to_state = 'accepted'
+		  AND rl.actor LIKE 'agent:%')`
 }
 
 func derivationRunWhere(filter DerivationRunFilter) (string, []any) {

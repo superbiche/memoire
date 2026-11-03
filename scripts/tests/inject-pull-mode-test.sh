@@ -49,6 +49,7 @@ done
 mkdir -p "$TMP/home"
 printf 'test-token\n' > "$TMP/home/token"
 export MEMOIRE_HOME="$TMP/home"
+export MEMOIRE_INJECT=on   # injection is opt-in; this suite tests its content
 export MEMOIRE_PROJECTS_REGISTRY="$TMP/registry.json"
 echo '{"schema":"liaison-memoire-projects/1","projects":{}}' > "$TMP/registry.json"
 unset MEMOIRE_PROJECT MEMOIRE_CAPTURE MEMOIRE_INJECT_CONTENT 2>/dev/null || true

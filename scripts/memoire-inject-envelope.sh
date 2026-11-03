@@ -12,7 +12,9 @@ set -uo pipefail
 # No logic fork: runs the real inject script (stdin passed through so it can
 # read the hook JSON) and wraps its stdout as
 #   {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}
-# Empty inject output emits nothing. Fail-open: any error exits 0 so session
+# Empty inject output emits nothing — which is the default: the inject script
+# prints nothing unless MEMOIRE_INJECT is on, and no-output is how qwen-code
+# is told there is no additional context. Fail-open: any error exits 0 so session
 # start is never blocked.
 #
 # The payload travels to jq via the printf builtin on stdin, never as exec

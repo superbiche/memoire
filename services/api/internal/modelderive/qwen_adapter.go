@@ -65,6 +65,12 @@ type QwenConfig struct {
 	// unboundedly until the call deadline (inbox 2026-07-10: a ~270-char window
 	// hung HL3 to context-deadline twice).
 	MaxCompletionTokens int
+	// ReasoningEffort steers a thinking model's reasoning budget through the
+	// server's chat template (chat_template_kwargs.reasoning_effort). Empty
+	// omits the field entirely, leaving the body byte-identical to a request
+	// that never knew the knob — the endpoint's own default then governs. A
+	// template that does not know the kwarg ignores it.
+	ReasoningEffort string
 }
 
 // defaultQwenTimeout bounds adapter HTTP calls when QwenConfig.Timeout is zero.
@@ -177,6 +183,9 @@ type chatCompletionRequest struct {
 	Temperature float64       `json:"temperature"`
 	Stream      bool          `json:"stream"`
 	MaxTokens   int           `json:"max_tokens"`
+	// ChatTemplateKwargs is the template-level steering channel (llama.cpp /
+	// vLLM pass it to the chat template). Nil is absent from the wire.
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatMessage struct {
@@ -228,16 +237,58 @@ func (a *QwenAdapter) Generate(ctx context.Context, req Request) (ProviderRespon
 		return ProviderResponse{}, fmt.Errorf("modelderive: prompt %d bytes exceeds adapter max_prompt_bytes %d", len(prompt), a.cfg.MaxPromptBytes)
 	}
 
+	return a.send(ctx, ep, req.Model, prompt)
+}
+
+// Chat is the adapter's PROMPT-IN surface: the same endpoint allowlist,
+// availability probe, bearer-by-name auth, and HTTP/refusal mapping as
+// Generate, for a caller that builds its own prompt. The triage judge
+// (triage lane v1, R-C) is that caller — a judge is not a derivation, so it
+// has no derivation Request to hand Generate, but memoire:D137 binds it to
+// the same `data_boundary=local` registry and memoire:D55/D58 to the same
+// name-not-value secret seam, which is exactly what reusing this adapter
+// buys instead of a second HTTP client with a second key path.
+func (a *QwenAdapter) Chat(ctx context.Context, endpointID, model, prompt string) (ProviderResponse, error) {
+	if strings.TrimSpace(endpointID) == "" {
+		return ProviderResponse{}, errors.New("modelderive: chat requires an explicit endpoint_id")
+	}
+	if strings.TrimSpace(model) == "" {
+		return ProviderResponse{}, errors.New("modelderive: chat requires an explicit model")
+	}
+	ep, ok := a.lookupEndpoint(endpointID)
+	if !ok {
+		return ProviderResponse{}, fmt.Errorf("modelderive: endpoint_id %q is not in the local-qwen allowlist", endpointID)
+	}
+	if !endpointAllowsModel(ep, model) {
+		return ProviderResponse{}, fmt.Errorf("modelderive: model %q is not allowlisted for endpoint %q", model, ep.EndpointID)
+	}
+	if err := a.availabilityCheck(ctx, ep, model); err != nil {
+		return ProviderResponse{}, fmt.Errorf("modelderive: local-qwen endpoint %q unavailable: %w", ep.EndpointID, err)
+	}
+	if a.cfg.MaxPromptBytes > 0 && len(prompt) > a.cfg.MaxPromptBytes {
+		return ProviderResponse{}, fmt.Errorf("modelderive: prompt %d bytes exceeds adapter max_prompt_bytes %d", len(prompt), a.cfg.MaxPromptBytes)
+	}
+	return a.send(ctx, ep, model, prompt)
+}
+
+// send is the shared wire half of Generate and Chat: body, auth, transport,
+// and the HTTP/refusal mapping that memoire:D57 pins.
+func (a *QwenAdapter) send(ctx context.Context, ep QwenEndpoint, model, prompt string) (ProviderResponse, error) {
 	maxTokens := a.cfg.MaxCompletionTokens
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxCompletionTokens
 	}
+	var templateKwargs map[string]any
+	if a.cfg.ReasoningEffort != "" {
+		templateKwargs = map[string]any{"reasoning_effort": a.cfg.ReasoningEffort}
+	}
 	body, err := json.Marshal(chatCompletionRequest{
-		Model:       req.Model,
-		Messages:    []chatMessage{{Role: "user", Content: prompt}},
-		Temperature: 0,
-		Stream:      false,
-		MaxTokens:   maxTokens,
+		Model:              model,
+		Messages:           []chatMessage{{Role: "user", Content: prompt}},
+		Temperature:        0,
+		Stream:             false,
+		MaxTokens:          maxTokens,
+		ChatTemplateKwargs: templateKwargs,
 	})
 	if err != nil {
 		return ProviderResponse{}, err

@@ -6,12 +6,14 @@ package forwarder
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -372,5 +374,162 @@ func TestStatusCountsMatchConsumerPredicate(t *testing.T) {
 	age := oldestAgeSeconds(dir)
 	if age < 9*60 || age > 15*60 {
 		t.Fatalf("oldestAgeSeconds = %d, want the real items' ~10m range — keyed on a non-item entry", age)
+	}
+}
+
+// qname builds a queue item name with the real shape
+// "<ms>-<adapter>-<64 hex>.json" (queuewriter.queueFileNameAt).
+func qname(ms int, adapter string, n int) string {
+	return fmt.Sprintf("%d-%s-%064x.json", ms, adapter, n)
+}
+
+// recordHub acks every POST and records each body in arrival
+// order; hook(k) runs after the k-th body is read.
+func recordHub(t *testing.T, order *[]string, hook func(k int)) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		*order = append(*order, string(b))
+		if hook != nil {
+			hook(len(*order))
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"queued": true})
+	}))
+}
+
+func TestPriorityAdapterGoesBeforeOlderBacklog(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ForwardPriorityAdapters = []string{"claude-code"}
+	var order []string
+	hub := recordHub(t, &order, nil)
+	defer hub.Close()
+	cfg.ForwardURL = hub.URL + "/v1"
+
+	writePending(t, cfg, qname(1000, "codex-cli", 1), "codex-1")
+	writePending(t, cfg, qname(1001, "codex-cli", 2), "codex-2")
+	writePending(t, cfg, qname(1002, "codex-cli", 3), "codex-3")
+	writePending(t, cfg, qname(2000, "claude-code", 4), "claude-1")
+
+	newTestForwarder(t, cfg).ForwardOnce(context.Background())
+
+	want := []string{"claude-1", "codex-1", "codex-2", "codex-3"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("forward order = %v, want %v", order, want)
+	}
+}
+
+func TestPriorityItemArrivingMidBacklogIsForwardedNext(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ForwardPriorityAdapters = []string{"claude-code"}
+	total := sliceSize + 50
+	for i := 0; i < total; i++ {
+		writePending(t, cfg, qname(1000+i, "codex-cli", i), fmt.Sprintf("codex-%03d", i))
+	}
+	const k = 10
+	var order []string
+	hub := recordHub(t, &order, func(n int) {
+		if n == k {
+			writePending(t, cfg, qname(9000, "claude-code", 999), "live")
+		}
+	})
+	defer hub.Close()
+	cfg.ForwardURL = hub.URL + "/v1"
+
+	newTestForwarder(t, cfg).ForwardOnce(context.Background())
+
+	if len(order) != total+1 {
+		t.Fatalf("forwarded %d items, want %d", len(order), total+1)
+	}
+	// The live item lands at the first slice boundary, ahead of the rest of the
+	// backlog, and never later than one slice after it arrived.
+	if got := order[sliceSize]; got != "live" {
+		t.Fatalf("item %d = %q, want the live item at the slice boundary; order head %v", sliceSize, got, order[sliceSize-1:sliceSize+2])
+	}
+	for i, body := range order {
+		if body == "live" {
+			continue
+		}
+		j := i
+		if i > sliceSize {
+			j = i - 1
+		}
+		if body != fmt.Sprintf("codex-%03d", j) {
+			t.Fatalf("backlog order broken at %d: %q", i, body)
+		}
+	}
+}
+
+func TestConfiguredPriorityListIsHonoured(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ForwardPriorityAdapters = []string{"claude-code", "opencode-native"}
+	var order []string
+	hub := recordHub(t, &order, nil)
+	defer hub.Close()
+	cfg.ForwardURL = hub.URL + "/v1"
+
+	writePending(t, cfg, qname(1000, "codex-cli", 1), "codex")
+	writePending(t, cfg, qname(3000, "claude-code", 2), "claude-late")
+	writePending(t, cfg, qname(2000, "opencode-native", 3), "opencode")
+	writePending(t, cfg, qname(4000, "gemini-cli", 4), "gemini")
+	writePending(t, cfg, "001-a.json", "legacy-shape")
+
+	newTestForwarder(t, cfg).ForwardOnce(context.Background())
+
+	want := []string{"opencode", "claude-late", "legacy-shape", "codex", "gemini"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("forward order = %v, want %v", order, want)
+	}
+}
+
+func TestPoisonBacklogWithPriorityTerminates(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ForwardPriorityAdapters = []string{"claude-code"}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer hub.Close()
+	cfg.ForwardURL = hub.URL + "/v1"
+	for i := 0; i < sliceSize+5; i++ {
+		writePending(t, cfg, qname(1000+i, "codex-cli", i), "x")
+	}
+	writePending(t, cfg, qname(9000, "claude-code", 999), "y")
+
+	newTestForwarder(t, cfg).ForwardOnce(context.Background())
+
+	if d := MeasureDepths(cfg); d.PendingDepth != 0 || d.FailedDepth != sliceSize+6 {
+		t.Fatalf("depths = %+v, want pending 0 failed %d", d, sliceSize+6)
+	}
+}
+
+// An item that cannot be claimed (inflight/ missing here) and stays in
+// pending must not make the re-scan loop spin: it is excluded for the rest
+// of the cycle (the stuck set) and the cycle terminates with every item
+// still pending. Review 2026-10-01 F2 (mutation: dropping the stuck set
+// turned this into a hot infinite loop that the suite did not catch).
+func TestUnclaimableItemsDoNotSpinTheCycle(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ForwardPriorityAdapters = []string{"claude-code"}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("hub must not be called")
+	}))
+	defer hub.Close()
+	cfg.ForwardURL = hub.URL + "/v1"
+	for i := 0; i < sliceSize+3; i++ {
+		writePending(t, cfg, qname(1000+i, "codex-cli", i), "x")
+	}
+	writePending(t, cfg, qname(9000, "claude-code", 999), "y")
+	if err := os.RemoveAll(cfg.Queue.Inflight); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { newTestForwarder(t, cfg).ForwardOnce(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("ForwardOnce did not terminate with unclaimable items")
+	}
+	if d := MeasureDepths(cfg); d.PendingDepth != sliceSize+4 {
+		t.Fatalf("depths %+v", d)
 	}
 }

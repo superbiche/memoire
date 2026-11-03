@@ -1,0 +1,163 @@
+{
+  "golden_version": 1,
+  "purpose": "Shared oracle for the near-dup gate. services/api/internal/modelderive/neardup.go is the implementation of record; bench/derive/benchlib.py is a Python port used to align comparison packs. Both assert this file, so a change to either side that moves a score or flips a policy hit fails loudly instead of silently aligning packs under a policy production no longer runs. Regenerating expectations to make a test pass is a recalibration, and recalibration is an operator ruling.",
+  "thresholds": {
+    "lo": 0.45,
+    "hi": 0.9
+  },
+  "normalize": [
+    {
+      "name": "superscript-two-is-not-a-digit",
+      "note": "Go unicode.IsDigit is Nd-only, so U+00B2 (category No) collapses to a space. Python str.isdigit() returns true for it — a naive port keeps it and changes every trigram.",
+      "in": "Round 2² of the re-check",
+      "normalized": "round 2 of the re check",
+      "digit_tokens": ["2"]
+    },
+    {
+      "name": "roman-numeral-is-not-a-letter",
+      "note": "Go unicode.IsLetter is L*-only, so U+2167 (category Nl) collapses to a space. Python str.isalpha() returns true for it.",
+      "in": "Chapter Ⅷ of the runbook",
+      "normalized": "chapter of the runbook",
+      "digit_tokens": []
+    },
+    {
+      "name": "dotted-capital-i-simple-lowercase",
+      "note": "U+0130 is the only unconditional lowercase EXPANSION in SpecialCasing.txt: Python's full str.lower() yields 'i' + U+0307, Go's simple per-rune ToLower yields plain 'i'. Left unhandled, the combining mark categorizes as a non-letter and becomes a space, shifting every trigram after it.",
+      "in": "AİBxxx",
+      "normalized": "aibxxx",
+      "digit_tokens": []
+    },
+    {
+      "name": "final-sigma-context-rule-must-not-apply",
+      "note": "Python's whole-string lower() applies the Final_Sigma context rule and yields 'ς' word-finally; Go's per-rune ToLower always maps U+03A3 to U+03C3. The port lowercases per character precisely to deny the rule its context.",
+      "in": "ΛΟΓΟΣ",
+      "normalized": "λογοσ",
+      "digit_tokens": []
+    },
+    {
+      "name": "punctuation-and-case",
+      "in": "UI bug: \"Load older\" button disappears!",
+      "normalized": "ui bug load older button disappears",
+      "digit_tokens": []
+    },
+    {
+      "name": "accented-letters-survive",
+      "in": "La dérivation a échoué (timeout)",
+      "normalized": "la dérivation a échoué timeout",
+      "digit_tokens": []
+    },
+    {
+      "name": "digits-and-hex-tokens",
+      "in": "commit 0ec85d6 fixed PR #67",
+      "normalized": "commit 0ec85d6 fixed pr 67",
+      "digit_tokens": ["0ec85d6", "67"]
+    },
+    {
+      "name": "only-separators",
+      "note": "Everything collapses away; the trigram set is empty, not a set holding the empty string.",
+      "in": "--- *** ---",
+      "normalized": "",
+      "digit_tokens": []
+    },
+    {
+      "name": "shorter-than-a-trigram",
+      "note": "Under three runes the whole normalized string is the single trigram.",
+      "in": "ok",
+      "normalized": "ok",
+      "digit_tokens": []
+    }
+  ],
+  "pairs": [
+    {
+      "name": "founding-paraphrase-gates",
+      "note": "The D211 founding pair: observations #347900/#348265, two runs' paraphrases of one statement.",
+      "a": "UI bug: \"Load older\" button disappears when a list is fully accepted/confirmed; expected to remain visible.",
+      "b": "UI issue: 'Load older' button disappears after accepting/confirming a whole list; expected to remain visible.",
+      "score": 0.590163934,
+      "hit": true
+    },
+    {
+      "name": "digit-guard-protects-pr-numbers",
+      "note": "Distinct outcomes whose whole difference is a digit token must survive the moderate tier.",
+      "a": "Background Codex xhigh security review of PR #67 completed successfully (exit code 0).",
+      "b": "Background Codex xhigh review of PR #69 completed successfully (exit code 0).",
+      "score": 0.7875,
+      "hit": false
+    },
+    {
+      "name": "digit-guard-protects-verdict-percentages",
+      "a": "v1 vs base judge verdict: Base model preferred 92% of the time (FT 2.97 vs Base 4.64).",
+      "b": "v2 vs base judge verdict: Base model preferred 95% of the time (v2 5/95).",
+      "score": 0.649350649,
+      "hit": false
+    },
+    {
+      "name": "template-bookkeeping-crosses-high-tier",
+      "note": "Round-counter narration differing only in the iteration number crosses the unconditional tier despite the digit mismatch. Losing it is the point.",
+      "a": "Background command \"Run delta 3 re-check (effort re-issued per D289)\" completed successfully with exit code 0.",
+      "b": "Background command \"Run delta 4 re-check (effort re-issued per D289)\" completed successfully with exit code 0.",
+      "score": 0.939393939,
+      "hit": true
+    },
+    {
+      "name": "documented-negation-blindness",
+      "note": "KNOWN ACCEPTED BLINDNESS (operator-ruled 2026-08-02): a digit-free pair whose meaning flips on one word gates as a dup. If this stops hitting, the policy changed and the calibration doc must be revisited.",
+      "a": "The queue drainer is broken on the PostgreSQL engine",
+      "b": "The queue drainer is fixed on the PostgreSQL engine",
+      "score": 0.722222222,
+      "hit": true
+    },
+    {
+      "name": "unrelated-content-survives",
+      "a": "Minting must run with ~/.memoire/db.env sourced in-process; credential values must never appear in argv.",
+      "b": "The hourly sweep re-derived whole sessions because the event fetch had no coverage exclusion.",
+      "score": 0.047904192,
+      "hit": false
+    },
+    {
+      "name": "strongest-match-wins",
+      "a": "the deploy gate requires a clean worktree before running images-push",
+      "b": "the deploy gate requires a clean worktree before images-push",
+      "score": 0.861538462,
+      "hit": true
+    },
+    {
+      "name": "superscript-canary-pair",
+      "note": "The canary as a SCORE: correct Nd-only handling makes these two texts normalize identically (1.0). A str.isdigit() port scores them below 1.0 and this vector fails.",
+      "a": "Round 2² of the re-check completed",
+      "b": "Round 2 of the re-check completed",
+      "score": 1.0,
+      "hit": true
+    },
+    {
+      "name": "dotted-capital-i-pair",
+      "note": "The reviewer's r1/F1 reproduction. Before the per-character fix the port scored this 0.2857 and missed the gate while production scored 1.0 and rejected the duplicate.",
+      "a": "AİBxxx",
+      "b": "aibxxx",
+      "score": 1.0,
+      "hit": true
+    },
+    {
+      "name": "final-sigma-pair",
+      "note": "A whole-string lower() port scores this below 1.0: 'ΛΟΓΟΣ' becomes 'λογος' and 'λογοσ' stays as written.",
+      "a": "ΛΟΓΟΣ",
+      "b": "λογοσ",
+      "score": 1.0,
+      "hit": true
+    },
+    {
+      "name": "disputed-band-not-a-dup",
+      "a": "The freezer refuses a session with 500 same-epoch events",
+      "b": "The freezer pages the tool-window query by re-anchoring start",
+      "score": 0.134020619,
+      "hit": false
+    },
+    {
+      "name": "identical-text",
+      "a": "the near-dup gate rejects at trigram-Jaccard 0.45 with equal digit tokens",
+      "b": "the near-dup gate rejects at trigram-Jaccard 0.45 with equal digit tokens",
+      "score": 1.0,
+      "hit": true
+    }
+  ]
+}

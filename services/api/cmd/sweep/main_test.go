@@ -29,7 +29,8 @@ func TestRunDrivesRealCLIDoor(t *testing.T) {
 		t.Fatal(err)
 	}
 	rawName := "1700000000000-cli-aaaaaaaa.json"
-	rawBody := []byte(`{"schema_version":1,"project":"memoire-test","session_id":"cli","source_adapter":"manual","event_type":"note","payload":{"message":"key AKIAIOSFODNN7EXAMPLE leaked"},"metadata":{}}`)
+	rawBody := []byte(`{"schema_version":1,"project":"memoire-test","session_id":"cli","source_adapter":"manual","event_type":"note","payload":{"message":"key AKIA` +
+		`IOSFODNN7EXAMPLE leaked"},"metadata":{}}`)
 	if err := os.WriteFile(filepath.Join(rawDir, rawName), rawBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func TestRunDrivesRealCLIDoor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(redacted, []byte("AKIAIOSFODNN7EXAMPLE")) {
+	if bytes.Contains(redacted, []byte("AKIA" + "IOSFODNN7EXAMPLE")) {
 		t.Fatalf("CLI output still contains secret:\n%s", string(redacted))
 	}
 	if _, err := os.Stat(quarantineOut); err != nil {

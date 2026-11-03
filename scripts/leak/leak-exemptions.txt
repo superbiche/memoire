@@ -1,0 +1,46 @@
+# leak-exemptions.txt — exemptions for the curated-export leak gate
+# (memoire:D226/D228). TAB-separated, typed entries:
+#
+#   line\t<path>\t<exact line>
+#     The D188 dist-scan discipline: the line must occur EXACTLY ONCE in
+#     its file, and only a hit whose full content equals it is dropped —
+#     a second leak sharing the line still fails (never a substring
+#     filter).
+#
+#   shapes\t<path>\t<ERE>
+#     File-scoped exemption for SYNTHETIC secret-shape fixtures: in this
+#     file only, a hit whose content matches the ERE is dropped. The
+#     shipped test suite carries no such fixtures anymore: the secret
+#     shapes it needs are split by literal concatenation so the full
+#     shape never appears in the source (the public repo's push
+#     protection blocks the shapes outright), and no shapes entries are
+#     live. The entry form stays documented; a new one needs the same
+#     review as the gate itself.
+#
+# The opencode plugin's fleet-default inject path — the same documented
+# exemption the dist contract carries (MEMOIRE_INJECT_SCRIPT overrides it).
+line	scripts/opencode-plugin/memoire.js	    || `${process.env.HOME}/dev/personal/memoire/scripts/memoire-inject-claude.sh`;
+line	scripts/tests/opencode-plugin-test.mjs	    seen.some((e) => typeof e === "string" && e.endsWith("/dev/personal/memoire/scripts/memoire-inject-claude.sh")),
+
+# The public AGENTS.md maintainer pointer names the ledger checkout path (L0011 cutover step 1.3).
+line	AGENTS.md	Maintainers: when `~/dev/personal/memoire-ledger/AGENTS.md` exists, read it before any work. It carries the
+
+# The pi extension carries the same documented, MEMOIRE_INJECT_SCRIPT-
+# overridable default as the opencode plugin (L0011 P2).
+line	scripts/pi-extension/memoire.js	  || `${process.env.HOME}/dev/personal/memoire/scripts/memoire-inject-claude.sh`;
+#
+# The dist contract test embeds the two plugin default lines verbatim to
+# build its own exact-once exemption pair (it scans the dist tree with
+# the shared scanner, not this file) — the same documented defaults
+# mirrored as test data (L0011 P2).
+line	scripts/tests/dist-contract-test.sh	  '    || `${process.env.HOME}/dev/personal/memoire/scripts/memoire-inject-claude.sh`;' \
+line	scripts/tests/dist-contract-test.sh	  '  || `${process.env.HOME}/dev/personal/memoire/scripts/memoire-inject-claude.sh`;' \
+# The pre-push leak gate test (L0011 P3) carries its generic-shape
+# fixtures verbatim (192.168.x, /home/michel, .lan): they are the
+# gate' test data, exempted exactly-once per line.
+line	scripts/tests/prepush-leak-test.sh	echo "server at 192.168.7.7" > "$R/notes.md"; git -C "$R" add notes.md; git -C "$R" commit -qm "add notes"
+line	scripts/tests/prepush-leak-test.sh	echo "path /home/michel/x" > "$R/a.md"; git -C "$R" add a.md; git -C "$R" commit -qm "leak"
+line	scripts/tests/prepush-leak-test.sh	echo "x" >> "$R/README.md"; git -C "$R" commit -qam "copied from /home/michel/dev"
+line	scripts/tests/prepush-leak-test.sh	echo "x" > "$R/host.lan.md"; git -C "$R" add host.lan.md; git -C "$R" commit -qm "add file"
+line	scripts/tests/prepush-leak-test.sh	printf 'see 192.168.0.1 docs\n' > "$R/c.md"
+line	scripts/tests/prepush-leak-test.sh	printf 'line\tc.md\tsee 192.168.0.1 docs\n' > "$R/scripts/leak/leak-exemptions.txt"

@@ -170,7 +170,7 @@ func TestRejectLandedIsReadableThroughConflict(t *testing.T) {
 	// preconditioned reject reports the landed state in its conflict, which
 	// is exactly the verification a lost-response client needs.
 	getRec := httptest.NewRecorder()
-	getReq := httptest.NewRequest(http.MethodGet, "/v1/observations/"+ids[0]+"?include_proposed=true&include_noise=true", nil)
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/observations/"+ids[0]+"?include_derived=true&include_proposed=true&include_noise=true", nil)
 	getReq.Header.Set("Authorization", "Bearer secret-token")
 	handler.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusNotFound {

@@ -66,6 +66,75 @@ func TestLoadModelEndpoints(t *testing.T) {
 		if len(eps[0].Models) != 2 {
 			t.Fatalf("models = %v, want 2", eps[0].Models)
 		}
+		if eps[0].Profile != nil {
+			t.Fatalf("an entry without a profile must parse with none, got %+v", eps[0].Profile)
+		}
+	})
+
+	t.Run("an endpoint profile parses whole", func(t *testing.T) {
+		path := filepath.Join(dir, "profiled.json")
+		body := `{"endpoints":[{"endpoint_id":"hl3","base_url":"http://host:8000","models":["m1"],` +
+			`"profile":{"ctx_tokens":32768,"max_completion_tokens":12288,"bytes_per_token":2.2,` +
+			`"margin_tokens":512,"thinking":{"policy":"budget","budget_tokens":8192}}}]}`
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		eps, err := LoadModelEndpoints(path)
+		if err != nil {
+			t.Fatalf("LoadModelEndpoints: %v", err)
+		}
+		p := eps[0].Profile
+		if p == nil {
+			t.Fatal("profile did not parse")
+		}
+		if p.CtxTokens != 32768 || p.MaxCompletionTokens != 12288 || p.MarginTokens != 512 || p.BytesPerToken != 2.2 {
+			t.Fatalf("unexpected profile: %+v", *p)
+		}
+		if p.Thinking == nil || p.Thinking.Policy != "budget" || p.Thinking.BudgetTokens != 8192 {
+			t.Fatalf("unexpected thinking declaration: %+v", p.Thinking)
+		}
+		// The ceiling the autopsy's arithmetic asks for, from declared data.
+		if got := p.EffectiveMaxPromptBytes(); got != 43929 {
+			t.Fatalf("EffectiveMaxPromptBytes() = %d, want 43929", got)
+		}
+	})
+
+	// An incoherent profile is an operator error, named field by field: a
+	// geometry memoire cannot honor must never reach a run.
+	t.Run("an incoherent profile is refused", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			profile string
+			names   string
+		}{
+			{"zero ctx", `{"ctx_tokens":0,"max_completion_tokens":8192,"bytes_per_token":2.2}`, "ctx_tokens"},
+			{"zero completion", `{"ctx_tokens":32768,"max_completion_tokens":0,"bytes_per_token":2.2}`, "max_completion_tokens"},
+			{"negative margin", `{"ctx_tokens":32768,"max_completion_tokens":8192,"bytes_per_token":2.2,"margin_tokens":-1}`, "margin_tokens"},
+			{"zero bytes per token", `{"ctx_tokens":32768,"max_completion_tokens":8192,"bytes_per_token":0}`, "bytes_per_token"},
+			{"no room for a prompt", `{"ctx_tokens":8192,"max_completion_tokens":8000,"bytes_per_token":2.2,"margin_tokens":192}`, "ctx_tokens"},
+			{"unknown thinking policy", `{"ctx_tokens":32768,"max_completion_tokens":8192,"bytes_per_token":2.2,"thinking":{"policy":"maybe"}}`, "thinking.policy"},
+			{"budget policy without a budget", `{"ctx_tokens":32768,"max_completion_tokens":8192,"bytes_per_token":2.2,"thinking":{"policy":"budget"}}`, "budget_tokens"},
+			{"budget without the budget policy", `{"ctx_tokens":32768,"max_completion_tokens":8192,"bytes_per_token":2.2,"thinking":{"policy":"off","budget_tokens":4096}}`, "budget_tokens"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				path := filepath.Join(dir, "bad-profile.json")
+				body := `{"endpoints":[{"endpoint_id":"hl3","base_url":"http://host:8000","models":["m1"],"profile":` + tc.profile + `}]}`
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				_, err := LoadModelEndpoints(path)
+				if err == nil {
+					t.Fatalf("expected refusal for %s", tc.name)
+				}
+				if !strings.Contains(err.Error(), tc.names) {
+					t.Fatalf("error should name %q, got: %v", tc.names, err)
+				}
+				if !strings.Contains(err.Error(), "hl3") {
+					t.Fatalf("error should name the endpoint, got: %v", err)
+				}
+			})
+		}
 	})
 }
 
@@ -275,5 +344,28 @@ func TestLoadReadsEmbedTokenFile(t *testing.T) {
 	}
 	if cfg.EmbedTokenFile != "/secrets/embed/token" {
 		t.Fatalf("EmbedTokenFile: %q", cfg.EmbedTokenFile)
+	}
+}
+
+func TestForwardPriorityAdaptersEnv(t *testing.T) {
+	t.Setenv("MEMOIRE_HOME", t.TempDir())
+	load := func() []string {
+		t.Helper()
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.ForwardPriorityAdapters
+	}
+	if got := strings.Join(load(), ","); got != "claude-code" {
+		t.Fatalf("default = %q, want claude-code", got)
+	}
+	t.Setenv("MEMOIRE_FORWARD_PRIORITY_ADAPTERS", " claude-code, opencode-native ,,")
+	if got := strings.Join(load(), ","); got != "claude-code,opencode-native" {
+		t.Fatalf("parsed = %q", got)
+	}
+	t.Setenv("MEMOIRE_FORWARD_PRIORITY_ADAPTERS", "")
+	if got := load(); len(got) != 0 {
+		t.Fatalf("empty value should disable priority, got %v", got)
 	}
 }

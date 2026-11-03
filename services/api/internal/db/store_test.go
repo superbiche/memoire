@@ -1189,6 +1189,16 @@ func TestTransitionObservationReviewMatrixAndLog(t *testing.T) {
 		wantErr string
 	}{
 		{name: "raw locked", id: rawID, toState: "superseded", wantErr: "raw observations are locked at accepted"},
+		// The ACCEPT verdict is the one that feeds the feed actor-gate
+		// anti-join; the kind guard above the state machine refuses it on
+		// raw too (as every other toState — the guard fires before the
+		// transition check, governance v1). This is the CURRENT API's
+		// behavior; the fail-closed gate in observationWhere does not
+		// depend on it (a migrated corpus can hold the pair — a20 = A,
+		// round-3 F4: the pgshadow copy carries legacy rows and
+		// review-log actors unchecked, and raw elevation predated
+		// 6f7228e).
+		{name: "raw cannot accept", id: rawID, toState: "accepted", wantErr: "raw observations are locked at accepted"},
 		{name: "rejected cannot accept", id: proposedRejectedID, toState: "accepted", wantErr: "unsupported review transition rejected -> accepted"},
 		{name: "superseded cannot accept", id: acceptedSupersededID, toState: "accepted", wantErr: "unsupported review transition superseded -> accepted"},
 		{name: "soft_deleted cannot accept", id: acceptedSoftDeletedID, toState: "accepted", wantErr: "unsupported review transition soft_deleted -> accepted"},

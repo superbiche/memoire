@@ -78,7 +78,6 @@ func TestApplyRefusedWhileGuardedProcessRuns(t *testing.T) {
 	}()
 
 	t.Setenv("MEMOIRE_PURGE_APPLY", "yes")
-	t.Setenv("MEMOIRE_PURGE_SKIP_QUIESCE", "")
 	var out, errBuf bytes.Buffer
 	err := run([]string{"--home", home, "--project", "x", "--apply", "--no-quarantine"}, &out, &errBuf)
 	if err == nil || !strings.Contains(err.Error(), "quiesce") {
@@ -115,7 +114,7 @@ func TestDryRunMessageAndReportFile(t *testing.T) {
 func TestGatedApplyRunsOnFixture(t *testing.T) {
 	home := fixtureHome(t)
 	t.Setenv("MEMOIRE_PURGE_APPLY", "yes")
-	t.Setenv("MEMOIRE_PURGE_SKIP_QUIESCE", "yes")
+	skipQuiesceGuard(t)
 	var out, errBuf bytes.Buffer
 	if err := run([]string{"--home", home, "--project", "nothing-here", "--apply", "--no-quarantine"}, &out, &errBuf); err != nil {
 		t.Fatal(err)
@@ -137,5 +136,96 @@ func TestBadIDListRejected(t *testing.T) {
 	err := run([]string{"--home", home, "--event-ids", "1,zap"}, &out, &errBuf)
 	if err == nil || !strings.Contains(err.Error(), "bad id") {
 		t.Fatalf("want bad-id error, got: %v", err)
+	}
+}
+
+// Engine seam (#616 slice B). A password-less, unreachable DSN: every
+// refusal below must fire BEFORE any connection attempt.
+const unreachablePG = "postgres://nobody@127.0.0.1:1/none"
+
+func TestMain(m *testing.M) {
+	// Hermetic: an ambient postgres MEMOIRE_DB must never redirect these
+	// fixture runs to a real store.
+	_ = os.Unsetenv("MEMOIRE_DB")
+	os.Exit(m.Run())
+}
+
+func TestPostgresApplyRefusedWithoutHubQuiesce(t *testing.T) {
+	home := fixtureHome(t)
+	t.Setenv("MEMOIRE_PURGE_APPLY", "yes")
+	for _, args := range [][]string{
+		{"--home", home, "--db", unreachablePG, "--project", "x", "--apply", "--no-quarantine"},
+		{"--home", home, "--db", unreachablePG, "--resume-intent", "--apply"},
+	} {
+		var out, errBuf bytes.Buffer
+		err := run(args, &out, &errBuf)
+		if err == nil || !strings.Contains(err.Error(), "--i-have-quiesced-the-hub") {
+			t.Fatalf("%v: postgres apply must refuse without the hub-quiesce attestation, got: %v", args, err)
+		}
+	}
+}
+
+func TestPostgresSelectedFromMemoireDBEnv(t *testing.T) {
+	home := fixtureHome(t)
+	t.Setenv("MEMOIRE_DB", unreachablePG)
+	t.Setenv("MEMOIRE_PURGE_APPLY", "yes")
+	var out, errBuf bytes.Buffer
+	err := run([]string{"--home", home, "--project", "x", "--apply", "--no-quarantine"}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "on Postgres") {
+		t.Fatalf("a postgres MEMOIRE_DB must select the postgres engine, got: %v", err)
+	}
+}
+
+func TestSQLiteMemoireDBEnvIgnored(t *testing.T) {
+	// The SQLite default stays <home>/memoire.db: a non-DSN MEMOIRE_DB is
+	// not consulted (byte-for-byte pre-seam behaviour).
+	home := fixtureHome(t)
+	t.Setenv("MEMOIRE_DB", filepath.Join(t.TempDir(), "elsewhere.db"))
+	var out, errBuf bytes.Buffer
+	if err := run([]string{"--home", home, "--project", "nothing-here"}, &out, &errBuf); err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		Engine string `json:"engine"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Engine != "sqlite" {
+		t.Fatalf("engine=%q, want sqlite", report.Engine)
+	}
+}
+
+func TestHubQuiesceFlagRejectedOnSQLite(t *testing.T) {
+	home := fixtureHome(t)
+	var out, errBuf bytes.Buffer
+	err := run([]string{"--home", home, "--project", "x", "--i-have-quiesced-the-hub"}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "only to a Postgres store") {
+		t.Fatalf("the hub attestation must not be accepted on SQLite, got: %v", err)
+	}
+}
+
+// skipQuiesceGuard substitutes the in-process guard seam for a hermetic
+// fixture; the environment can no longer disarm the guard (#616 slice E).
+func skipQuiesceGuard(t *testing.T) {
+	t.Helper()
+	prev := guardedProcessRunning
+	guardedProcessRunning = func() (string, []byte) { return "", nil }
+	t.Cleanup(func() { guardedProcessRunning = prev })
+}
+
+// TestEnvCannotBypassQuiesceGuard pins the removal of the env bypass: with
+// the legacy variable set and a guarded process alive, apply still refuses.
+func TestEnvCannotBypassQuiesceGuard(t *testing.T) {
+	home := fixtureHome(t)
+	t.Setenv("MEMOIRE_PURGE_APPLY", "yes")
+	t.Setenv("MEMOIRE_PURGE_SKIP_QUIESCE", "yes")
+	prev := guardedProcessRunning
+	guardedProcessRunning = func() (string, []byte) { return "memoire-api", []byte("4242 memoire-api\n") }
+	t.Cleanup(func() { guardedProcessRunning = prev })
+	var out, errBuf bytes.Buffer
+	err := run([]string{"--home", home, "--project", "x", "--apply", "--no-quarantine"}, &out, &errBuf)
+	if err == nil || !strings.Contains(err.Error(), "quiesce") {
+		t.Fatalf("legacy env var must not disarm the guard, got: %v", err)
 	}
 }

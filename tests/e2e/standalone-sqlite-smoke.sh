@@ -215,7 +215,7 @@ for DIALECT in openai-v1 anthropic; do
   [[ "$OBS_COUNT" == 1 ]] \
     || fail "byok $DIALECT expected exactly 1 proposed inferred observation linked to $RUN_ID, got $OBS_COUNT"
 
-  OBS="$(curl -fsS "${AUTH[@]}" "$BASE/observations?project=standalone&session_id=$SESSION&review_state=proposed")"
+  OBS="$(curl -fsS "${AUTH[@]}" "$BASE/observations?project=standalone&session_id=$SESSION&review_state=proposed&include_derived=true")"
   grep -q "the byok $DIALECT stub answered" <<<"$OBS" \
     || fail "byok $DIALECT observation not visible: $OBS"
 done

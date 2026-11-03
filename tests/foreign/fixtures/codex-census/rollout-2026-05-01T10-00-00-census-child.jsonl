@@ -1,0 +1,10 @@
+{"timestamp": "2026-05-01T10:00:00.000Z", "type": "session_meta", "payload": {"id": "cx-child-0002", "session_id": "cx-alpha-0001", "timestamp": "2026-05-01T10:00:00.000Z", "cwd": "/tmp/census-proj", "originator": "codex-tui", "cli_version": "0.199.0", "source": "subagent", "parent_thread_id": "cx-alpha-0001", "forked_from_id": "cx-alpha-0001", "agent_nickname": "inventé — 😀", "subagent_history_start_ordinal": 6}}
+{"timestamp": "2026-05-01T10:00:00.100Z", "type": "session_meta", "ordinal": 1, "payload": {"id": "cx-alpha-0001", "cwd": "/tmp/census-proj", "timestamp": "2026-05-01T09:00:00.000Z"}}
+{"timestamp": "2026-05-01T09:00:01.001Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "p1"}, "ordinal": 2}
+{"timestamp": "2026-05-01T09:00:02.002Z", "type": "response_item", "payload": {"type": "message", "role": "user", "id": "msg_0009", "content": [{"type": "input_text", "text": "inherited inventé — 😀 prompt"}]}, "ordinal": 3}
+{"timestamp": "2026-05-01T09:00:03.003Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_0010", "content": [{"type": "output_text", "text": "inherited inventé — 😀 answer"}]}, "ordinal": 4}
+{"timestamp": "2026-05-01T09:00:04.004Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "p1"}, "ordinal": 5}
+{"timestamp": "2026-05-01T09:00:05.005Z", "type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_settings": {"model": "acme-1"}}, "ordinal": 6}
+{"timestamp": "2026-05-01T09:00:06.006Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "c1"}, "ordinal": 7}
+{"timestamp": "2026-05-01T09:00:07.007Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_0011", "content": [{"type": "output_text", "text": "own child answer"}]}, "ordinal": 8}
+{"timestamp": "2026-05-01T09:00:08.008Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "c1"}, "ordinal": 9}

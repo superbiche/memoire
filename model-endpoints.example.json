@@ -6,6 +6,20 @@
       "base_url": "http://127.0.0.1:8000",
       "api_key_env": "MEMOIRE_DERIVE_API_KEY",
       "models": ["your-model-name"]
+    },
+    {
+      "_comment": "OPTIONAL derive profile (docs/DERIVE-PROFILE-DESIGN.md): the endpoint's declared context geometry. Without it an endpoint behaves exactly as before — flags and built-in defaults. With it, the prompt ceiling is computed rather than shared across models: effective_max_prompt_bytes = floor((ctx_tokens - max_completion_tokens - margin_tokens) * bytes_per_token), so prompt + completion + margin always fits the serving context. bytes_per_token is MEASURED on your own content (~2.2-2.3 for session transcripts on Qwen tokenizers) — declare it conservatively; no tokenizer runs inside memoire. thinking DECLARES how the server is started (llama-server --reasoning / --reasoning-budget N); memoire records it in run provenance and never sends it to the model. An explicit -max-prompt-bytes / -max-completion-tokens still wins over the profile.",
+      "endpoint_id": "example-profiled",
+      "base_url": "http://127.0.0.1:8001",
+      "api_key_env": "MEMOIRE_DERIVE_API_KEY",
+      "models": ["your-profiled-model-name"],
+      "profile": {
+        "ctx_tokens": 32768,
+        "max_completion_tokens": 12288,
+        "bytes_per_token": 2.2,
+        "margin_tokens": 512,
+        "thinking": { "policy": "budget", "budget_tokens": 8192 }
+      }
     }
   ]
 }

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Michel Tomas
 
-.PHONY: githooks test-core test-home ops-image cdk8s-synth cdk8s-verify pg-shadow-up pg-shadow-down pg-copy pg-replay pg-diff dev derive test smoke check-health restart-smoke codex-capture-smoke codex-rollout-smoke qwen-rollout-smoke redaction-smoke claude-capture-smoke build ui quadlet-image quadlet-install quadlet-start quadlet-rebuild quadlet-stop quadlet-status quadlet-health fmt docs-state docs-state-check dist dist-sign dist-check deploy deploy-diff
+.PHONY: check githooks test-core test-ops ops-image pg-shadow-up pg-shadow-down pg-copy pg-replay pg-diff dev derive test smoke check-health restart-smoke codex-capture-smoke codex-rollout-capture-test opencode-capture-test acpx-capture-test muse-capture-test coverage coverage-check qwen-rollout-smoke redaction-smoke claude-capture-smoke build ui quadlet-image quadlet-install quadlet-start quadlet-rebuild quadlet-stop quadlet-status quadlet-health fmt dist dist-sign dist-check
 
 GO_TAGS := sqlite_fts5
 # Build-stamp (MISSING #7): /v1/health reports the version the binary was
@@ -16,66 +16,101 @@ dev:
 derive:
 	go run -tags '$(GO_TAGS)' ./services/api/cmd/derive $(ARGS)
 
-# Curated-export test split (memoire:D226/D228, docs/EXPORT-DESIGN.md §5):
-# `test` = the public core, green in both the home repo and the curated
-# export; `test-home` = lanes whose subjects (cdk8s, ops scripts, ledgers,
-# the export manifest) stay home — appended only when the home marker
-# (DECISIONS.md, the ledger itself) is present. The Makefile ships
-# unchanged; the split is the mechanism, never an export-time rewrite.
-HOME_TREE := $(wildcard DECISIONS.md)
+# Test split (L0011 P3, memoire:D226/D228 docs/EXPORT-DESIGN.md §5):
+# `test` = test-core (public core, green in the public checkout and in the
+# home repo) + test-ops (ops scripts, local tooling lanes). Lanes whose
+# subject is private (generated decision state, fleet registry, cdk8s /
+# deploy parity, the export manifest) run only in the ledger:
+# `make -f Makefile.ledger test` (Makefile.ledger ships home-only until the
+# cutover, then becomes the ledger's Makefile). The split is static in both
+# files — no marker-file branching, never an export-time rewrite.
+
+# Tests never read the operator's project registry: an entry covering the
+# temp directory (a scratch entry for /tmp, /var/tmp) replaces the basename
+# fallback several tests assert. A test that needs a registry sets its own.
+test-core test-ops: export MEMOIRE_PROJECTS_REGISTRY := /nonexistent/memoire-projects.json
 
 # go:embed all:dist needs a built (or at least present) dist; build the UI
 # once if it is missing so `go test` compiles on a fresh checkout.
-test: test-core $(if $(HOME_TREE),test-home)
+test: test-core test-ops
+
+# The owner gate (liaison HARNESS-PARITY.md § 3): the tests AND this machine's
+# observed capture coverage. Red while any route is a gap; CI runs `make test`
+# (hermetic), a host runs `make check`.
+check: test coverage-check
 
 test-core: $(UI_DIST)/index.html
 	go test -tags '$(GO_TAGS)' ./services/api/...
 	cd services/mcp && go test -race ./...
 	bash scripts/tests/mcp-tokenless-stdio-test.sh
 	bash scripts/tests/resolve-project-test.sh
+	bash scripts/tests/check-health-test.sh
 	bash scripts/tests/capture-project-wiring-test.sh
 	bash scripts/tests/turn-ingest-adapter-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/claude-prompt-identity-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/claude-hook-queue-failure-test.sh
+	$(MAKE) codex-rollout-capture-test
+	$(MAKE) opencode-capture-test
+	$(MAKE) acpx-capture-test
+	$(MAKE) muse-capture-test
+	bash scripts/tests/coverage-test.sh
 	bash scripts/tests/inject-envelope-test.sh
 	bash scripts/tests/inject-identity-test.sh
 	bash scripts/tests/inject-pull-mode-test.sh
 	bash scripts/tests/inject-transport-backlog-test.sh
-	bash scripts/tests/opencode-capture-test.sh
+	bash scripts/tests/inject-off-test.sh
 	bash scripts/tests/opencode-plugin-test.sh
+	bash scripts/tests/opencode-plugin-v2-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/pi-extension-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/subagent-context-plugin-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/capture-trigger-plugin-test.sh
 	bash scripts/tests/spdx-header-test.sh
 	bash scripts/tests/version-stamp-test.sh
 	bash tests/e2e/standalone-sqlite-smoke.sh
 
 # Versioned drift gate (inbox 2026-08-01): hooks live in .githooks/ so a
-# fresh clone gets the gate. Wiring is idempotent and rides test-home, so
-# every home `make test` self-heals it; public checkouts (no test-home)
-# never have their git config touched.
-# The .githooks/ presence gate (review r1 F2) keeps an explicit
-# `make githooks` in a public export — where .githooks/ is home-only —
-# from pointing core.hooksPath at a missing dir and silently disabling
-# the consumer's own .git/hooks.
+# fresh clone gets the gate. Wiring is idempotent. The ledger's
+# `make test` self-heals it (Makefile.ledger, first recipe line, guarded
+# by the .githooks/ presence check); this public Makefile never touches
+# a checkout's git config from `make test` — a public export has no
+# .githooks/ and pointing core.hooksPath at a missing dir would silently
+# disable the consumer's own .git/hooks (review r1 F2).
 githooks:
 	@if [ -d .githooks ]; then \
 	  test "$$(git config core.hooksPath 2>/dev/null)" = ".githooks" || git config core.hooksPath .githooks; \
 	else echo "githooks: .githooks/ not present in this checkout — skipping"; fi
 
-test-home: githooks
+test-ops:
+	python3 scripts/memoire-coverage.py --print
 	bash scripts/tests/live-turn-ingest-test.sh
+	bash scripts/tests/capture-tick-test.sh
+	bash scripts/tests/codex-capture-tick-test.sh
+	bash scripts/tests/qwen-capture-tick-test.sh
+	bash scripts/tests/opencode-capture-tick-test.sh
+	bash scripts/tests/acpx-capture-tick-test.sh
+	bash scripts/tests/muse-capture-tick-test.sh
+	bash scripts/tests/capture-health-test.sh
 	bash scripts/tests/kill-switch-test.sh
 	bash scripts/tests/resolver-consumer-enumeration-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/subagent-context-test.sh
+	python3 scripts/tests/codex-parent-test.py
+	bash scripts/tests/require-ran.sh bash scripts/tests/subagent-context-perf-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/capture-trigger-test.sh
 	bash scripts/tests/sweep-split-test.sh
+	bash scripts/tests/sweep-ceiling-test.sh
 	bash scripts/tests/derive-db-env-test.sh
 	bash scripts/tests/hl5-trigger-test.sh
+	bash scripts/tests/lapse-pause-test.sh
 	bash scripts/tests/hl5-lane-units-test.sh
 	bash scripts/tests/project-move-test.sh
 	bash scripts/tests/relabel-observed-test.sh
 	bash scripts/tests/rekey-derivation-runs-test.sh
 	bash scripts/tests/retention-conformance-test.sh
-	bash scripts/tests/docs-state-freshness-test.sh
 	bash scripts/tests/snapshot-test.sh
-	bash scripts/tests/cdk8s-manifest-contract-test.sh
-	bash scripts/tests/cronjob-command-contract-test.sh
-	bash scripts/tests/deploy-parity-test.sh
-	bash scripts/tests/export-manifest-test.sh
+	bash bench/derive/tests/derive-bench-test.sh
+	# The L0011 split contract itself and the pre-push leak gate (P3).
+	bash scripts/tests/test-lanes-test.sh
+	bash scripts/tests/prepush-leak-test.sh
 
 # Build the review SPA into the Go embed directory (services/api/internal/ui/dist).
 ui:
@@ -98,8 +133,37 @@ restart-smoke: build
 codex-capture-smoke: build
 	./tests/foreign/codex-capture-smoke.sh
 
-codex-rollout-smoke: build
-	./tests/foreign/codex-rollout-capture-smoke.sh
+# Builds its own queue writer from this checkout into its scratch directory,
+# so it needs no `build` (no UI, no other binary).
+codex-rollout-capture-test:
+	./tests/foreign/codex-rollout-capture.sh
+
+# Builds its own queue writer from this checkout into its scratch directory,
+# so it needs no `build` (no UI, no other binary).
+opencode-capture-test:
+	./tests/foreign/opencode-capture.sh
+	./tests/foreign/opencode-v2-capture.sh
+
+# Synthetic fixtures and a stub queue writer: no build, no store, no network.
+acpx-capture-test:
+	./tests/foreign/acpx-journal-capture.sh
+
+# Synthetic store, stub `muse export` and stub queue writer: no build, no
+# store, no network, no Muse binary. MUSE_CONTRACT_BIN=<muse> adds the
+# stub-vs-real export contract check.
+muse-capture-test:
+	./tests/foreign/muse-store-capture.sh
+
+# Harness parity (liaison docs/design/HARNESS-PARITY.md): publish Memoire's
+# OBSERVED capture coverage per fleet harness for liaison's `harness.parity`
+# row (~/.agents/coverage/memoire.json). `coverage-check` is this project's
+# own gate on its branchements: red while any route is a gap.
+coverage:
+	python3 scripts/memoire-coverage.py --print
+
+coverage-check:
+	python3 scripts/memoire-coverage.py --strict
+	liaison harnesses coverage --owner memoire --strict
 
 qwen-rollout-smoke: build
 	./tests/foreign/qwen-rollout-capture-smoke.sh
@@ -110,13 +174,18 @@ redaction-smoke: build
 claude-capture-smoke: build
 	./tests/foreign/claude-capture-smoke.sh
 
+claude-attribute-smoke: build
+	./tests/foreign/claude-attribute-smoke.sh
+
 build: ui
 	mkdir -p bin
 	go build -tags '$(GO_TAGS)' -ldflags '$(GO_LDFLAGS)' -o bin/memoire-api ./services/api/cmd/api
 	go build -tags '$(GO_TAGS)' -o bin/memoire-derive ./services/api/cmd/derive
+	go build -tags '$(GO_TAGS)' -o bin/memoire-triage ./services/api/cmd/triage
 	go build -tags '$(GO_TAGS)' -o bin/memoire-queue ./services/api/cmd/queue
 	go build -tags '$(GO_TAGS)' -o bin/memoire-redact-derived ./services/api/cmd/redactderived
 	go build -tags '$(GO_TAGS)' -o bin/memoire-purge ./services/api/cmd/purge
+	go build -tags '$(GO_TAGS)' -o bin/memoire-raw-pack ./services/api/cmd/rawpack
 	go build -tags '$(GO_TAGS)' -o bin/memoire-forward ./services/api/cmd/forward
 	go build -tags '$(GO_TAGS)' -o bin/memoire-mint-token ./services/api/cmd/minttoken
 	go build -tags '$(GO_TAGS)' -o bin/memoire-pgshadow ./services/api/cmd/pgshadow
@@ -145,6 +214,7 @@ dist: build
 	cp $(addprefix bin/,$(DIST_BINS)) $(DIST_DIR)/bin/
 	cp $(addprefix scripts/,$(DIST_SCRIPTS)) $(DIST_DIR)/scripts/
 	cp -r scripts/opencode-plugin $(DIST_DIR)/scripts/opencode-plugin
+	cp -r scripts/pi-extension $(DIST_DIR)/scripts/pi-extension
 	cp -r schema $(DIST_DIR)/schema
 	cp -r schema-pg $(DIST_DIR)/schema-pg
 	cp LICENSE VERSION QUICKSTART.md model-endpoints.example.json \
@@ -186,12 +256,12 @@ embed-image:
 #
 # IMMUTABLE pre-release semver tags, NEVER :latest (operator-ruled
 # 2026-07-30): <VERSION>-dev.g<shortsha>. Refuses a dirty worktree so the tag
-# names a real commit. Deploy = replace the three full-ref *_IMAGE consts in
+# names a real commit. Deploy = replace the two full-ref *_IMAGE consts in
 # cdk8s/main.ts with the validated refs this target prints (tag@digest —
 # never hand-assembled; r2 SIMPLIFICATION), `npm run synth`,
-# `make cdk8s-verify`, commit, `make deploy` (the L6 parity gate,
-# memoire:D199 — see below). Push auth is the caller's (one Bitwarden touch,
-# transient login):
+# `make -f Makefile.ledger cdk8s-verify`, commit, `make -f Makefile.ledger
+# deploy` (the L6 parity gate, memoire:D199 — see below). Push auth is the
+# caller's (one Bitwarden touch, transient login):
 #   bw-env-run --file ~/Sync/config/setup-new-machines/bw-env.d/registry-superbiche.env -- \
 #     sh -c 'podman login registry.superbiche.me -u "$REGISTRY_CI_PUSH_USER" \
 #       --password-stdin <<<"$REGISTRY_CI_PUSH_PASSWORD" && make images-push; \
@@ -213,44 +283,26 @@ images-push:
 	@if [ -f .trivyignore.yaml ]; then git ls-files --error-unmatch .trivyignore.yaml >/dev/null 2>&1 && test -z "$$(git status --porcelain -- .trivyignore.yaml)" || { echo "refusing: .trivyignore.yaml exists but is untracked or modified — accepted advisories must be committed state the image tag names (review r1 F1)"; exit 1; }; fi
 	podman build --target api -t $(IMAGE_REGISTRY)/memoire:$(IMAGE_TAG) -f services/api/Containerfile .
 	podman build --target ops -t $(IMAGE_REGISTRY)/memoire-ops:$(IMAGE_TAG) -f services/api/Containerfile .
-	podman build -t $(IMAGE_REGISTRY)/memoire-embed:$(IMAGE_TAG) -f services/embed-worker/Containerfile .
 	bash $(IMAGE_SCAN_SH) $(IMAGE_REGISTRY)/memoire:$(IMAGE_TAG)
 	bash $(IMAGE_SCAN_SH) $(IMAGE_REGISTRY)/memoire-ops:$(IMAGE_TAG)
-	bash $(IMAGE_SCAN_SH) $(IMAGE_REGISTRY)/memoire-embed:$(IMAGE_TAG)
-	podman push $(IMAGE_REGISTRY)/memoire:$(IMAGE_TAG)
-	podman push $(IMAGE_REGISTRY)/memoire-ops:$(IMAGE_TAG)
-	podman push $(IMAGE_REGISTRY)/memoire-embed:$(IMAGE_TAG)
-	@refs=""; for img in memoire memoire-ops memoire-embed; do \
-	  digest=$$(podman image inspect --format '{{index .RepoDigests 0}}' $(IMAGE_REGISTRY)/$$img:$(IMAGE_TAG) | sed 's/.*@//'); \
+	# The printed digest is the one the registry stored (--digestfile), never
+	# podman's local RepoDigests: those can predate the push and leave the
+	# hub with an unpullable ref (ErrImagePull on 2026-10-09).
+	@mkdir -p tmp/images-push
+	podman push --digestfile tmp/images-push/memoire.digest $(IMAGE_REGISTRY)/memoire:$(IMAGE_TAG)
+	podman push --digestfile tmp/images-push/memoire-ops.digest $(IMAGE_REGISTRY)/memoire-ops:$(IMAGE_TAG)
+	@refs=""; for img in memoire memoire-ops; do \
+	  digest=$$(cat tmp/images-push/$$img.digest); \
 	  echo "$$digest" | grep -qE '^sha256:[0-9a-f]{64}$$' || { echo "refusing: no valid digest for $$img:$(IMAGE_TAG) (got '$$digest')"; exit 1; }; \
 	  refs="$$refs  $(IMAGE_REGISTRY)/$$img:$(IMAGE_TAG)@$$digest\n"; \
 	done; \
 	echo "pushed $(IMAGE_TAG) — paste-ready deploy refs (scan ref == rollout ref):"; \
 	printf "$$refs"; \
-	echo "replace the three *_IMAGE consts in cdk8s/main.ts with the refs above (verbatim), npm run synth, make cdk8s-verify, commit, make deploy"
+	echo "replace the two *_IMAGE consts in cdk8s/main.ts with the refs above (verbatim), npm run synth, make -f Makefile.ledger cdk8s-verify, commit, make -f Makefile.ledger deploy"
 
-# Synthesize the cdk8s app to cdk8s/dist/ (requires npm ci in cdk8s/).
-cdk8s-synth:
-	cd cdk8s && npm run synth
-
-# Drift falsifier (cdk8s review round-1 finding 9): the committed synth
-# artifact must match main.ts — a stale dist/ means reviewers approved
-# TypeScript while infra applies old YAML.
-cdk8s-verify: cdk8s-synth
-	git diff --exit-code -- cdk8s/dist
-
-# L6 deploy-parity gate (memoire:D199, jurisprudence 2026-07-30): a
-# manifest<->cluster parity check is a deployment PREREQUISITE. `deploy`
-# = DIFF (refused on unexplained drift — only image/noise lines are the
-# deploy's own delta) -> kubectl apply -> post-apply DIFF-EMPTY captured
-# under tmp/ as the completion artifact. `deploy-diff` runs the parity
-# check alone. Needs the target cluster's kubeconfig; the gate logic is
-# covered clusterless by scripts/tests/deploy-parity-test.sh.
-deploy-diff:
-	bash scripts/memoire-deploy.sh diff
-
-deploy: cdk8s-verify
-	bash scripts/memoire-deploy.sh deploy
+# cdk8s-synth / cdk8s-verify / deploy / deploy-diff moved to
+# Makefile.ledger (L0011 P3): deployment configuration is a ledger
+# subject (a31). `make -f Makefile.ledger deploy-diff` and friends.
 
 quadlet-install:
 	./scripts/quadlet.sh install
@@ -296,35 +348,10 @@ pg-diff:
 # postgres leg creates and drops a throwaway database on the local shadow.
 # Not part of `make test` (needs podman).
 test-pg: pg-shadow-up
-	@MEMOIRE_TEST_PG_URL="$$(./scripts/pg-shadow.sh url --unsafe)" go test -tags 'sqlite_fts5' -run TestEnginePairConformance ./services/api/internal/db/ -count=1 -v
+	@MEMOIRE_TEST_PG_URL="$$(./scripts/pg-shadow.sh url --unsafe)" go test -tags 'sqlite_fts5' -run 'TestEnginePairConformance|TestPGCollation|TestPGLocaleProvider|TestPGMigrateLock|TestBM25' ./services/api/internal/db/ -count=1 -v
 	@MEMOIRE_TEST_PG_URL="$$(./scripts/pg-shadow.sh url --unsafe)" go test -tags 'sqlite_fts5' ./services/api/internal/pgshadow/ -count=1
+	@MEMOIRE_TEST_PG_URL="$$(./scripts/pg-shadow.sh url --unsafe)" go test -tags 'sqlite_fts5' -run 'TestPG' ./services/api/internal/purge/ -count=1 -v
+	@MEMOIRE_TEST_PG_URL="$$(./scripts/pg-shadow.sh url --unsafe)" go test -tags 'sqlite_fts5' ./services/api/internal/redactderived/ ./services/api/cmd/redactderived/ -count=1
 
 fmt:
 	gofmt -w services/api
-
-# Generated decision state (memoire:D169/D171): docs/state/ + docs/views/ are
-# written by greffe, the decision-ledger clerk (extracted from liaison
-# 2026-08-02, liaison:D347), reused as a dev-time dependency — no fork, no Go
-# rewrite, zero product-runtime coupling. docs/state/state-config.json is the
-# hand-written input that gives this repo its own identity, taxonomy and
-# commands; greffe refuses to run without it.
-GREFFE_BIN ?= greffe
-
-define docs_state_run
-	@command -v $(GREFFE_BIN) >/dev/null 2>&1 || { \
-	  echo "FAIL: greffe not found ($(GREFFE_BIN))." >&2; \
-	  echo "      docs/state and docs/views are generated by greffe, the decision-ledger" >&2; \
-	  echo "      clerk (extracted from liaison 2026-08-02, liaison:D347; dev-time" >&2; \
-	  echo "      dependency ratified in memoire:D171)." >&2; \
-	  echo "      Install: uv tool install -e <path-to-your-greffe-checkout>" >&2; \
-	  echo "      or set GREFFE_BIN=<path to the greffe executable> and retry." >&2; \
-	  exit 1; \
-	}
-	$(GREFFE_BIN) $(1) --repo .
-endef
-
-docs-state:
-	$(call docs_state_run,generate)
-
-docs-state-check:
-	$(call docs_state_run,check)

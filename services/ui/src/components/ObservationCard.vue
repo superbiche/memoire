@@ -7,6 +7,7 @@ import { kindStyle } from '../lib/kinds'
 import { fmtRelative, pct } from '../lib/format'
 import KindBadge from './KindBadge.vue'
 import ElevatedBadge from './ElevatedBadge.vue'
+import UsageBadge from './UsageBadge.vue'
 
 const props = defineProps<{ observation: Observation; selected: boolean }>()
 const style = computed(() => kindStyle(props.observation.kind))
@@ -18,8 +19,8 @@ const style = computed(() => kindStyle(props.observation.kind))
     class="group relative w-full overflow-hidden rounded-xl border bg-white text-left transition-all duration-200 dark:bg-zinc-900"
     :class="
       selected
-        ? 'border-violet-400/70 shadow-lg shadow-violet-500/10 ring-2 ring-violet-400/40 dark:border-violet-500/50'
-        : 'border-zinc-200 hover:border-zinc-300 hover:shadow-md hover:shadow-zinc-950/5 dark:border-zinc-800 dark:hover:border-zinc-700'
+        ? 'border-violet-400/70 border-l-4 border-l-violet-500 shadow-lg shadow-violet-500/10 ring-2 ring-violet-500/70 dark:border-violet-500/50 dark:border-l-violet-400 dark:ring-violet-400/60'
+        : 'border-zinc-200 hover:border-zinc-300 hover:shadow-md hover:shadow-zinc-950/5 hover:ring-2 hover:ring-violet-300/50 dark:border-zinc-800 dark:hover:border-zinc-700 dark:hover:ring-violet-500/30'
     "
   >
     <span class="absolute inset-y-0 left-0 w-1" :class="style.accent" />
@@ -60,6 +61,7 @@ const style = computed(() => kindStyle(props.observation.kind))
           </span>
           {{ pct(observation.confidence) }}
         </span>
+        <UsageBadge :usage="observation.usage" />
       </div>
     </div>
   </button>

@@ -8,12 +8,14 @@ import TopBar from './components/TopBar.vue'
 import ReviewView from './components/ReviewView.vue'
 import BrowseView from './components/BrowseView.vue'
 import SessionsView from './components/SessionsView.vue'
+import TriageView from './components/TriageView.vue'
+import Stage2View from './components/Stage2View.vue'
 import ToastHost from './components/ToastHost.vue'
 import { loadQueue, state } from './stores/review'
 import { jumpToObservation } from './stores/sessions'
 
 const authed = ref(Boolean(getToken()))
-const tab = ref<'review' | 'browse' | 'sessions'>('review')
+const tab = ref<'review' | 'triage' | 'stage2' | 'browse' | 'sessions'>('review')
 
 // TopBar "#id" jump: land on the observation inside its session story —
 // the surface that already carries every verdict affordance.
@@ -47,6 +49,8 @@ onMounted(() => {
            Sessions or Browse tab silently applied verdicts to the HIDDEN
            queue's selected card (defect found 2026-07-30). -->
       <ReviewView v-show="tab === 'review'" :active="tab === 'review'" />
+      <TriageView v-if="tab === 'triage'" />
+      <Stage2View v-if="tab === 'stage2'" />
       <BrowseView v-if="tab === 'browse'" />
       <SessionsView v-if="tab === 'sessions'" />
     </main>

@@ -32,6 +32,12 @@ const emit = defineEmits<{
   elevate: []
 }>()
 
+// The elevation bar (memoire:D191(b)), stated at the gesture and not only in
+// the ledger: elevation is a standing-order subscription, not a truth tier.
+// One constant so the chain and plain tooltips cannot drift from each other.
+const ELEVATION_BAR =
+  'standing order: rides EVERY session in this project when session-start injection is on (can_instruct) — elevate caveats/gotchas/invariants only; an important fact is confirmed, not elevated'
+
 const chain = computed(() => needsConfirmChain(props.observation))
 const panel = computed(() => props.size === 'panel')
 const btn = computed(() =>
@@ -92,9 +98,7 @@ const key = computed(() =>
       :class="btn"
       class="bg-violet-600 text-white hover:bg-violet-500"
       :title="
-        chain
-          ? 'confirms first (I vouch), then rides the operating-notes block — two review-log rows'
-          : 'ride the operating-notes block (can_instruct)'
+        chain ? `${ELEVATION_BAR} — chained: confirms first (I vouch), two review-log rows` : ELEVATION_BAR
       "
       @click="emit('elevate')"
     >

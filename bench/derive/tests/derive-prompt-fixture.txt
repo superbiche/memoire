@@ -1,0 +1,141 @@
+# Memoire Observation Derivation
+
+You derive durable memory observations from captured source events.
+
+## Assistant Turns
+
+Assistant turns ARE included when present: events with event_type `claude_assistant_turn` carry the assistant's visible prose (live-captured or transcript-backfilled) and are first-class evidence — often the richest source of conclusions, verdicts, and results. Windows may still be prompt+tool-only when no assistant capture exists. Never invent content beyond what the events state; hidden chain-of-thought is never included.
+
+## Sealed Observation Kinds
+
+Pick kind only from the sealed set. Do not invent kinds.
+
+- `decision`: a settled technical, product, or sequencing decision.
+- `preference`: durable human/project preference.
+- `constraint`: rule, safety boundary, non-goal, or policy limit.
+- `task`: actionable follow-up or re-entry point.
+- `fact`: stable project/runtime fact.
+- `open_question`: unresolved question, design fork, uncertainty, or decision that still needs human/operator review.
+- `gotcha`: an expectation-violating, evidence-backed causal surprise with a concrete cost or failure mode (what bit us, and why).
+
+Prefer the best-fit kind from the seven. Disambiguation:
+- `gotcha`: a resolved, evidence-backed expectation violation with a concrete cost or failure mode (what bit us, and why). Use it for surprise/cost shapes.
+- `fact`: a neutral, stable truth with no surprise or cost attached.
+- `constraint`: a prescriptive rule, boundary, or non-goal to obey going forward.
+- `open_question`: an unresolved question or fork, not a settled finding.
+
+Outcome extraction comes first: when the window contains final results — judge verdicts, test/smoke outcomes, merges, run completions, approvals, failures — state each as a `fact` (or `gotcha` when it violated expectations) INCLUDING the concrete result value (e.g. "J1 verdict PASS 8/8", "4/4 smoke legs green", "merged as <sha>"). Outcomes outrank process notes: never emit a process observation (task created, tool invoked, monitoring set up) when the same events yield an outcome observation.
+
+Consider `gotcha` before `unknown` whenever the candidate describes a costly or unexpected outcome. Use `unknown` only when no sealed kind plausibly applies, and only with full structural analysis: choosing `unknown` requires explicit rejection rationale for at least three sealed kinds plus a hypothesis for what kind would fit. Prefer no output over weak inference. Do not summarize for its own sake.
+
+## Secret Handling
+
+Treat any credential-shaped or secret-shaped content as opaque. Do not reproduce, infer, or reconstruct it in observations. Secret handling is enforced by the raw custody policy upstream, not by the model. Do not claim deletion/purge semantics.
+
+## Confidence Calibration
+
+- 0.9-1.0: directly supported by explicit source evidence.
+- 0.7-0.9: strong inference from clear source evidence.
+- 0.4-0.7: plausible but ambiguous; emit only if useful as proposed.
+- <0.4: do not emit.
+
+## Governance Fields
+
+Each observation may include governance metadata. The model must emit
+the fields below when they apply; omit fields that do not apply.
+
+### provenance
+
+Indicate how the observation was derived. Allowed values:
+- `inferred`: conclusions drawn from source evidence by the model.
+- `generated`: synthetic observations created by the model to fill gaps.
+Reserved values (never emit these): `observed` (a derivation model
+infers, it does not observe — an emitted `observed` is recorded as
+`inferred`), `user_confirmed`, `imported`.
+
+### noise_candidate
+
+Boolean flag. Set to `true` when the observation is speculative, partial,
+or likely noise (e.g., a weak inference that may need re-evaluation).
+Default is `false` (omit the field when false).
+
+Noise genres are STATUS-ONLY narration — they never include final
+results. A final result with its concrete value (a test/smoke verdict,
+a merge, a run completion or failure with what it produced) is an
+OUTCOME under "Outcome extraction" above: a durable `fact`/`gotcha`,
+never noise. The genres below cover the bookkeeping AROUND such
+outcomes — prefer not emitting them at all; any that still carries
+something worth recording must carry `"noise_candidate": true`:
+- orchestration and coordination chatter: lane/worker bookkeeping,
+  "await/monitor completion of X", subagent dispatch and status notes;
+- status-only run narration: progress updates and bare completion or
+  exit-code notices whose only content is that a step ran, carrying no
+  durable result value;
+- transient session mechanics: statements true only while the session
+  runs (what is currently open, running, or awaited), worthless as
+  durable memory once it ends.
+
+## Output Format
+
+Return strict JSON only, no prose wrapper, shaped as:
+
+```json
+{
+  "schema_version": "1",
+  "observations": [
+    {
+      "kind": "decision",
+      "text": "...",
+      "confidence": 0.86,
+      "source_event_ids": [123],
+      "rationale": "...",
+      "provenance": "inferred",
+      "noise_candidate": false
+    }
+  ]
+}
+```
+
+Emit only observations grounded in source event ids. `source_event_ids` must be non-empty and every id must come from the source events below. `source_event_ids` entries must be the numeric event ids (e.g. 12345), never the `source_event_id` strings.
+
+## Source Window
+
+project=memoire session_id=sess-shim-fixture start_epoch=1756000000 end_epoch=1756000400
+
+## Source Events
+
+### event 94101
+- occurred_at_epoch: 1756000000
+- event_type: claude_UserPromptSubmit
+- source_adapter: claude-code
+- source_event_id: u-1
+- project: memoire
+- session_id: sess-shim-fixture
+- prompt: The byte ceiling is shared across models with different tokenizers. Make it per-endpoint data.
+
+### event 94102
+- occurred_at_epoch: 1756000120
+- event_type: claude_assistant_turn
+- source_adapter: claude-code
+- source_event_id: a-1
+- project: memoire
+- session_id: sess-shim-fixture
+
+### event 94103
+- occurred_at_epoch: 1756000240
+- event_type: claude_PostToolUse
+- source_adapter: claude-code
+- source_event_id: t-1
+- project: memoire
+- session_id: sess-shim-fixture
+- tool: Bash
+- result_summary: make test exit 0; 0 FAIL lines
+
+### event 94104
+- occurred_at_epoch: 1756000400
+- event_type: codex_assistant_turn
+- source_adapter: codex
+- source_event_id: c-1
+- project: memoire
+- session_id: sess-shim-fixture
+

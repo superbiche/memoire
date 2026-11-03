@@ -1179,7 +1179,7 @@ type intraRunKillerStore struct {
 	firstID int64
 }
 
-func (s *intraRunKillerStore) InsertDerivedObservationUnlessMatchedLive(ctx context.Context, in db.DerivedObservationInput, matchedIDs []int64) (db.DerivedObservationResult, int64, error) {
+func (s *intraRunKillerStore) InsertDerivedObservationSuperseding(ctx context.Context, in db.DerivedObservationInput, matchedIDs []int64, offers []db.ObservationSupersedeOffer) (db.DerivedObservationGateResult, error) {
 	s.calls++
 	if s.calls == 2 && s.firstID > 0 {
 		if _, err := s.store.TransitionObservationReview(ctx, s.firstID, "accepted", "intra fixture"); err != nil {
@@ -1189,11 +1189,11 @@ func (s *intraRunKillerStore) InsertDerivedObservationUnlessMatchedLive(ctx cont
 			s.t.Errorf("soft-delete first: %v", err)
 		}
 	}
-	res, live, err := s.OrchestratorStore.InsertDerivedObservationUnlessMatchedLive(ctx, in, matchedIDs)
+	out, err := s.OrchestratorStore.InsertDerivedObservationSuperseding(ctx, in, matchedIDs, offers)
 	if s.calls == 1 {
-		s.firstID = res.ID
+		s.firstID = out.Result.ID
 	}
-	return res, live, err
+	return out, err
 }
 
 func TestOrchestratorForceRerunBypassesNearDupContext(t *testing.T) {
@@ -1321,4 +1321,158 @@ func TestOrchestratorNearDupConcurrentWriteCaught(t *testing.T) {
 	if out.WrittenCount != 0 || out.RejectedCount != 1 || out.Status != StatusCompleted {
 		t.Fatalf("mid-generation concurrent paraphrase must be caught by the post-provider gate read: %#v", out)
 	}
+}
+
+// TestOrchestratorRecordsCollapsedEventCounts pins the persistence half of
+// Fibery #365: the collapse counters must reach derivation_runs.meta_json on
+// a real executed run, not only the CLI dry-run's prompt_meta, because the
+// ceiling calibration reads them off the run rows. buildRunMeta nests the
+// whole builder meta under "prompt", so the counters live at
+// meta_json.prompt.collapsed_event_count.
+func TestOrchestratorRecordsCollapsedEventCounts(t *testing.T) {
+	ctx := context.Background()
+	_, store := openTestStore(t)
+	o := newOrchestrator(store)
+
+	seedPrompt(t, store, "sess-collapsed", "e1", 1000, "Memoire decision: chose Go for the API service")
+	for i := 0; i < 5; i++ {
+		// Content-less claude_PostToolUse events: a tool name and no result
+		// summary, the shape every adapter in this repo produces.
+		if _, err := store.Ingest(ctx, db.EventInput{
+			Project:         "memoire-test",
+			SessionID:       "sess-collapsed",
+			SourceAdapter:   "claude-code",
+			SourceEventID:   fmt.Sprintf("collapsed-tool-%d", i),
+			EventType:       "claude_PostToolUse",
+			OccurredAtEpoch: 1100 + int64(i),
+			Payload:         json.RawMessage(`{"tool_name":"Read","tool_input":{"file_path":"/some/path"}}`),
+		}); err != nil {
+			t.Fatalf("ingest tool event %d: %v", i, err)
+		}
+	}
+
+	provider := localFake(func(ctx context.Context, req Request) (ProviderResponse, error) {
+		return validResponse(req), nil
+	})
+	out, err := o.Run(ctx, provider, orchRequest("sess-collapsed"))
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	meta := runMeta(t, store, out.RunID)
+	promptMeta, ok := meta["prompt"].(map[string]any)
+	if !ok {
+		t.Fatalf("run meta carries no prompt block: %v", meta)
+	}
+	if got, _ := promptMeta["collapsed_event_count"].(float64); got != 5 {
+		t.Fatalf("run meta prompt.collapsed_event_count = %v, want 5", promptMeta["collapsed_event_count"])
+	}
+	if got, _ := promptMeta["collapsed_block_count"].(float64); got != 1 {
+		t.Fatalf("run meta prompt.collapsed_block_count = %v, want 1", promptMeta["collapsed_block_count"])
+	}
+	// The manifest still covers every event (memoire:D211): 1 prompt + 5
+	// collapsed tool events.
+	if got, _ := promptMeta["input_event_count"].(float64); got != 6 {
+		t.Fatalf("run meta prompt.input_event_count = %v, want 6", promptMeta["input_event_count"])
+	}
+	ids, _ := promptMeta["input_event_ids"].([]any)
+	if len(ids) != 6 {
+		t.Fatalf("len(run meta prompt.input_event_ids) = %d, want 6", len(ids))
+	}
+}
+
+// TestOrchestratorRecordsContextGeometry pins the provenance half of the
+// derive profile: a run records the generation room it was given, in the run
+// meta and in every observation's derivation block. Without it, a run whose
+// prompt left the model no room to finish looks exactly like a model that had
+// nothing to say (tmp/derive-bench/2026-08-24/autopsy-empty-content.md).
+func TestOrchestratorRecordsContextGeometry(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("limits and thinking declaration are recorded", func(t *testing.T) {
+		dbPath, store := openTestStore(t)
+		o := newOrchestrator(store)
+		seedPrompt(t, store, "sess-geometry", "e1", 1000, "Memoire decision: chose Go")
+
+		req := orchRequest("sess-geometry")
+		req.Limits.MaxPromptBytes = 43929
+		req.Limits.MaxCompletionTokens = 12288
+		req.ThinkingPolicy = "budget"
+		req.ThinkingBudgetTokens = 8192
+
+		provider := localFake(func(ctx context.Context, req Request) (ProviderResponse, error) {
+			return validResponse(req), nil
+		})
+		out, err := o.Run(ctx, provider, req)
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+
+		meta := runMeta(t, store, out.RunID)
+		for key, want := range map[string]float64{
+			"max_prompt_bytes":       43929,
+			"max_completion_tokens":  12288,
+			"thinking_budget_tokens": 8192,
+		} {
+			if got, _ := meta[key].(float64); got != want {
+				t.Fatalf("run meta %s = %v, want %v", key, meta[key], want)
+			}
+		}
+		if meta["thinking_policy"] != "budget" {
+			t.Fatalf("run meta thinking_policy = %v, want budget", meta["thinking_policy"])
+		}
+
+		conn, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000&_journal_mode=WAL")
+		if err != nil {
+			t.Fatalf("open conn: %v", err)
+		}
+		defer conn.Close()
+		var metaJSON string
+		if err := conn.QueryRowContext(ctx, `SELECT meta_json FROM observations WHERE derivation_run_id = ? AND review_state = 'proposed'`, out.RunID).Scan(&metaJSON); err != nil {
+			t.Fatalf("query observation meta: %v", err)
+		}
+		var obsMeta map[string]any
+		if err := json.Unmarshal([]byte(metaJSON), &obsMeta); err != nil {
+			t.Fatalf("unmarshal obs meta: %v", err)
+		}
+		derivation, ok := obsMeta["derivation"].(map[string]any)
+		if !ok {
+			t.Fatalf("observation carries no derivation block: %v", obsMeta)
+		}
+		if got, _ := derivation["max_completion_tokens"].(float64); got != 12288 {
+			t.Fatalf("observation derivation max_completion_tokens = %v, want 12288", derivation["max_completion_tokens"])
+		}
+		if derivation["thinking_policy"] != "budget" {
+			t.Fatalf("observation derivation thinking_policy = %v, want budget", derivation["thinking_policy"])
+		}
+	})
+
+	// An endpoint that declares nothing gets no invented declaration: the
+	// limits are always stated, the thinking keys stay absent.
+	t.Run("an undeclared thinking policy stays absent", func(t *testing.T) {
+		_, store := openTestStore(t)
+		o := newOrchestrator(store)
+		seedPrompt(t, store, "sess-nothink", "e1", 1000, "Memoire decision: chose Go")
+
+		provider := localFake(func(ctx context.Context, req Request) (ProviderResponse, error) {
+			return validResponse(req), nil
+		})
+		out, err := o.Run(ctx, provider, orchRequest("sess-nothink"))
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		meta := runMeta(t, store, out.RunID)
+		if _, ok := meta["thinking_policy"]; ok {
+			t.Fatalf("undeclared thinking policy must not appear: %v", meta["thinking_policy"])
+		}
+		if _, ok := meta["thinking_budget_tokens"]; ok {
+			t.Fatalf("undeclared thinking budget must not appear: %v", meta["thinking_budget_tokens"])
+		}
+		if _, ok := meta["max_prompt_bytes"]; !ok {
+			t.Fatalf("the resolved limits are always recorded: %v", meta)
+		}
+		if got, _ := meta["max_completion_tokens"].(float64); got != 0 {
+			t.Fatalf("max_completion_tokens = %v, want 0 (adapter default)", meta["max_completion_tokens"])
+		}
+	})
 }

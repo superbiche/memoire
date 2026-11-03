@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# pre-push — the L0011 P3 leak gate. Every outgoing commit is scanned
+# (full tree contents, file names, commit message) with
+# scripts/leak/leak-scan.sh using that same commit's generic pattern and
+# exemption files (the reviewed state), plus the maintainer sensitive set
+# at $HOME/.memoire/export/leak-patterns.txt when present and non-empty —
+# without it the scan uses generic shapes only and says so. Any hit
+# refuses the push (exit 1). No network, no personal paths, local-only.
+# Optional local extensions: executable files in
+# $HOME/.memoire/hooks/pre-push.d/ run after the gate passes with the
+# original stdin; they are report-only and a missing directory is a no-op.
+set -uo pipefail
+
+refuse() { echo "pre-push leak gate: $1 — refusing the push" >&2; exit 1; }
+
+# Materialize a commit's tree from raw blobs (review r1 F1): git archive
+# honours export-ignore and export-subst, so a tracked file could reach the
+# remote unscanned. Every regular file and symlink (written as a file holding
+# its target) is extracted byte for byte; any other object mode is refused.
+materialize() { # <commit> <dir>
+  local commit="$1" dir="$2" entry meta path mode sha
+  git ls-tree -r -z --full-tree "$commit" > "$WORK/ls-tree" || return 1
+  while IFS= read -r -d '' entry; do
+    meta="${entry%%$'\t'*}"; path="${entry#*$'\t'}"
+    mode="${meta%% *}"; sha="${meta##* }"
+    case "$mode" in
+      100644|100755|120000) ;;
+      *) echo "pre-push leak gate: unsupported object mode $mode at $path in $commit" >&2; return 1 ;;
+    esac
+    mkdir -p -- "$dir/$(dirname -- "$path")" || return 1
+    git cat-file blob "$sha" > "$dir/$path" || return 1
+  done < "$WORK/ls-tree"
+}
+
+remote="${1:-origin}"
+url="${2:-}"
+toplevel="$(git rev-parse --show-toplevel)" || refuse "cannot resolve the repository top level"
+cd "$toplevel" || refuse "cannot enter $toplevel"
+
+# The maintainers' private repositories (the ledger and, until the L0011
+# cutover, memoire-source) carry private material by design: a push there is
+# not scanned. Every other destination is.
+case "$url" in
+  */superbiche/memoire-source|*/superbiche/memoire-source.git|*:superbiche/memoire-source.git|\
+  */superbiche/memoire-ledger|*/superbiche/memoire-ledger.git|*:superbiche/memoire-ledger.git)
+    echo "pre-push leak gate: private destination ($url), not scanned" >&2
+    exit 0 ;;
+esac
+
+SCAN="$toplevel/scripts/leak/leak-scan.sh"
+[[ -f "$SCAN" ]] || { echo "pre-push leak gate: scanner missing ($SCAN) — refusing the push" >&2; exit 1; }
+GEN_DEFAULT="$toplevel/scripts/leak/leak-patterns-generic.txt"
+EXE_DEFAULT="$toplevel/scripts/leak/leak-exemptions.txt"
+SENS="$HOME/.memoire/export/leak-patterns.txt"
+
+# Pre-push stdin: "<local ref> <local sha> <remote ref> <remote sha>" per
+# line. Keep it for the extension pass-through below.
+STDIN_RAW="$(cat)" || refuse "cannot read the pushed refs"
+
+WORK="$(mktemp -d)" || refuse "cannot create a scratch directory"
+trap 'rm -rf "$WORK"' EXIT
+
+if [[ -f "$SENS" && -s "$SENS" ]]; then
+  SENS_ARGS=(--sensitive "$SENS")
+else
+  SENS_ARGS=()
+  echo "pre-push leak gate: sensitive set absent or empty — scanning with generic shapes only" >&2
+fi
+
+refused=0
+# Deletions (local sha all zeros) are not scanned.
+while read -r lref lsha rref rsha; do
+  [[ -n "$lsha" ]] || continue
+  [[ "$lsha" =~ ^0+$ ]] && continue
+  # Outgoing commits; with a ref-less remote this is the whole history.
+  outgoing="$(git rev-list "$lsha" --not --remotes="$remote")" || refuse "cannot list the outgoing commits of $lref"
+  while IFS= read -r commit; do
+    [[ -n "$commit" ]] || continue
+    tree="$WORK/tree-$commit"
+    mkdir -p "$tree" || refuse "cannot create $tree"
+    materialize "$commit" "$tree" || refuse "cannot materialize commit $commit"
+    # Patterns and exemptions are read from the same commit (the reviewed
+    # state); pre-scan commits fall back to the checkout copies.
+    gen="$WORK/gen-$commit.txt"
+    git show "$commit:scripts/leak/leak-patterns-generic.txt" > "$gen" 2>/dev/null \
+      || cp "$GEN_DEFAULT" "$gen" || refuse "no generic pattern file for $commit"
+    exe="$WORK/exe-$commit.txt"
+    git show "$commit:scripts/leak/leak-exemptions.txt" > "$exe" 2>/dev/null \
+      || cp "$EXE_DEFAULT" "$exe" || refuse "no exemptions file for $commit"
+    report="$WORK/report-$commit.txt"
+    if ! bash "$SCAN" --tree "$tree" --report "$report" \
+      --generic "$gen" --exemptions "$exe" "${SENS_ARGS[@]}"; then
+      refused=1
+      echo "pre-push leak gate: REFUSED — commit $commit (file content or name; report: $report)" >&2
+    fi
+    # The commit message is scanned alone, with the same patterns and no
+    # exemptions (an exemption must name a tree file, never a message).
+    mdir="$WORK/msg-$commit"
+    mkdir -p "$mdir"
+    git log -1 --format=%B "$commit" > "$mdir/message.txt" || refuse "cannot read the message of $commit"
+    mreport="$WORK/message-report-$commit.txt"
+    if ! bash "$SCAN" --tree "$mdir" --report "$mreport" \
+      --generic "$gen" "${SENS_ARGS[@]}"; then
+      refused=1
+      echo "pre-push leak gate: REFUSED — commit $commit (commit message; report: $mreport)" >&2
+    fi
+  done <<< "$outgoing"
+done <<< "$STDIN_RAW"
+
+if [[ "$refused" -eq 1 ]]; then
+  echo "pre-push leak gate: push refused (see reports above) — remove or scrub the offending content and try again" >&2
+  exit 1
+fi
+
+# Optional local extensions (report-only, run after the gate passed).
+EXT_DIR="$HOME/.memoire/hooks/pre-push.d"
+if [[ -d "$EXT_DIR" ]]; then
+  for ext in "$EXT_DIR"/*; do
+    [[ -x "$ext" ]] || continue
+    if ! printf '%s\n' "$STDIN_RAW" | "$ext" "$remote" > /dev/null; then
+      echo "pre-push: extension $ext reported a failure (non-blocking)" >&2
+    fi
+  done
+fi
+exit 0

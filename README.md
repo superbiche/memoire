@@ -1,84 +1,87 @@
 # Memoire
 
-Sovereign, local-first memory for a multi-harness AI workflow. Sessions from
-Claude Code, Codex, Qwen, and opencode are captured into one store the
-operator owns. Capture adapters for all four harnesses ship here; the
-bootstrap emits the Claude Code wiring (`QUICKSTART.md` covers that path),
-while the Codex, Qwen, and opencode capture scanners ship as scripts whose
-invocation and scheduling are left to you. A model endpoint you provide
-derives durable observations; the operator reviews them; the useful ones
-greet new sessions through the injection surfaces (Claude Code and opencode
-wired today; the envelope adapter serves any harness). Capture comes first
-and is never blocked by anything downstream. Memory and context belong to
-the operator, not to a provider — **foreign-client read parity is a hard
-requirement, not a feature**.
+Memoire is a local-first capture and custody service for people who work with
+AI coding agents. It records what your agents and you actually did — prompts,
+tool calls, tool output, transcripts — from several harnesses into one store you
+own, keeps every byte, and lets you search that record by exact text and date
+over HTTP, MCP or a shell.
 
-Memoire is the shared-memory half of Liaison's founding pain fork. It is a
-sibling under contract in that ecosystem, not a subtree: the two repos share
-doctrine and, under one stated fence, dev-time tooling — never runtime
-(memoire:D169, memoire:D171).
+It is the **source of record**, not the memory layer. Deciding what a record
+*means* — what was decided, what was learned — belongs to a separate
+agent-memory system, [Hindsight](https://github.com/vectorize-io/hindsight), which reads from it. Memoire answers a narrower
+question: what exactly was said or run, and when. Its read surfaces serve raw,
+dated records and hold no derived memory by default. (Memoire used to derive
+and review observations itself; chapter 2 of the Great Book tells what became
+of that.)
 
-## Lanes
+## Who it is for
 
-Memoire runs in three topologies. They differ by equipment, not by nature
-(memoire:D232): the core — capture, replayable custody, the review
-lifecycle, search — is the same system in every lane, guaranteed by the
-dual-engine storage contract (memoire:D157: a storage and lifecycle
-guarantee, not a feature-parity guarantee).
+Anyone who runs coding agents (Claude Code, Codex, Qwen, opencode and others)
+and wants a durable, greppable, self-hosted record of those sessions, with no
+account, no hosted tier and no telemetry. Memoire is single-operator by design.
 
-| Capability | SQLite full-client | PG full-client | Thin client + hub |
-|---|---|---|---|
-| Capture, replayable custody, queue | yes | yes | yes (client) |
-| Review lifecycle (full, incl. elevation) | yes | yes | yes (hub UI) |
-| FTS search | yes | yes | yes |
-| Derivation | model endpoint you provide¹ | model endpoint you provide¹ | hub service |
-| Hybrid retrieval (vectors + RRF) | no — FTS-only | wanted-later² | yes |
+## What works today
 
-¹ BYOK: bring your own endpoint — exactly two dialects, OpenAI-compatible
-v1 and Anthropic (closed set, extended by operator ruling only; see
-`QUICKSTART.md` "Optional: derivation"). Evidenced by the two-dialect
-stub legs in `tests/e2e/standalone-sqlite-smoke.sh` and the
-engine-independent adapter contract tests — a matrix cell is a claim only
-when a test or live deployment backs it. The end-to-end composition is
-exercised on SQLite; on PG it is an open, ledgered gap (see the evidence
-paragraph below).
-² Wanted-later, tracked in the source project's roadmap ledger. Hybrid
-retrieval is PG-only by ruling (memoire:D218); the SQLite lane is
-FTS-only by design, not degradation.
+- **Capture**, fail-open and never blocking a session: Claude Code (hooks plus
+  a transcript sweep), Codex, Qwen, opencode and Muse Code (sweeps of their own
+  session files), Pi (extension), sessions driven through `acpx`, and a generic
+  text adapter. Gemini has no adapter.
+- **Custody**: every event is kept without expiry in a replayable store and in
+  `raw/` envelope files (packed into immutable compressed parts by
+  `memoire-raw-pack`). Deleting an event only hides it; `memoire-purge` is the
+  deliberate, gated hard delete.
+- **Redaction at the source**: secret-shaped content is removed before anything
+  is written, by the shared `redact-v7` ruleset (Caviar). It fails closed.
+- **Search and reads**: full-text search, timeline, context and by-id reads over
+  raw records, with a date on every hit and an optional `occurred_after`
+  bound. Four read-only MCP tools (`memoire_search`, `memoire_timeline`,
+  `memoire_context`, `memoire_get_observations`); the three that search look back
+  30 days by default.
+- **Two shapes, one binary**: standalone on SQLite (one binary, one
+  `MEMOIRE_HOME`, no external services) or PostgreSQL, and a hub that thin
+  clients forward to (chapter 4 describes a reference Kubernetes deployment).
 
-Evidence per column, each layer named separately: the SQLite lane is the
-default `make test` engine plus `tests/e2e/standalone-sqlite-smoke.sh`,
-which composes capture→queue→BYOK-derive→proposed-row end-to-end. The PG
-lane's store and lifecycle layers are backed by the dual-engine
-store-contract battery (`make test-pg` in the source repository — the
-same store code against a live PostgreSQL), the cutover parity record
-(memoire:D158/D159), and the hub's production PG deployment (which runs
-its own hub-side derive lane, not BYOK). The composed PG+BYOK
-end-to-end leg has NOT been exercised by any test or deployment yet —
-the BYOK adapter itself is engine-independent and contract-tested, but
-the composition is an open gap, ledgered in the source project's roadmap
-ledger. The hub lane is the live deployment this repo operates
-(memoire:D186 onward). Derivation is a Memoire service in every lane —
-never a harness-adapter behavior (boundary law, memoire:D231).
+```
+ Claude Code  Codex  Qwen  opencode  Muse  Pi  acpx  text
+      └──────────┴──────┴─────┴────────┴─────┴────┴──────┘
+                          │ capture (fail-open, redacted)
+                          ▼
+                  queue/pending/*.json
+                          │ drain
+                          ▼
+           raw/ envelopes  +  events  +  raw projection (indexed)
+                          │
+          ┌───────────────┴────────────────┐
+          ▼                                ▼
+  dated lookup: HTTP, MCP, curl     Hindsight, audit, replay
+```
 
-This file is otherwise human-facing and pointer-only (memoire:D173):
-identity and lanes above, pointers below, zero perishable facts.
-Anything that changes lives in a surface that regenerates.
+## Get started
 
-The `memoire:D<n>` citations throughout are entries in the decision
-ledger, which lives in the private source repository (`memoire-source`)
-— the public export carries the code and its honest state, not the
-ledger custody (curated-export ruling, memoire:D226).
+`QUICKSTART.md` takes you from a build to a captured and searched event on the
+standalone SQLite shape.
 
-- **Humans**: the Great Book — `docs/great-book/` — is the readable manual of
-  the system, one edition per version. It ships in every checkout.
-- **Current state** ("where are we"): `VERSION` carries the version and its
-  goal; `MISSING.md` is that version's honest punch-list and ships with every
-  release.
-- **In the private source repository only** (deliberately excluded from the
-  public export): the decision ledgers (`DECISIONS.md`, `BURN-DECISIONS.md`),
-  the generated state and views (`docs/state/`, `docs/views/`), the
-  wanted-later ledger (`ROADMAP.md`), vocabulary, progress history, and the
-  agent instruction surfaces (`AGENTS.md`).
-- **Agents working in the source repository: your files are `AGENTS.md` and
-  your gesture's view (`docs/views/`) — this file is not for you.**
+```sh
+make build
+./scripts/memoire-bootstrap.sh
+./bin/memoire-api
+```
+
+## Read more
+
+The Great Book in `docs/great-book/` is the manual, one edition per version:
+
+1. Identity & the custody thesis
+2. The life of a captured event (including the retired derivation lane)
+3. Custody & redaction
+4. Operating the service
+5. The seams (Hindsight, Liaison, Conclave, the redaction core, harnesses)
+6. The CLI & MCP surface
+
+`docs/API-SURFACE.json` is the versioned HTTP and MCP inventory, enforced by
+contract tests. `MISSING.md` lists the known gaps of the current version.
+
+## Status and license
+
+Pre-release `0.x`; the version and its goal are in `VERSION`. Licensed
+AGPL-3.0-only — see `LICENSE`.

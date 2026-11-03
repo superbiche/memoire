@@ -1,0 +1,9 @@
+{
+  "comment": [
+    "Graduated noise genres (triage lane v1, R-B). A genre lands here only through `memoire-triage -graduate`, which refuses on a non-zero flip set — an operator kept at least one row the genre claimed — and which writes the dated record beside the entry.",
+    "This is DEATH AT DERIVATION: a graduated genre is instructed as never-emit, so the rows stop being written at all. Default death stays at TRIAGE, where a human sees every row; graduation is the narrow, evidence-gated exception per genre.",
+    "The file is embedded into the binary rather than read at runtime so the standalone single-binary contract holds and so a graduation is a reviewable commit, not an exec-edit (the memoire:D252 custody lesson).",
+    "genres[] entries: slug (the reason_genre the judge emitted), instruction (the never-emit line rendered into the derivation prompt), record (the dated record that ratified it), graduated_on (ISO date), evidence (occurrences and judged counts at graduation)."
+  ],
+  "genres": []
+}

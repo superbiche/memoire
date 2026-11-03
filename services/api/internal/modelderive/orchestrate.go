@@ -37,6 +37,7 @@ type OrchestratorStore interface {
 	RecordRunInputEvents(context.Context, string, []int64) error
 	InsertDerivedObservation(context.Context, db.DerivedObservationInput) (db.DerivedObservationResult, error)
 	InsertDerivedObservationUnlessMatchedLive(context.Context, db.DerivedObservationInput, []int64) (db.DerivedObservationResult, int64, error)
+	InsertDerivedObservationSuperseding(context.Context, db.DerivedObservationInput, []int64, []db.ObservationSupersedeOffer) (db.DerivedObservationGateResult, error)
 	UpdateDerivationRunStatus(context.Context, db.DerivationRunStatusUpdate) error
 }
 
@@ -69,7 +70,12 @@ type RunOutcome struct {
 	RejectedCount int
 	UnknownCount  int
 	Refused       bool
-	Usage         Usage
+	// SupersededCount counts the writes that replaced an earlier cut's
+	// proposed observation instead of being rejected against it (Fibery
+	// #344). A SUBSET of WrittenCount, never an addition to it: a superseding
+	// write is a write.
+	SupersededCount int
+	Usage           Usage
 	// Skipped is a non-empty marker (e.g. SkipReasonDegenerateWindow) when the
 	// orchestrator declined the window before creating a run: no run record, no
 	// provider call, RunID and Status empty.
@@ -125,7 +131,8 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 	if req.Window.StartEpoch > 0 && req.Window.EndEpoch > 0 && req.Window.EndEpoch < req.Window.StartEpoch {
 		return RunOutcome{}, errors.New("modelderive: window end_epoch must be >= start_epoch")
 	}
-	if req.Limits.MaxInputEvents < 0 || req.Limits.MaxPromptBytes < 0 || req.Limits.MaxOutputObservations < 0 {
+	if req.Limits.MaxInputEvents < 0 || req.Limits.MaxPromptBytes < 0 || req.Limits.MaxOutputObservations < 0 ||
+		req.Limits.MaxCompletionTokens < 0 {
 		return RunOutcome{}, errors.New("modelderive: limits must be non-negative")
 	}
 
@@ -365,6 +372,7 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 	// provider-call minutes to the write window, journaled not solved.
 	written := 0
 	nearDupRejected := 0
+	var supersededCandidates []SupersededCandidate
 	if genErr == nil && parseErr == nil && len(parsed.Observations) > 0 {
 		var refs []nearDupRef
 		if gateSession {
@@ -372,7 +380,7 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 			if gerr != nil {
 				return RunOutcome{}, gerr
 			}
-			refs = nearDupRefsFromSession(gateObs)
+			refs = nearDupRefsFromSession(gateObs, runRes.ID)
 		}
 		kept := parsed.Observations[:0]
 		for _, obs := range parsed.Observations {
@@ -395,20 +403,58 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 				})
 			}
 			matchedIDs, scoreByID := hitIDs(hits)
-			insertedID, liveMatch, ierr := o.insertProposedGated(ctx, req, runRes.ID, inputHash, boundary, obs, matchedIDs)
+			// Supersede offers (Fibery #344): the classification happens here,
+			// per matched ref, and the STORE decides — it holds the target's
+			// state and the insert in one transaction. Offers travel per
+			// target because the transaction rejects or supersedes against
+			// whichever matched row it finds live, which is not always the
+			// strongest hit.
+			offers, offerScores := o.supersedeOffers(req, runRes.ID, inputHash, boundary, obs, hits, scoreByID)
+			gate, ierr := o.insertProposedGated(ctx, req, runRes.ID, inputHash, boundary, obs, matchedIDs, offers)
 			if ierr != nil {
 				return RunOutcome{}, ierr
 			}
-			if liveMatch > 0 {
-				reject(fmt.Sprintf("near-duplicate of observation %d (trigram=%.2f)", liveMatch, scoreByID[liveMatch]))
+			if gate.LiveMatchID > 0 {
+				reject(fmt.Sprintf("near-duplicate of observation %d (trigram=%.2f)", gate.LiveMatchID, scoreByID[gate.LiveMatchID]))
 				continue
 			}
 			written++
+			if gate.SupersededID > 0 {
+				scores := offerScores[gate.SupersededID]
+				supersededCandidates = append(supersededCandidates, SupersededCandidate{
+					Kind:           obs.Kind,
+					Text:           obs.Text,
+					SourceEventIDs: obs.SourceEventIDs,
+					ObservationID:  gate.Result.ID,
+					SupersededID:   gate.SupersededID,
+					Trigram:        scores.Trigram,
+					Containment:    scores.Containment,
+					Growth:         scores.Growth,
+				})
+				// The superseded target leaves the ref set, mirroring the
+				// store read that no longer offers it (D5): a later candidate
+				// in this response is judged against the SUCCESSOR, never
+				// against a row this run has already retired.
+				//
+				// Defense in depth, honestly labeled: in every constructible
+				// case the successor CONTAINS the target, so it outscores it
+				// and the store's first-live match is the successor anyway —
+				// and when it is not, the CAS's zero-row branch re-decides
+				// against fresh state. This keeps the ref set and the store
+				// read saying the same thing rather than relying on that.
+				refs = dropNearDupRef(refs, gate.SupersededID)
+			}
 			// The just-inserted row joins the ref set under its REAL id
 			// (round-2): a later candidate matching it re-checks its liveness
 			// in the same in-transaction path as any session row — the
 			// index-only intra-run shortcut bypassed liveness entirely.
-			refs = append(refs, nearDupRef{profile: buildNearDupProfile(obs.Text), observationID: insertedID})
+			refs = append(refs, nearDupRef{
+				profile:       buildNearDupProfile(obs.Text),
+				observationID: gate.Result.ID,
+				reviewState:   "proposed",
+				intraResponse: true,
+				sameRun:       true,
+			})
 			kept = append(kept, obs)
 		}
 		parsed.Observations = kept
@@ -427,7 +473,11 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 		written == 0 && nearDupRejected > 0 && otherRejected == 0 && len(parsed.UnknownCandidates) == 0 {
 		status = StatusCompleted
 	}
-	meta := o.buildRunMeta(req, inputHash, boundary, status, promptMeta, resp, parsed, written, runRes.RetryCount, genErr, parseErr)
+	// A superseding write is a write, so the D43 table is untouched: a
+	// response whose candidates all superseded lands on the same row a
+	// response whose candidates all wrote plainly does — written>0,
+	// rejected==0 => completed.
+	meta := o.buildRunMeta(req, inputHash, boundary, status, promptMeta, resp, parsed, written, supersededCandidates, runRes.RetryCount, genErr, parseErr)
 	// Context provenance: how much session history the dupe defenses saw,
 	// and what the prompt actually carried after the yielding budget
 	// (rendered entries + truncation live in promptMeta; the builder is the
@@ -469,6 +519,7 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 		WrittenCount:    written,
 		RejectedCount:   len(parsed.RejectedCandidates),
 		UnknownCount:    len(parsed.UnknownCandidates),
+		SupersededCount: len(supersededCandidates),
 		Refused:         refused,
 		Usage:           resp.Usage,
 		Forced:          runRes.Forced,
@@ -477,17 +528,72 @@ func (o *Orchestrator) Run(ctx context.Context, provider Provider, req Request) 
 	}, nil
 }
 
-// insertProposedGated writes one proposed observation unless one of the
-// gate-matched rows is still live at insert time (checked inside the insert
-// transaction — round-1 finding 1). liveMatch > 0 means no write happened
-// and names the row the rejection stands on; otherwise insertedID is the
-// new row's id (it joins the gate's ref set). An empty matchedIDs is a
-// plain ungated insert.
-func (o *Orchestrator) insertProposedGated(ctx context.Context, req Request, runID, inputHash, boundary string, obs CandidateObservation, matchedIDs []int64) (insertedID, liveMatch int64, err error) {
-	contentHash, err := derive.CanonicalContentHash(req.Window.Project, obs.Kind, obs.Text)
-	if err != nil {
-		return 0, 0, err
+// dropNearDupRef removes one ref by observation id, preserving order.
+func dropNearDupRef(refs []nearDupRef, id int64) []nearDupRef {
+	out := refs[:0]
+	for _, ref := range refs {
+		if ref.observationID != id {
+			out = append(out, ref)
+		}
 	}
+	return out
+}
+
+// supersedeScoreSet is the three-number record of one supersede decision,
+// carried into run metadata so the uncalibrated thresholds can be re-derived
+// from real sweeps.
+type supersedeScoreSet struct {
+	Trigram     float64
+	Containment float64
+	Growth      float64
+}
+
+// supersedeOffers classifies every gate hit for one candidate and builds the
+// store's per-target offers, each carrying the observation metadata that
+// applies IF that offer wins the CAS. The kill switch (-no-supersede) returns
+// nothing, which makes the gate behave exactly as it did before #344.
+func (o *Orchestrator) supersedeOffers(req Request, runID, inputHash, boundary string, obs CandidateObservation, hits []nearDupMatch, scoreByID map[int64]float64) ([]db.ObservationSupersedeOffer, map[int64]supersedeScoreSet) {
+	if req.NoSupersede || len(hits) == 0 {
+		return nil, nil
+	}
+	cand := buildNearDupProfile(obs.Text)
+	var offers []db.ObservationSupersedeOffer
+	scores := map[int64]supersedeScoreSet{}
+	for _, hit := range hits {
+		if hit.ref.observationID <= 0 {
+			continue
+		}
+		containment, growth, ok := supersedeVerdict(cand, hit.ref)
+		if !ok {
+			continue
+		}
+		set := supersedeScoreSet{
+			Trigram:     scoreByID[hit.ref.observationID],
+			Containment: containment,
+			Growth:      growth,
+		}
+		meta, err := o.observationMeta(req, runID, inputHash, boundary, obs, &supersedeMeta{target: hit.ref.observationID, scores: set})
+		if err != nil {
+			// An unencodable supersede block must never lose the candidate:
+			// with no offer the pair rejects exactly as it does today.
+			continue
+		}
+		offers = append(offers, db.ObservationSupersedeOffer{TargetID: hit.ref.observationID, Metadata: meta})
+		scores[hit.ref.observationID] = set
+	}
+	return offers, scores
+}
+
+// supersedeMeta is the optional supersede block for one candidate's
+// metadata, present only on the variant that applies if that offer wins.
+type supersedeMeta struct {
+	target int64
+	scores supersedeScoreSet
+}
+
+// observationMeta builds one candidate's meta_json (memoire:D47 provenance),
+// optionally carrying the supersede block for a specific target.
+func (o *Orchestrator) observationMeta(req Request, runID, inputHash, boundary string, obs CandidateObservation, sup *supersedeMeta) (json.RawMessage, error) {
 	metaMap := map[string]any{
 		"confidence_source": ConfidenceSourceModel,
 		"rationale":         obs.Rationale,
@@ -503,15 +609,45 @@ func (o *Orchestrator) insertProposedGated(ctx context.Context, req Request, run
 			"input_hash":              inputHash,
 		},
 	}
+	addContextGeometry(metaMap["derivation"].(map[string]any), req)
 	if len(obs.Extra) > 0 {
 		metaMap["model_response_extra"] = obs.Extra
 	}
-	meta, err := json.Marshal(metaMap)
+	// Provisional (Fibery #344): this row was derived from a window whose
+	// tail is still open — the session may be running and the arc unfinished.
+	// Meta only, no column, no retrieval change: a measurement hook (what
+	// gets superseded fast was scaffolding) and a future triage hint.
+	if req.Provisional {
+		metaMap["provisional"] = true
+	}
+	if sup != nil {
+		metaMap["supersede"] = map[string]any{
+			"of":          sup.target,
+			"trigram":     sup.scores.Trigram,
+			"containment": sup.scores.Containment,
+			"growth":      sup.scores.Growth,
+		}
+	}
+	return json.Marshal(metaMap)
+}
+
+// insertProposedGated writes one proposed observation unless one of the
+// gate-matched rows is still live at insert time (checked inside the insert
+// transaction — round-1 finding 1). A live match means no write happened and
+// names the row the rejection stands on; an offered-and-won match means the
+// write superseded it (Fibery #344); otherwise it is an ordinary write. An
+// empty matchedIDs is a plain ungated insert.
+func (o *Orchestrator) insertProposedGated(ctx context.Context, req Request, runID, inputHash, boundary string, obs CandidateObservation, matchedIDs []int64, offers []db.ObservationSupersedeOffer) (db.DerivedObservationGateResult, error) {
+	contentHash, err := derive.CanonicalContentHash(req.Window.Project, obs.Kind, obs.Text)
 	if err != nil {
-		return 0, 0, err
+		return db.DerivedObservationGateResult{}, err
+	}
+	meta, err := o.observationMeta(req, runID, inputHash, boundary, obs, nil)
+	if err != nil {
+		return db.DerivedObservationGateResult{}, err
 	}
 	confidence := obs.Confidence
-	res, liveMatch, err := o.Store.InsertDerivedObservationUnlessMatchedLive(ctx, db.DerivedObservationInput{
+	return o.Store.InsertDerivedObservationSuperseding(ctx, db.DerivedObservationInput{
 		Project:         req.Window.Project,
 		SessionID:       req.Window.SessionID,
 		Kind:            obs.Kind,
@@ -525,16 +661,18 @@ func (o *Orchestrator) insertProposedGated(ctx context.Context, req Request, run
 		Metadata:        meta,
 		Provenance:      obs.Provenance,
 		NoiseCandidate:  obs.NoiseCandidate,
-	}, matchedIDs)
-	return res.ID, liveMatch, err
+	}, matchedIDs, offers)
 }
 
-// candidateReasonCounts aggregates one counter per rejection class.
-// Unknown-kind audit candidates get their own counter, and a syntactically
-// valid response carrying zero candidates gets an explicit empty_observations
-// marker — the two cases that used to surface as an unexplainable
-// "partial, written=0, rejected=0".
-func candidateReasonCounts(parsed ParsedResponse, written int, genErr, parseErr error, refused bool) map[string]int {
+// candidateReasonCounts aggregates one counter per candidate OUTCOME class.
+// Rejection classes dominate it; unknown-kind audit candidates get their own
+// counter; a syntactically valid response carrying zero candidates gets an
+// explicit empty_observations marker — the two cases that used to surface as
+// an unexplainable "partial, written=0, rejected=0". Since Fibery #344 the map
+// also carries `supersede`, which is NOT a rejection: it counts writes that
+// replaced an earlier cut's proposal, so one map explains where every
+// candidate went.
+func candidateReasonCounts(parsed ParsedResponse, written, superseded int, genErr, parseErr error, refused bool) map[string]int {
 	counts := map[string]int{}
 	for _, rc := range parsed.RejectedCandidates {
 		class := rc.Class
@@ -545,6 +683,9 @@ func candidateReasonCounts(parsed ParsedResponse, written int, genErr, parseErr 
 	}
 	if n := len(parsed.UnknownCandidates); n > 0 {
 		counts[RejectClassUnknownKind] = n
+	}
+	if superseded > 0 {
+		counts[OutcomeClassSupersede] = superseded
 	}
 	if written == 0 && len(counts) == 0 && genErr == nil && parseErr == nil && !refused {
 		counts[RejectClassEmptyResponse] = 1
@@ -573,6 +714,25 @@ func decideStatus(genErr, parseErr error, refused bool, written, rejected int) s
 	return StatusPartial
 }
 
+// addContextGeometry records the context geometry the run actually ran under:
+// the resolved prompt/completion ceilings and, when the endpoint declared one,
+// the serving-side thinking policy (docs/DERIVE-PROFILE-DESIGN.md §4). Without
+// it a run whose generation room was too small for the model's thinking phase
+// is indistinguishable, after the fact, from a model that had nothing to say.
+//
+// Additive meta_json only — no schema migration, and the thinking declaration
+// is provenance, never a request-side instruction.
+func addContextGeometry(meta map[string]any, req Request) {
+	meta["max_prompt_bytes"] = req.Limits.MaxPromptBytes
+	meta["max_completion_tokens"] = req.Limits.MaxCompletionTokens
+	if req.ThinkingPolicy != "" {
+		meta["thinking_policy"] = req.ThinkingPolicy
+	}
+	if req.ThinkingBudgetTokens > 0 {
+		meta["thinking_budget_tokens"] = req.ThinkingBudgetTokens
+	}
+}
+
 func (o *Orchestrator) buildRunMeta(
 	req Request,
 	inputHash, boundary, status string,
@@ -580,6 +740,7 @@ func (o *Orchestrator) buildRunMeta(
 	resp ProviderResponse,
 	parsed ParsedResponse,
 	written int,
+	superseded []SupersededCandidate,
 	retryCount int,
 	genErr, parseErr error,
 ) map[string]any {
@@ -610,6 +771,20 @@ func (o *Orchestrator) buildRunMeta(
 		"unmapped_candidates":       parsed.UnknownCandidates,
 		"unmapped_ratio":            unmappedRatio,
 	}
+	addContextGeometry(meta, req)
+	// Supersede provenance (Fibery #344), same shape as rejected_candidates:
+	// the text, the target it replaced, and the three scores the decision
+	// stood on — the calibration record for thresholds chosen by judgment.
+	// superseded_count is a SUBSET of written_observation_count.
+	if len(superseded) > 0 {
+		meta["superseded_candidates"] = superseded
+		meta["superseded_count"] = len(superseded)
+	}
+	// Provisional (Fibery #344): the window's tail was still open when this
+	// run derived it, so its observations are "so far" statements.
+	if req.Provisional {
+		meta["provisional"] = true
+	}
 	// byok transport identity (docs/BYOK-DERIVE-DESIGN.md §2): dialect is
 	// audit metadata like endpoint_id, never part of run idempotency.
 	if req.Dialect != "" {
@@ -618,7 +793,7 @@ func (o *Orchestrator) buildRunMeta(
 	// One counter per rejection class so a "partial, written=0" run is
 	// explainable from run metadata alone, without reading every reason string
 	// (operator brief 2026-07-10, sweep hygiene).
-	if counts := candidateReasonCounts(parsed, written, genErr, parseErr, resp.Refusal != ""); len(counts) > 0 {
+	if counts := candidateReasonCounts(parsed, written, len(superseded), genErr, parseErr, resp.Refusal != ""); len(counts) > 0 {
 		meta["candidate_reason_counts"] = counts
 	}
 	if retryCount > 0 {

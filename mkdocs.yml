@@ -1,0 +1,14 @@
+site_name: The Memoire Great Book
+site_description: The human-readable manual of Memoire, one edition per version.
+docs_dir: docs/great-book
+site_dir: tmp/great-book-site
+theme:
+  name: superbiche
+nav:
+  - Cover: index.md
+  - 1. Identity & the custody thesis: 01-identity-and-the-custody-thesis.md
+  - 2. The life of a captured event: 02-the-life-of-a-captured-event.md
+  - 3. Custody & redaction: 03-custody-and-redaction.md
+  - 4. Operating the service: 04-operating-the-service.md
+  - 5. The seams: 05-the-seams.md
+  - 6. The CLI & MCP surface: 06-the-cli-and-mcp-surface.md

@@ -34,6 +34,7 @@ import (
 	"memoire/services/api/internal/authctx"
 	"memoire/services/api/internal/db"
 	"memoire/services/api/internal/drainer"
+	"memoire/services/api/internal/rawstore"
 )
 
 // Apply runs every schema-pg/*.sql file in name order against the shadow.
@@ -47,6 +48,18 @@ func Apply(ctx context.Context, pg *sql.DB, schemaDir string) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("no *.sql files in %s", schemaDir)
 	}
+	// Same applier lock as the store's own migrate (db.AcquirePGMigrateLock):
+	// a shadow apply and a live store open can land on the same database at
+	// the same moment, and concurrent DDL deadlocks (2026-08-27 incident;
+	// inbox/2026-08-04-agentic-qm1-migrate-race-and-twin-enforcement.md item
+	// 1). Held across the Provision* calls too — they are DDL on the same
+	// objects. Taken after the glob check so a bad schemaDir fails locally
+	// without queueing.
+	release, err := db.AcquirePGMigrateLock(ctx, pg)
+	if err != nil {
+		return err
+	}
+	defer release()
 	for _, path := range entries {
 		body, err := os.ReadFile(path)
 		if err != nil {
@@ -261,38 +274,33 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 			return stats, fmt.Errorf("replay delta preload: %w", err)
 		}
 	}
-	entries, err := os.ReadDir(rawDir)
+	// Raw custody may be partly packed (internal/rawstore cold archive):
+	// Walk yields flat and packed envelopes in the same global name order
+	// the flat directory had, with each file's mtime. The lock keeps the
+	// packer from moving files under the walk.
+	// Custody contract item 1: the lock, and no replay while a purge is
+	// unfinished (it would resurrect events the purge already deleted).
+	sess, err := rawstore.Custody{RawDir: rawDir}.Enter(rawstore.ModeRead)
 	if err != nil {
 		return stats, err
 	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
+	defer sess.Release()
 
-	for _, name := range names {
+	err = rawstore.Walk(rawDir, func(entry rawstore.Entry, body []byte) error {
 		if err := ctx.Err(); err != nil {
-			return stats, err
+			return err
 		}
+		name := entry.Name
 		stats.Files++
-		path := filepath.Join(rawDir, name)
-		body, err := os.ReadFile(path)
-		if err != nil {
-			stats.Failed++
-			continue
-		}
 		event, err := drainer.NormalizeEnvelope(body)
 		if err != nil {
 			stats.Failed++
-			continue
+			return nil
 		}
 		occurred, err := event.OccurredEpoch()
 		if err != nil {
 			stats.Failed++
-			continue
+			return nil
 		}
 		received := event.ReceivedAtEpoch
 		if received == 0 {
@@ -301,9 +309,9 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 			// replay-time now() would shift the event's received_at by the
 			// full corpus age (found live: 1 event in 196,720; smoke envelope
 			// from before the stamp existed).
-			if info, statErr := os.Stat(path); statErr == nil {
-				received = info.ModTime().Unix()
-			} else {
+			// Packed members carry the flat file's mtime (whole seconds).
+			received = entry.ModTime.Unix()
+			if entry.ModTime.IsZero() {
 				received = time.Now().Unix()
 			}
 		}
@@ -322,7 +330,7 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 			_, sessionKnown := knownSessions[event.SessionID]
 			if keyKnown && sessionKnown {
 				stats.Skipped++
-				continue
+				return nil
 			}
 		}
 		principal := event.PrincipalID
@@ -332,14 +340,14 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 
 		tx, err := pg.BeginTx(ctx, nil)
 		if err != nil {
-			return stats, err
+			return err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO sessions(session_id, project, client, started_at_epoch, principal_id, meta_json)
 			 VALUES ($1,$2,$3,$4,$5,'{}') ON CONFLICT (session_id) DO NOTHING`,
 			event.SessionID, event.Project, event.SourceAdapter, occurred, principal); err != nil {
 			_ = tx.Rollback()
-			return stats, fmt.Errorf("replay %s sessions: %w", name, err)
+			return fmt.Errorf("replay %s sessions: %w", name, err)
 		}
 		var id int64
 		err = tx.QueryRowContext(ctx,
@@ -357,12 +365,12 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 		case err == sql.ErrNoRows:
 			stats.Duplicates++
 			if err := tx.Commit(); err != nil {
-				return stats, err
+				return err
 			}
-			continue
+			return nil
 		case err != nil:
 			_ = tx.Rollback()
-			return stats, fmt.Errorf("replay %s events: %w", name, err)
+			return fmt.Errorf("replay %s events: %w", name, err)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO observations(
@@ -373,7 +381,7 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 			id, event.Project, event.SessionID, coalesce(text, ""), event.SourceAdapter, event.EventType,
 			occurred, time.Now().Unix(), principal); err != nil {
 			_ = tx.Rollback()
-			return stats, fmt.Errorf("replay %s observations: %w", name, err)
+			return fmt.Errorf("replay %s observations: %w", name, err)
 		}
 		// Drain-equivalence for the tail (round-1 finding 4): Store.Ingest also
 		// audits the ingest and maintains project identity state; a cutover
@@ -386,18 +394,19 @@ func Replay(ctx context.Context, pg *sql.DB, rawDir string, delta bool) (ReplayS
 			 VALUES ($1, NULL, $2, 'event.ingest', 'event', $3, '{}', $4)`,
 			principal, nullIfEmpty(event.RequestID), strconv.FormatInt(id, 10), received); err != nil {
 			_ = tx.Rollback()
-			return stats, fmt.Errorf("replay %s audit: %w", name, err)
+			return fmt.Errorf("replay %s audit: %w", name, err)
 		}
 		if err := recordProjectRootPG(ctx, tx, event.Project, payload, received); err != nil {
 			_ = tx.Rollback()
-			return stats, fmt.Errorf("replay %s identity: %w", name, err)
+			return fmt.Errorf("replay %s identity: %w", name, err)
 		}
 		if err := tx.Commit(); err != nil {
-			return stats, err
+			return err
 		}
 		stats.Ingested++
-	}
-	return stats, nil
+		return nil
+	})
+	return stats, err
 }
 
 // recordProjectRootPG is the Postgres port of store.recordProjectRootTx
@@ -796,7 +805,7 @@ func Diff(ctx context.Context, pg *sql.DB, lite *sql.DB, opts DiffOptions, out i
 
 	fmt.Fprintf(out, "\n## Postgres EXPLAIN spot checks (informational)\n\n")
 	for name, q := range map[string]string{
-		"idx_events_future_skew": `EXPLAIN SELECT count(*) FROM events WHERE occurred_at_epoch > received_at_epoch AND occurred_at_epoch > received_at_epoch + 60`,
+		"idx_events_future_skew":         `EXPLAIN SELECT count(*) FROM events WHERE occurred_at_epoch > received_at_epoch AND occurred_at_epoch > received_at_epoch + 60`,
 		"idx_events_redaction_violation": `EXPLAIN SELECT count(*) FROM events WHERE (meta_json::jsonb -> 'redaction_contract_violation') IN ('true'::jsonb, '1'::jsonb)`,
 	} {
 		plan, err := querySet(ctx, pg, q)

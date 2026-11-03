@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,37 +15,49 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// Defaults chosen for the memory-query use case: raw capture projections are
-// excluded and unreviewed (proposed or lapsed) observations are included,
-// marked with `~`. Pass exclude_kind="" to search raw events too.
+// memoryRule rides on every retrieval tool description; memoryFetchBodies
+// rides on the tools that return compact hits (not on
+// memoire_get_observations, which is the fetch). L0010 R1 = A rewrote
+// memoryRule (Hindsight owns what was decided or learned; Memoire is a
+// dated raw capture log) and retired memorySearchShapes, which steered
+// searches at derived memory Hindsight now owns. The tool declaration
+// remains the carrier agents always read (docs/rework/retrieval-consumer/
+// README.md, unit 4 arms tooldesc/tooldesc2: the rule alone moved citations
+// from 0/3 to 2/3), so the citation discipline is carried into the new text.
+const memoryRule = " Memoire is a dated capture log: its hits are raw records of what happened in past sessions — prompts, tool calls, tool output, ids — and a hit is dated evidence, not current truth. For what was decided or learned, use Hindsight; a Memoire hit corroborates and dates. Cite a hit's observation id in brackets, e.g. [123456], whenever you rely on it; verify it against the files when one carries it, and when none is found, say the hit is the only carrier found."
+
+const memoryFetchBodies = " Fetch the full body of every hit you rely on with memoire_get_observations."
+
+// L0010 R1 = A: the tools are a dated recent raw lookup. They serve raw
+// capture projections only — the API serves them by default, so no
+// include_derived is sent — never ask for derived observations (no
+// kind/exclude_kind/include_proposed parameters), and they bound the read
+// to the last `days` days by occurred time (default 30; 0 lifts the bound).
 func registerTools(s *server.MCPServer, c *apiClient) {
 	s.AddTool(
 		mcp.NewTool("memoire_search",
-			mcp.WithDescription("Full-text search over Memoire observations. Returns compact hits — enough to judge relevance in one trip; fetch full bodies with memoire_get_observations. One line per hit: `[id] kind~ YYYY-MM-DD project provenance/review_state[!]: snippet`. `~` after kind marks unreviewed observations (proposed or lapsed). provenance is how the observation came to exist: observed (captured verbatim), inferred (derived by a model), user_confirmed (the operator confirmed it), imported, generated; `-` means the server sent none. review_state is the governance state: proposed, accepted, rejected, superseded, lapsed. A trailing `!` after review_state means can_instruct — an elevated operating note the operator promoted to instruction-grade; weigh those above ordinary hits."),
+			mcp.WithDescription("Full-text search over recent raw Memoire captures — prompts, tool calls, tool output, ids. Returns compact hits — enough to judge relevance in one trip; fetch full bodies with memoire_get_observations. One line per hit: `[id] kind~ YYYY-MM-DD project provenance/review_state[!]: snippet`. A raw capture renders as `raw` with `observed/accepted`; the date is when the event occurred."+memoryRule+memoryFetchBodies),
 			mcp.WithString("q", mcp.Required(), mcp.Description("FTS5 query (words, phrases, OR, NEAR)")),
 			mcp.WithString("project", mcp.Description("Limit to one project (e.g. 'liaison')")),
-			mcp.WithString("kind", mcp.Description("Limit to one kind: fact, decision, gotcha, preference, task, open_question, constraint, raw")),
-			mcp.WithString("exclude_kind", mcp.Description("Kind to exclude. Default 'raw' (capture noise); pass '' to include raw events")),
+			mcp.WithNumber("days", mcp.Description("Look back this many days by occurred time; default 30, 0 lifts the bound")),
 			mcp.WithNumber("limit", mcp.Description("Max hits, default 20")),
-			mcp.WithBoolean("include_proposed", mcp.Description("Include unreviewed (proposed/lapsed) observations, default true")),
 		),
 		handleSearch(c),
 	)
 
 	s.AddTool(
 		mcp.NewTool("memoire_timeline",
-			mcp.WithDescription("Most recent Memoire observations, newest first (no query needed). Same compact hit format as memoire_search: `[id] kind~ YYYY-MM-DD project provenance/review_state[!]: snippet` — `~` marks unreviewed (proposed/lapsed), provenance is observed|inferred|user_confirmed|imported|generated (`-` when absent), and a trailing `!` marks can_instruct, an elevated operating note."),
+			mcp.WithDescription("Most recent raw Memoire captures, newest first (no query needed), bounded to the last `days` days by occurred time (default 30; 0 lifts the bound). Same compact hit format as memoire_search: `[id] kind~ YYYY-MM-DD project provenance/review_state[!]: snippet`."+memoryRule+memoryFetchBodies),
 			mcp.WithString("project", mcp.Description("Limit to one project")),
-			mcp.WithString("exclude_kind", mcp.Description("Kind to exclude. Default 'raw'; pass '' to include raw events")),
+			mcp.WithNumber("days", mcp.Description("Look back this many days by occurred time; default 30, 0 lifts the bound")),
 			mcp.WithNumber("limit", mcp.Description("Max hits, default 15")),
-			mcp.WithBoolean("include_proposed", mcp.Description("Include unreviewed (proposed/lapsed) observations, default true")),
 		),
 		handleTimeline(c),
 	)
 
 	s.AddTool(
 		mcp.NewTool("memoire_get_observations",
-			mcp.WithDescription("Fetch full observation bodies by id (ids come from memoire_search / memoire_timeline hits)."),
+			mcp.WithDescription("Fetch full observation bodies by id (ids come from memoire_search / memoire_timeline hits)."+memoryRule),
 			mcp.WithArray("ids", mcp.Required(), mcp.WithNumberItems(), mcp.Description("Observation ids, e.g. [82446, 82452]")),
 		),
 		handleGetObservations(c),
@@ -52,9 +65,10 @@ func registerTools(s *server.MCPServer, c *apiClient) {
 
 	s.AddTool(
 		mcp.NewTool("memoire_context",
-			mcp.WithDescription("Prompt-ready context block for a topic: searches observations and returns a pre-formatted text block suitable for direct inclusion in a prompt."),
+			mcp.WithDescription("Prompt-ready context block for a topic: searches recent raw Memoire captures and returns a pre-formatted text block suitable for direct inclusion in a prompt. Bounded to the last `days` days by occurred time (default 30; 0 lifts the bound)."+memoryRule+memoryFetchBodies),
 			mcp.WithString("q", mcp.Required(), mcp.Description("Topic query (FTS5)")),
 			mcp.WithString("project", mcp.Description("Limit to one project")),
+			mcp.WithNumber("days", mcp.Description("Look back this many days by occurred time; default 30, 0 lifts the bound")),
 			mcp.WithNumber("limit", mcp.Description("Max observations, default 10")),
 		),
 		handleContext(c),
@@ -68,17 +82,31 @@ func readFilterParams(request mcp.CallToolRequest, defaultLimit int) url.Values 
 	if p := request.GetString("project", ""); p != "" {
 		params.Set("project", p)
 	}
-	if k := request.GetString("kind", ""); k != "" {
-		params.Set("kind", k)
-	}
-	if ek := request.GetString("exclude_kind", "raw"); ek != "" {
-		params.Set("exclude_kind", ek)
-	}
-	if request.GetBool("include_proposed", true) {
-		params.Set("include_proposed", "true")
-	}
 	intParam(params, "limit", request.GetInt("limit", defaultLimit))
+	if after := occurredAfter(request); after > 0 {
+		params.Set("occurred_after", strconv.FormatInt(after, 10))
+	}
 	return params
+}
+
+// maxLookbackDays caps `days` so the bound never overflows a Duration.
+const maxLookbackDays = 36500
+
+// occurredAfter turns the `days` argument into the occurred_after epoch the
+// API takes: default 30, 0 lifts the bound (returns 0), and a negative value
+// is treated as the default rather than silently lifting the bound.
+func occurredAfter(request mcp.CallToolRequest) int64 {
+	days := request.GetInt("days", 30)
+	if days == 0 {
+		return 0
+	}
+	if days < 0 {
+		days = 30
+	}
+	if days > maxLookbackDays {
+		days = maxLookbackDays
+	}
+	return time.Now().Add(-time.Duration(days) * 24 * time.Hour).Unix()
 }
 
 func handleSearch(c *apiClient) toolHandler {
@@ -145,6 +173,10 @@ func handleGetObservations(c *apiClient) toolHandler {
 		for _, id := range ids {
 			var resp struct {
 				Observation observationRecord `json:"observation"`
+				// Siblings sit beside the record, not inside it: the API
+				// attaches them per response, from the same run lookup the
+				// search surfaces use.
+				Siblings []observationSibling `json:"siblings,omitempty"`
 			}
 			if err := c.get(fmt.Sprintf("/v1/observations/%d", id), params, &resp); err != nil {
 				// A rejected bearer dooms every id — fail the CALL (isError),
@@ -163,6 +195,9 @@ func handleGetObservations(c *apiClient) toolHandler {
 				header += ", session " + o.SessionID
 			}
 			header += ")"
+			if line := siblingContinuationLine(resp.Siblings); line != "" {
+				header += "\n" + line
+			}
 			blocks = append(blocks, header+"\n"+o.Text)
 		}
 		return mcp.NewToolResultText(strings.Join(blocks, "\n\n---\n\n")), nil
@@ -176,10 +211,11 @@ func handleContext(c *apiClient) toolHandler {
 			return mcp.NewToolResultError("q is required"), nil
 		}
 		body := map[string]any{
-			"q":                q,
-			"exclude_kind":     "raw",
-			"include_proposed": true,
-			"limit":            request.GetInt("limit", 10),
+			"q":     q,
+			"limit": request.GetInt("limit", 10),
+		}
+		if after := occurredAfter(request); after > 0 {
+			body["occurred_after"] = after
 		}
 		if p := request.GetString("project", ""); p != "" {
 			body["project"] = p

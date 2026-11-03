@@ -213,7 +213,8 @@ func (s *Store) searchVector(ctx context.Context, vec []float32, filter Observat
 	rows, err := tx.QueryContext(ctx, `SELECT o.id, COALESCE(o.session_id, ''), o.project,
 	o.kind, o.review_state, COALESCE(o.source_adapter, ''), COALESCE(o.event_type, ''),
 	o.text, left(o.text, 200), o.occurred_at_epoch, (e.embedding <=> ?::vector)::float8,
-	o.noise_candidate, o.can_instruct, COALESCE(o.provenance, '')
+	o.noise_candidate, o.can_instruct, COALESCE(o.provenance, ''),
+	COALESCE(o.derivation_run_id, '')
 	FROM observation_embeddings_pg e
 	JOIN observations o ON o.id = e.observation_id
 	WHERE e.model = ?
@@ -228,7 +229,7 @@ func (s *Store) searchVector(ctx context.Context, vec []float32, filter Observat
 	var hits []SearchHit
 	for rows.Next() {
 		var h SearchHit
-		if err := rows.Scan(&h.ID, &h.SessionID, &h.Project, &h.Kind, &h.ReviewState, &h.SourceAdapter, &h.EventType, &h.Text, &h.Snippet, &h.OccurredAtEpoch, &h.Rank, &h.NoiseCandidate, &h.CanInstruct, &h.Provenance); err != nil {
+		if err := rows.Scan(&h.ID, &h.SessionID, &h.Project, &h.Kind, &h.ReviewState, &h.SourceAdapter, &h.EventType, &h.Text, &h.Snippet, &h.OccurredAtEpoch, &h.Rank, &h.NoiseCandidate, &h.CanInstruct, &h.Provenance, &h.DerivationRunID); err != nil {
 			return nil, err
 		}
 		h.syncOccurredAt()

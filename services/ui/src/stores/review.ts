@@ -215,7 +215,7 @@ export async function applyElevation(
       pushToast(
         'success',
         elevated
-          ? `#${id} ${needsConfirm ? 'confirmed + ' : ''}elevated — rides every session`
+          ? `#${id} ${needsConfirm ? 'confirmed + ' : ''}elevated — rides every session when injection is on`
           : `#${id} demoted — memory only again`,
       )
       return { applied: true, observation: out.observation }
@@ -458,7 +458,7 @@ export async function elevateFromQueue(
     const out2 = await preconditionedCall(() => api.elevate(id, reason))
     if (out2.kind === 'ok') {
       state.reviewed.push({ observation: out2.observation, verdict: 'confirmed', reason, at: Date.now() })
-      pushToast('success', `#${id} confirmed + elevated — rides every session`)
+      pushToast('success', `#${id} confirmed + elevated — rides every session when injection is on`)
       return true
     }
     if (out2.kind === 'conflict' && out2.current.can_instruct === 1) {

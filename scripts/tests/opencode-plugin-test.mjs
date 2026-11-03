@@ -148,6 +148,106 @@ function freshOutput() {
   );
 }
 
+// --- real injector behind the plugin: off by default (MEMOIRE_INJECT) ---------
+// A real shell runs the real memoire-inject-claude.sh with a stub curl that
+// records every call and a FIFO as the token file. Unset: no prt_memoire_
+// part, no call, no token read. MEMOIRE_INJECT=on: the part is back.
+{
+  const { spawn, spawnSync } = await import("node:child_process");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const realScript = path.resolve(here, "../memoire-inject-claude.sh");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "inject-off-plugin-"));
+  const home = path.join(tmp, "home");
+  fs.mkdirSync(path.join(tmp, "bin"), { recursive: true });
+  fs.mkdirSync(home, { recursive: true });
+  const log = path.join(tmp, "curl.log");
+  fs.writeFileSync(log, "");
+  fs.writeFileSync(
+    path.join(tmp, "bin", "curl"),
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${log}"\n` +
+      `echo '{"hits":[{"id":7,"kind":"fact","captured_at_epoch":1700000000,"snippet":"hello"}]}'\n`,
+    { mode: 0o755 },
+  );
+  const quote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`;
+  // Real shell with the Bun-shell chain the plugin uses (cwd/nothrow/quiet/text).
+  let lastErr = "";
+  const realShell = (strings, ...exprs) => {
+    const cmd = strings.reduce((acc, str, i) => acc + str + (i < exprs.length ? quote(exprs[i]) : ""), "");
+    let dir;
+    const api = {
+      cwd(d) { dir = d; return api; },
+      nothrow() { return api; },
+      quiet() { return api; },
+      then(res, rej) {
+        return new Promise((resolve) => {
+          const child = spawn("bash", ["-c", cmd], { cwd: dir, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+          let out = "";
+          lastErr = "";
+          child.stdout.on("data", (c) => { out += c; });
+          child.stderr.on("data", (c) => { lastErr += c; });
+          child.on("close", (code) => resolve({ exitCode: code, text: () => out }));
+        }).then(res, rej);
+      },
+    };
+    return api;
+  };
+  const saved = { ...process.env };
+  const setEnv = (extra) => {
+    for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+    Object.assign(process.env, saved, {
+      PATH: `${path.join(tmp, "bin")}:${saved.PATH}`,
+      MEMOIRE_HOME: home,
+      MEMOIRE_BASE_URL: "http://127.0.0.1:9",
+      MEMOIRE_PROJECT: "off-proj",
+      MEMOIRE_INJECT_SCRIPT: realScript,
+      MEMOIRE_INJECT_WRAPPER_TIMEOUT: "5",
+    }, extra);
+    delete process.env.MEMOIRE_INJECT;
+    if (extra?.MEMOIRE_INJECT !== undefined) process.env.MEMOIRE_INJECT = extra.MEMOIRE_INJECT;
+  };
+  const realHook = async () => {
+    const { MemoirePlugin } = await import(pathToFileURL(pluginPath).href + `?v=${Math.random()}`);
+    return (await MemoirePlugin({ $: realShell, directory: tmp }))["chat.message"];
+  };
+
+  // Token = FIFO without a writer: a read would block until the 5s deadline.
+  spawnSync("mkfifo", [path.join(home, "token")]);
+  setEnv({});
+  let hook = await realHook();
+  let out = freshOutput();
+  let t0 = Date.now();
+  await hook({ sessionID: "ses_off", messageID: "msg_1" }, out);
+  check(out.parts.filter((x) => x.id.startsWith("prt_memoire_")).length === 0, "default (MEMOIRE_INJECT unset): no prt_memoire_ part");
+  check(out.parts.length === 0, "default: nothing pushed at all");
+  check(fs.readFileSync(log, "utf8") === "", "default: curl must not be called");
+  check(Date.now() - t0 < 4000, "default: the injector must not wait on the token");
+  check(lastErr === "", `default: the injector prints nothing on stderr: ${lastErr}`);
+
+  setEnv({ MEMOIRE_INJECT: "off" });
+  hook = await realHook();
+  out = freshOutput();
+  await hook({ sessionID: "ses_off2", messageID: "msg_1" }, out);
+  check(out.parts.length === 0, "MEMOIRE_INJECT=off: nothing pushed");
+  check(fs.readFileSync(log, "utf8") === "", "MEMOIRE_INJECT=off: curl must not be called");
+  check(lastErr === "", `MEMOIRE_INJECT=off: the injector prints nothing on stderr: ${lastErr}`);
+
+  fs.rmSync(path.join(home, "token"));
+  fs.writeFileSync(path.join(home, "token"), "tok\n");
+  setEnv({ MEMOIRE_INJECT: "on" });
+  hook = await realHook();
+  out = freshOutput();
+  await hook({ sessionID: "ses_on", messageID: "msg_1" }, out);
+  check(out.parts.length === 1 && out.parts[0].id.startsWith("prt_memoire_"), "MEMOIRE_INJECT=on: one prt_memoire_ part");
+  check(out.parts[0]?.text?.includes("recent context"), "MEMOIRE_INJECT=on: the part carries the block");
+  check(fs.readFileSync(log, "utf8") !== "", "MEMOIRE_INJECT=on: curl is called");
+
+  for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+  Object.assign(process.env, saved);
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+
 if (failures > 0) {
   console.error(`opencode-plugin-test: ${failures} failure(s)`);
   process.exit(1);

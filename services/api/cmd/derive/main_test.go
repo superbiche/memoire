@@ -76,6 +76,45 @@ func seedSession(t *testing.T, project, sessionID string, epochs []int64, prompt
 	return ids
 }
 
+// seedToolEvents ingests content-less claude_PostToolUse events — a tool name
+// and tool input, no result summary, the shape every adapter in this repo
+// actually produces (Fibery #365). They carry zero content for the prompt
+// renderer and for the min-content guard alike.
+func seedToolEvents(t *testing.T, project, sessionID string, startEpoch int64, n int) {
+	t.Helper()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if err := cfg.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+	store, err := db.Open(cfg.DBPath, cfg.SchemaDir)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer store.Close()
+
+	tools := []string{"Read", "Grep", "Bash"}
+	for i := 0; i < n; i++ {
+		payload, _ := json.Marshal(map[string]any{
+			"tool_name":  tools[i%len(tools)],
+			"tool_input": map[string]any{"file_path": "/some/path"},
+		})
+		if _, err := store.Ingest(context.Background(), db.EventInput{
+			Project:         project,
+			SessionID:       sessionID,
+			SourceAdapter:   "claude-code",
+			EventType:       "claude_PostToolUse",
+			SourceEventID:   fmt.Sprintf("claude-posttooluse-%s-%d", sessionID, i),
+			OccurredAtEpoch: startEpoch + int64(i),
+			Payload:         payload,
+		}); err != nil {
+			t.Fatalf("Ingest tool event %d: %v", i, err)
+		}
+	}
+}
+
 func countDerivationRuns(t *testing.T, project string) int {
 	t.Helper()
 	cfg, err := config.Load()
@@ -170,6 +209,59 @@ func TestCLIDryRunEmitsPromptMetadata(t *testing.T) {
 	}
 	if _, ok := out["prompt_preview"].(string); !ok {
 		t.Errorf("prompt_preview missing")
+	}
+}
+
+// TestCLIDryRunReportsCollapsedEvents pins the v2.5 surface at the CLI seam
+// (Fibery #365): the dry-run's prompt_meta carries the collapse counters, so
+// the ceiling calibration can read the saving per run, and prompt_version
+// names the bumped prompt. The window holds two substantive prompts around a
+// burst of 40 content-less tool events — one maximal run.
+func TestCLIDryRunReportsCollapsedEvents(t *testing.T) {
+	setupCLIEnv(t)
+	seedSession(t, "memoire-test", "sess-collapse", []int64{3000, 3400}, []string{
+		strings.Repeat("a substantive opening prompt. ", 12),
+		strings.Repeat("a substantive closing prompt. ", 12),
+	})
+	seedToolEvents(t, "memoire-test", "sess-collapse", 3100, 40)
+
+	var stdout bytes.Buffer
+	err := run([]string{
+		"-strategy=model", "-dry-run", "-json",
+		"-provider=local-qwen", "-model=qwen-7b", "-endpoint-id=hl3",
+		"-project=memoire-test", "-session-id=sess-collapse",
+	}, &stdout, io.Discard)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, stdout.String())
+	}
+	if got := out["source_event_count"].(float64); got != 42 {
+		t.Fatalf("source_event_count = %v, want 42", got)
+	}
+	meta, ok := out["prompt_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("prompt_meta missing or wrong type: %v", out["prompt_meta"])
+	}
+	if got := meta["prompt_version"]; got != "derive-observations-v2.5" {
+		t.Fatalf("prompt_meta.prompt_version = %v, want derive-observations-v2.5", got)
+	}
+	if got, _ := meta["collapsed_event_count"].(float64); got != 40 {
+		t.Fatalf("prompt_meta.collapsed_event_count = %v, want 40", meta["collapsed_event_count"])
+	}
+	if got, _ := meta["collapsed_block_count"].(float64); got != 1 {
+		t.Fatalf("prompt_meta.collapsed_block_count = %v, want 1", meta["collapsed_block_count"])
+	}
+	// The input manifest still covers the collapsed events (memoire:D211).
+	if got, _ := meta["input_event_count"].(float64); got != 42 {
+		t.Fatalf("prompt_meta.input_event_count = %v, want 42", meta["input_event_count"])
+	}
+	ids, _ := meta["input_event_ids"].([]any)
+	if len(ids) != 42 {
+		t.Fatalf("len(prompt_meta.input_event_ids) = %d, want 42", len(ids))
 	}
 }
 
@@ -804,6 +896,29 @@ func TestExecuteTimeoutFlagValidation(t *testing.T) {
 	}
 }
 
+// TestReasoningEffortFlagValidation pins the preflight value domain of the
+// chat-template effort hint (operator ruling 2026-08-26): a level the template
+// does not know is a silent no-op at the server, so a typo must fail before the
+// run rather than sweep at the wrong effort. Empty stays valid — no kwarg sent.
+func TestReasoningEffortFlagValidation(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := run([]string{"-strategy", "model", "-reasoning-effort", "lo"}, &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "reasoning-effort") {
+		t.Fatalf("expected reasoning-effort validation error, got %v", err)
+	}
+
+	// Explicitly empty is part of the flag's contract (= send no kwarg), not
+	// just the unset default: it must pass the value gate like the levels do.
+	for _, effort := range []string{"", "none", "low", "medium", "high", "xhigh"} {
+		// Accepted levels pass the value gate and fail later, on the model
+		// strategy's own requirements — never on the effort value itself.
+		err := run([]string{"-strategy", "model", "-reasoning-effort", effort}, &out, &errOut)
+		if err == nil || strings.Contains(err.Error(), "reasoning-effort") {
+			t.Fatalf("-reasoning-effort %q must be accepted at preflight, got %v", effort, err)
+		}
+	}
+}
+
 // TestCLIExecuteDeniedProjectSkips pins the sweep targeting filter: a project
 // matching the denylist is skipped with a marker before any endpoint or store
 // access (no endpoints registry exists in this home, which would otherwise be
@@ -1308,5 +1423,284 @@ func TestCLIByokModelFromEnv(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no source events") {
 		t.Fatalf("expected the empty-window error after passing validation, got %v", err)
+	}
+}
+
+// profiledEndpointsConfig writes a registry whose single endpoint carries a
+// derive profile: the 2026-08-25 re-bench geometry, whose ceiling is
+// floor((32768-12288-512)*2.2) = 43929.
+func profiledEndpointsConfig(t *testing.T, home, baseURL, model string) {
+	t.Helper()
+	cfgFile := map[string]any{
+		"endpoints": []map[string]any{
+			{
+				"endpoint_id": "hl3",
+				"base_url":    baseURL,
+				"models":      []string{model},
+				"profile": map[string]any{
+					"ctx_tokens":            32768,
+					"max_completion_tokens": 12288,
+					"bytes_per_token":       2.2,
+					"margin_tokens":         512,
+					"thinking":              map[string]any{"policy": "budget", "budget_tokens": 8192},
+				},
+			},
+		},
+	}
+	b, _ := json.MarshalIndent(cfgFile, "", "  ")
+	if err := os.WriteFile(filepath.Join(home, "model-endpoints.json"), b, 0o600); err != nil {
+		t.Fatalf("write endpoints config: %v", err)
+	}
+}
+
+// capturingQwenServer is fakeQwenServer plus the chat request the adapter
+// actually sent, so a test can prove the resolved completion cap reached the
+// wire rather than only the run record.
+func capturingQwenServer(t *testing.T, content string, sent *map[string]any) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[{"id":"qwen2.5-7b"}]}`))
+		case "/v1/chat/completions":
+			body := map[string]any{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			*sent = body
+			resp := map[string]any{
+				"choices": []map[string]any{
+					{"message": map[string]any{"content": content}, "finish_reason": "stop"},
+				},
+				"usage": map[string]any{"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// derivationRunMeta returns the single persisted run's decoded meta_json.
+func derivationRunMeta(t *testing.T, project string) map[string]any {
+	t.Helper()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	store, err := db.Open(cfg.DBPath, cfg.SchemaDir)
+	if err != nil {
+		t.Fatalf("db.Open: %v", err)
+	}
+	defer store.Close()
+	runs, err := store.ListDerivationRuns(context.Background(), db.DerivationRunFilter{Project: project})
+	if err != nil {
+		t.Fatalf("ListDerivationRuns: %v", err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("expected 1 derivation run, got %d", len(runs))
+	}
+	meta := map[string]any{}
+	if err := json.Unmarshal(runs[0].Metadata, &meta); err != nil {
+		t.Fatalf("decode run meta_json: %v", err)
+	}
+	return meta
+}
+
+// TestCLIExecuteAppliesEndpointProfile asserts the ruled precedence at its
+// core: with no limit flags passed, the endpoint's declared geometry becomes
+// the numbers the run enforces — the completion cap on the wire, and the
+// resolved ceilings plus the serving thinking declaration in run provenance.
+func TestCLIExecuteAppliesEndpointProfile(t *testing.T) {
+	home := setupCLIEnv(t)
+	ids := seedSubstantiveSession(t, "memoire-test", "sess-profile", 11000)
+
+	modelJSON := fmt.Sprintf(`{"schema_version":"1","observations":[{"kind":"decision","text":"the endpoint profile supplies the ceiling","confidence":0.9,"source_event_ids":[%d],"rationale":"explicit"}]}`, ids[0])
+	var sent map[string]any
+	srv := capturingQwenServer(t, modelJSON, &sent)
+	defer srv.Close()
+	profiledEndpointsConfig(t, home, srv.URL, "qwen2.5-7b")
+
+	err := run([]string{
+		"-strategy=model", "-execute", "-json",
+		"-provider=local-qwen", "-model=qwen2.5-7b", "-endpoint-id=hl3",
+		"-project=memoire-test", "-session-id=sess-profile",
+	}, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if got, _ := sent["max_tokens"].(float64); got != 12288 {
+		t.Fatalf("max_tokens on the wire = %v, want the profile's 12288", sent["max_tokens"])
+	}
+	meta := derivationRunMeta(t, "memoire-test")
+	if got, _ := meta["max_prompt_bytes"].(float64); got != 43929 {
+		t.Fatalf("run meta max_prompt_bytes = %v, want 43929", meta["max_prompt_bytes"])
+	}
+	if got, _ := meta["max_completion_tokens"].(float64); got != 12288 {
+		t.Fatalf("run meta max_completion_tokens = %v, want 12288", meta["max_completion_tokens"])
+	}
+	if meta["thinking_policy"] != "budget" {
+		t.Fatalf("run meta thinking_policy = %v, want budget", meta["thinking_policy"])
+	}
+	if got, _ := meta["thinking_budget_tokens"].(float64); got != 8192 {
+		t.Fatalf("run meta thinking_budget_tokens = %v, want 8192", meta["thinking_budget_tokens"])
+	}
+}
+
+// TestCLIExecuteFlagOutranksProfile pins the top of the precedence chain,
+// including the subtle half: an explicitly passed 0 keeps its own meaning (no
+// prompt cap) rather than reading as "unset, take the profile's".
+func TestCLIExecuteFlagOutranksProfile(t *testing.T) {
+	home := setupCLIEnv(t)
+	ids := seedSubstantiveSession(t, "memoire-test", "sess-flagwins", 12000)
+
+	modelJSON := fmt.Sprintf(`{"schema_version":"1","observations":[{"kind":"fact","text":"an explicit flag outranks the endpoint profile","confidence":0.8,"source_event_ids":[%d],"rationale":"explicit"}]}`, ids[0])
+	var sent map[string]any
+	srv := capturingQwenServer(t, modelJSON, &sent)
+	defer srv.Close()
+	profiledEndpointsConfig(t, home, srv.URL, "qwen2.5-7b")
+
+	err := run([]string{
+		"-strategy=model", "-execute", "-json",
+		"-provider=local-qwen", "-model=qwen2.5-7b", "-endpoint-id=hl3",
+		"-project=memoire-test", "-session-id=sess-flagwins",
+		"-max-prompt-bytes=0", "-max-completion-tokens=777",
+	}, io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if got, _ := sent["max_tokens"].(float64); got != 777 {
+		t.Fatalf("max_tokens on the wire = %v, want the flag's 777", sent["max_tokens"])
+	}
+	meta := derivationRunMeta(t, "memoire-test")
+	if got, _ := meta["max_prompt_bytes"].(float64); got != 0 {
+		t.Fatalf("run meta max_prompt_bytes = %v, want 0 — an explicit 0 is a cap decision, not an absence", meta["max_prompt_bytes"])
+	}
+	// The thinking declaration describes how the endpoint is SERVED, so it is
+	// recorded whether or not the operator overrode the numbers.
+	if meta["thinking_policy"] != "budget" {
+		t.Fatalf("run meta thinking_policy = %v, want budget", meta["thinking_policy"])
+	}
+}
+
+// TestCLIDryRunEffectiveLimits covers both dry-run halves: the profile is
+// applied when the registry has one, and a dry-run with NO registry at all
+// keeps working exactly as before, reporting the built-in default. The
+// resolution is best-effort by design — sizing must not gain a failure mode
+// the execute path will report anyway.
+func TestCLIDryRunEffectiveLimits(t *testing.T) {
+	t.Run("registry absent keeps today's behavior", func(t *testing.T) {
+		setupCLIEnv(t)
+		seedSession(t, "memoire-test", "sess-nolimits", []int64{3000, 3100}, []string{"alpha", "beta"})
+
+		var stdout bytes.Buffer
+		err := run([]string{
+			"-strategy=model", "-dry-run", "-json",
+			"-provider=local-qwen", "-model=qwen-7b", "-endpoint-id=hl3",
+			"-project=memoire-test", "-session-id=sess-nolimits",
+		}, &stdout, io.Discard)
+		if err != nil {
+			t.Fatalf("a dry-run without a registry must still work: %v", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+		}
+		limits, ok := out["effective_limits"].(map[string]any)
+		if !ok {
+			t.Fatalf("effective_limits missing: %v", out["effective_limits"])
+		}
+		if limits["source"] != "default" {
+			t.Fatalf("source = %v, want default", limits["source"])
+		}
+		if got, _ := limits["max_prompt_bytes"].(float64); got != 0 {
+			t.Fatalf("max_prompt_bytes = %v, want 0 (uncapped, as today)", limits["max_prompt_bytes"])
+		}
+	})
+
+	t.Run("profile supplies the sizing ceiling", func(t *testing.T) {
+		home := setupCLIEnv(t)
+		seedSession(t, "memoire-test", "sess-dryprofile", []int64{4000, 4100}, []string{"alpha", "beta"})
+		profiledEndpointsConfig(t, home, "http://127.0.0.1:1", "qwen-7b")
+
+		var stdout bytes.Buffer
+		err := run([]string{
+			"-strategy=model", "-dry-run", "-json",
+			"-provider=local-qwen", "-model=qwen-7b", "-endpoint-id=hl3",
+			"-project=memoire-test", "-session-id=sess-dryprofile",
+		}, &stdout, io.Discard)
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+		}
+		limits, _ := out["effective_limits"].(map[string]any)
+		if limits == nil {
+			t.Fatalf("effective_limits missing: %v", out)
+		}
+		if limits["source"] != "profile" {
+			t.Fatalf("source = %v, want profile", limits["source"])
+		}
+		if got, _ := limits["max_prompt_bytes"].(float64); got != 43929 {
+			t.Fatalf("max_prompt_bytes = %v, want 43929", limits["max_prompt_bytes"])
+		}
+		if got, _ := limits["max_completion_tokens"].(float64); got != 12288 {
+			t.Fatalf("max_completion_tokens = %v, want 12288", limits["max_completion_tokens"])
+		}
+	})
+}
+
+// TestCLIDryRunFullyCoveredCarriesEffectiveLimits pins review r1 F2: the
+// fully_covered early return is still a dry-run JSON, so it must report the
+// resolved ceilings like every other one. A caller learning an endpoint's
+// geometry must not have to find an uncovered window first.
+func TestCLIDryRunFullyCoveredCarriesEffectiveLimits(t *testing.T) {
+	home := setupCLIEnv(t)
+	ids := seedSubstantiveSession(t, "memoire-test", "sess-covered", 13000)
+
+	modelJSON := fmt.Sprintf(`{"schema_version":"1","observations":[{"kind":"fact","text":"this window is now covered","confidence":0.8,"source_event_ids":[%d],"rationale":"explicit"}]}`, ids[0])
+	var sent map[string]any
+	srv := capturingQwenServer(t, modelJSON, &sent)
+	defer srv.Close()
+	profiledEndpointsConfig(t, home, srv.URL, "qwen2.5-7b")
+
+	// Cover the window with a real run, so the dry-run below takes the
+	// fully_covered branch rather than the normal path.
+	if err := run([]string{
+		"-strategy=model", "-execute", "-json",
+		"-provider=local-qwen", "-model=qwen2.5-7b", "-endpoint-id=hl3",
+		"-project=memoire-test", "-session-id=sess-covered",
+	}, io.Discard, io.Discard); err != nil {
+		t.Fatalf("seeding execute run: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	if err := run([]string{
+		"-strategy=model", "-dry-run", "-json",
+		"-provider=local-qwen", "-model=qwen2.5-7b", "-endpoint-id=hl3",
+		"-project=memoire-test", "-session-id=sess-covered",
+	}, &stdout, io.Discard); err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if out["skipped"] != "fully_covered" {
+		t.Fatalf("expected the fully_covered branch, got %v", out)
+	}
+	limits, ok := out["effective_limits"].(map[string]any)
+	if !ok {
+		t.Fatalf("fully_covered dry-run omitted effective_limits: %v", out)
+	}
+	if limits["source"] != "profile" {
+		t.Fatalf("source = %v, want profile", limits["source"])
+	}
+	if got, _ := limits["max_prompt_bytes"].(float64); got != 43929 {
+		t.Fatalf("max_prompt_bytes = %v, want 43929", limits["max_prompt_bytes"])
 	}
 }

@@ -74,7 +74,7 @@ payload="$(
         file_path: "/tmp/redaction-smoke/.env",
         content: ("DATABASE_PASSWORD=" + $secret + "\nSAFE=" + $ref)
       },
-      tool_response: {stdout: ("-----BEGIN RSA PRIVATE KEY-----\n" + $pem + "\n-----END RSA PRIVATE KEY-----")}
+      tool_response: {stdout: ("-----BEGIN RSA PRIVATE" + " KEY-----\n" + $pem + "\n-----END RSA PRIVATE" + " KEY-----")}
     }'
 )"
 
@@ -132,7 +132,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' 
     "session_id": "redaction-smoke-http",
     "source_adapter": "curl",
     "event_type": "note",
-    "payload": {"message": "leaked key AKIAIOSFODNN7EXAMPLE in a note", "AKIAJ7EXAMPLEKEYNAME": "as a key", "big": 9007199254740993}
+    "payload": {"message": "leaked key AKIA''IOSFODNN7EXAMPLE in a note", "AKIA''J7EXAMPLEKEYNAME": "as a key", "big": 9007199254740993}
   }' >/dev/null
 
 # Batch endpoint gets the same backstop.
@@ -144,15 +144,59 @@ curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' 
       "session_id": "redaction-smoke-batch",
       "source_adapter": "curl",
       "event_type": "note",
-      "payload": {"message": "batch leak ghp_abcdefghijklmnopqrstuvwxyz0123456789"}
+      "payload": {"message": "batch leak ghp_''abcdefghijklmnopqrstuvwxyz0123456789"}
     }]
   }' >/dev/null
+# Gap shapes (Fibery #616, 2026-10-06): a bare value under a secret-named
+# JSON field, and userinfo credentials inside a URL.
+FAKE_JSON_SECRET="j4xQm9vL2zT8""w7Rf3Kd56Hc02Yb"
+FAKE_URL_PASS="u3Wb8kD5nV1q""9Lp02Xs47Tc63Ma"
+# Tool-shaped like the capture path (raw hook JSON as payload): the JSON
+# secret field rides in the tool input, the URL credentials in the tool
+# response — the real transcript shape.
+gaps_payload="$(
+  jq -nc \
+    --arg s "$FAKE_JSON_SECRET" \
+    --arg p "$FAKE_URL_PASS" \
+    '{
+      schema_version: 1,
+      project: "memoire-redaction-smoke",
+      session_id: "redaction-smoke-gaps",
+      source_adapter: "curl",
+      event_type: "claude_PostToolUse",
+      cwd: "/tmp/redaction-smoke",
+      payload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Write",
+        tool_input: {file_path: "/tmp/redaction-smoke/config.json", content: ("{\"apiKey\":\"" + $s + "\"}")},
+        tool_response: {stdout: ("postgresql://memoire:" + $p + "@memoire-pg-rw:5432/memoire")}
+      }
+    }'
+)"
+printf '%s' "$gaps_payload" | curl -fsS -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -X POST "$BASE/events" -d @- >/dev/null
+
 sleep 1
-for leaked in "AKIAIOSFODNN7EXAMPLE" "AKIAJ7EXAMPLEKEYNAME" "ghp_abcdefghijklmnopqrstuvwxyz0123456789"; do
+for leaked in "AKIA""IOSFODNN7EXAMPLE" "AKIA""J7EXAMPLEKEYNAME" "ghp_""abcdefghijklmnopqrstuvwxyz0123456789" "$FAKE_JSON_SECRET" "$FAKE_URL_PASS"; do
   if grep -R -a -q "$leaked" "$HOME_DIR"; then
     fail "HTTP backstop let $leaked through"
   fi
 done
 grep -R -a -q "9007199254740993" "$HOME_DIR" || fail "large integer corrupted by redaction round-trip"
+
+# Both gap rules must have fired in the stored event (wait for the drain).
+gaps_total=0
+for _ in $(seq 1 40); do
+  gaps_total="$(curl -fsS -H "Authorization: Bearer $TOKEN" \
+    "$BASE/events/tool-window?session_id=redaction-smoke-gaps" | jq -r '.total')"
+  if [[ "$gaps_total" == "1" ]]; then
+    break
+  fi
+  sleep 0.2
+done
+[[ "$gaps_total" == "1" ]] || fail "gaps event never drained"
+gaps_window="$(curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE/events/tool-window?session_id=redaction-smoke-gaps")"
+grep -q "REDACTED:json-secret-field" <<<"$gaps_window" || fail "json-secret-field marker missing from stored event"
+grep -q "REDACTED:url-credentials" <<<"$gaps_window" || fail "url-credentials marker missing from stored event"
 
 echo "memoire redaction smoke passed"

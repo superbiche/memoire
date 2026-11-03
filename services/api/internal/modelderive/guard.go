@@ -97,7 +97,7 @@ func eventContentText(e db.EventRecord) string {
 		return strings.TrimSpace(payloadString(e.Payload, "prompt", "user_prompt", "userPrompt", "message", "text"))
 	case "claude_PostToolUse":
 		return strings.TrimSpace(payloadString(e.Payload, "result_summary", "resultSummary", "summary", "result"))
-	case "claude_assistant_turn", "codex_assistant_turn", "qwen_assistant_turn", "opencode_assistant_turn":
+	case "claude_assistant_turn", "codex_assistant_turn", "qwen_assistant_turn", "opencode_assistant_turn", "pi_assistant_turn":
 		// Assistant turns carry their prose in the text column, not payload.
 		return strings.TrimSpace(e.Text)
 	}

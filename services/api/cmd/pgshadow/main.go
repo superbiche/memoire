@@ -11,9 +11,13 @@
 //	memoire-pgshadow -pg <url> replay [-raw DIR] [-delta]
 //	memoire-pgshadow -pg <url> diff   [-db PATH] [-project P] [-probes FILE]
 //	                                  [-replay-lane] [-out REPORT.md]
+//	memoire-pgshadow -pg <url> reindex-bm25 [-dry-run]
 //
 // The Postgres URL may also come from MEMOIRE_PG_URL. diff exits 1 on
 // parity FAIL so make targets and rehearsal scripts can gate on it.
+// reindex-bm25 is the explicit operator step that swaps the BM25 index
+// to the v2 definition (RUNBOOK, "BM25 index (pg_search)"); it is never
+// run by apply.
 package main
 
 import (
@@ -30,6 +34,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 
+	"memoire/services/api/internal/db"
 	"memoire/services/api/internal/pgshadow"
 )
 
@@ -54,6 +59,7 @@ func run(ctx context.Context, args []string, stdout *os.File) error {
 	replayLane := fs.Bool("replay-lane", false, "diff only replay-covered surfaces")
 	delta := fs.Bool("delta", false, "replay: preload shadow keys, skip already-present files")
 	outPath := fs.String("out", "", "diff report path (default stdout)")
+	dryRun := fs.Bool("dry-run", false, "reindex-bm25: print the planned DDL, change nothing")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -61,7 +67,7 @@ func run(ctx context.Context, args []string, stdout *os.File) error {
 	// legally appear on either side of the subcommand: parse, take the
 	// subcommand, then parse the rest.
 	if fs.NArg() == 0 {
-		return fmt.Errorf("subcommand required: apply | copy | replay | diff")
+		return fmt.Errorf("subcommand required: apply | copy | replay | diff | reindex-bm25")
 	}
 	sub := fs.Arg(0)
 	if err := fs.Parse(fs.Args()[1:]); err != nil {
@@ -153,6 +159,19 @@ func run(ctx context.Context, args []string, stdout *os.File) error {
 			return fmt.Errorf("parity FAIL (see report)")
 		}
 		fmt.Fprintln(os.Stderr, "parity PASS")
+		return nil
+	case "reindex-bm25":
+		// The explicit operator step (a20 = A, 2026-11-01): swap the
+		// BM25 index to the v2 definition that carries the read-filter
+		// columns. Never run by apply; -dry-run prints the plan only.
+		report, err := db.ReindexBM25Index(ctx, pg, *dryRun)
+		if err != nil {
+			if report != "" {
+				fmt.Fprint(stdout, report)
+			}
+			return err
+		}
+		fmt.Fprint(stdout, report)
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", sub)

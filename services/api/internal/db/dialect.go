@@ -40,7 +40,7 @@ func IsPostgresDSN(path string) bool {
 // rebind converts this package's canonical '?' placeholders to Postgres
 // $1..$n. Placeholders inside single-quoted SQL string literals are left
 // alone (none of this package's queries has one — the scan is
-// belt-and-suspenders; a doubled '' escape toggles the flag twice, net
+// belt-and-suspenders; a doubled ” escape toggles the flag twice, net
 // unchanged).
 func rebind(eng Engine, query string) string {
 	if eng != EnginePostgres || !strings.ContainsRune(query, '?') {
@@ -66,6 +66,11 @@ func rebind(eng Engine, query string) string {
 	}
 	return b.String()
 }
+
+// Rebind exposes rebind to operator tools outside this package that drive
+// a raw *sql.DB on either engine (memoire-purge, #616 slice B). Same rules:
+// identity on SQLite, '?' -> $n on Postgres.
+func Rebind(eng Engine, query string) string { return rebind(eng, query) }
 
 // insertIgnore returns the per-engine spelling of "insert, silently skip
 // unique-key duplicates" as a (prefix, suffix) pair around a plain INSERT:
@@ -120,8 +125,8 @@ func (c dbc) BeginTx(ctx context.Context, opts *sql.TxOptions) (dbtx, error) {
 	return dbtx{tx: tx, eng: c.eng}, nil
 }
 
-func (c dbc) Ping() error   { return c.conn.Ping() }
-func (c dbc) Close() error  { return c.conn.Close() }
+func (c dbc) Ping() error           { return c.conn.Ping() }
+func (c dbc) Close() error          { return c.conn.Close() }
 func (c dbc) SetMaxOpenConns(n int) { c.conn.SetMaxOpenConns(n) }
 
 // dbtx is the transaction twin of dbc.

@@ -296,6 +296,10 @@ func credentialName(credential string) string {
 // only lets the complete request reach past validation.
 var probeFixtures = map[string]map[string]any{
 	"POST /v1/observations/{id}/review": {"to_state": "accepted"},
+	// The flag-verb action set is a closed vocabulary, like to_state above:
+	// the dummy probe string is refused by the handler's own guard, so the
+	// matrix supplies a real member.
+	"POST /v1/observations/{id}/action": {"action": "mark-stale"},
 	"PUT /v1/embeddings":                {"embeddings": []map[string]any{probeEmbedding()}},
 }
 

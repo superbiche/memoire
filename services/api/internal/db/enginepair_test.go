@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -34,11 +35,14 @@ import (
 // job; ranking deltas are measured there, not asserted here.
 
 // conformancePGURL creates a throwaway database and returns its DSN plus
-// whether pg_search should be active there. CREATE DATABASE clones
-// template1, which does NOT carry extensions (round-1 finding 2: the old
-// version silently ran the tsvector fallback while claiming pg_search
-// coverage) — so the extension is created HERE, in the throwaway database
-// itself, whenever the server offers it.
+// whether pg_search should be active there. CREATE DATABASE does NOT carry
+// extensions (round-1 finding 2: the old version silently ran the tsvector
+// fallback while claiming pg_search coverage) — so the extension is created
+// HERE, in the throwaway database itself, whenever the server offers it.
+// The database is created C-collated from template0 (memoire:D0249): a
+// memoire Postgres store orders TEXT bytewise like SQLite BINARY, and Open
+// refuses anything else — the container image's default locale is not C,
+// so template0 + explicit LC_* is load-bearing, not cosmetic.
 func conformancePGURL(t *testing.T) (string, bool) {
 	t.Helper()
 	admin := os.Getenv("MEMOIRE_TEST_PG_URL")
@@ -60,7 +64,8 @@ func conformancePGURL(t *testing.T) (string, bool) {
 	if err != nil {
 		t.Fatalf("open admin: %v", err)
 	}
-	if _, err := adminConn.Exec("CREATE DATABASE " + dbName); err != nil {
+	if _, err := adminConn.Exec("CREATE DATABASE " + dbName +
+		" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'"); err != nil {
 		_ = adminConn.Close()
 		t.Fatalf("create conformance database (role needs CREATEDB; use the pg-shadow admin DSN): %v", err)
 	}
@@ -149,6 +154,17 @@ func TestEnginePairConformance(t *testing.T) {
 	}
 }
 
+// mustListSessionObs is the derivation read-back, failing the test rather
+// than the caller's flow.
+func mustListSessionObs(t *testing.T, store *Store, ctx context.Context, project, session string) []SessionObservationSummary {
+	t.Helper()
+	list, err := store.ListSessionObservationsForDerivation(ctx, project, session, 0)
+	if err != nil {
+		t.Fatalf("session read-back: %v", err)
+	}
+	return list
+}
+
 func runConformanceBattery(t *testing.T, store *Store) {
 	ctx := context.Background()
 	now := time.Now().Unix()
@@ -184,6 +200,45 @@ func runConformanceBattery(t *testing.T, store *Store) {
 	}
 	if n, err := store.AuditCount(ctx, "event.ingest"); err != nil || n != 1 {
 		t.Fatalf("audit count after dedup: want 1, got %d err %v", n, err)
+	}
+
+	// --- Attribution at Stop: memory_usage projection, aggregate, lines ---
+	var rawObs int64
+	if err := store.rdb.QueryRow(`SELECT id FROM observations WHERE event_id = ?`, first.ID).Scan(&rawObs); err != nil {
+		t.Fatalf("raw observation of the seed event: %v", err)
+	}
+	// Its own project: the usage event is a raw observation too, and the
+	// counts below are on the seed project.
+	usageIn := EventInput{
+		Project:         project + "-usage",
+		SessionID:       "conf-session-2",
+		SourceAdapter:   "claude-code",
+		SourceEventID:   "claude-memory-usage-conf-1",
+		EventType:       EventTypeMemoryUsage,
+		OccurredAtEpoch: now - 50,
+		Payload:         json.RawMessage(fmt.Sprintf(`{"served_ids":[%d,987654321],"verdicts":[{"id":%d,"verdict":"used","reason":"carried the meadow"},{"id":987654321,"verdict":"used","reason":"names no row"}]}`, rawObs, rawObs)),
+		Text:            "Memoire attribution at Stop",
+	}
+	usageRes, err := store.Ingest(ctx, usageIn)
+	if err != nil {
+		t.Fatalf("ingest usage: %v", err)
+	}
+	if rep, err := store.Ingest(ctx, usageIn); err != nil || !rep.Duplicate {
+		t.Fatalf("usage replay: want duplicate, got %+v err %v", rep, err)
+	}
+	usageRecs := []ObservationRecord{{ID: rawObs}, {ID: 987654321}}
+	if err := store.AttachUsage(ctx, usageRecs); err != nil {
+		t.Fatalf("attach usage: %v", err)
+	}
+	if u := usageRecs[0].Usage; u == nil || u.Used != 1 || u.Sessions != 1 || u.LastUsedAtEpoch != now-50 {
+		t.Fatalf("usage summary: want used=1 sessions=1, got %+v", u)
+	}
+	if usageRecs[1].Usage != nil {
+		t.Fatalf("usage on an id that names no row must stay nil, got %+v", usageRecs[1].Usage)
+	}
+	usageLines, err := store.ListObservationUsage(ctx, rawObs, 0)
+	if err != nil || len(usageLines) != 1 || usageLines[0].EventID != usageRes.ID || usageLines[0].Reason != "carried the meadow" {
+		t.Fatalf("usage lines: want one line from event %d, got %+v err %v", usageRes.ID, usageLines, err)
 	}
 
 	// --- Search: FTS/tsvector needle, snippet, project scoping ---
@@ -290,6 +345,72 @@ func runConformanceBattery(t *testing.T, store *Store) {
 		t.Fatalf("completed-run dedup must carry status completed: %+v err %v", dupDone, err)
 	}
 
+	// --- Recent derive-run outcomes: the /metrics failure-genre window ---
+	// Newest-first ordering, a NULL meta_json scanning to nil, and the LIMIT
+	// must behave identically on both engines: the failure-genre gauges read
+	// nothing else (memoire:D222 observable).
+	failMeta := json.RawMessage(`{"failure":{"stage":"provider_call","error":"modelderive: model \"m\" is not allowlisted for endpoint \"e\""}}`)
+	failedRun, err := store.EnsureDerivationRun(ctx, DerivationRunInput{
+		Project: project, SessionID: session, Provider: "byok", DataBoundary: "local",
+		DerivationVersion: "v1", InputHash: "conf-hash-2", EndpointID: "conf-endpoint",
+		Model: "conf-model", WindowStartEpoch: now - 100, WindowEndEpoch: now,
+	})
+	if err != nil {
+		t.Fatalf("ensure failed run: %v", err)
+	}
+	if err := store.UpdateDerivationRunStatus(ctx, DerivationRunStatusUpdate{
+		ID: failedRun.ID, Status: "failed", CompletedAtEpoch: now, Metadata: failMeta,
+	}); err != nil {
+		t.Fatalf("mark run failed with metadata: %v", err)
+	}
+	// A legacy row can carry a NULL meta_json (the column is nullable and
+	// predates the insert-time '{}'); the scan must yield nil, not "".
+	nullMetaRun, err := store.EnsureDerivationRun(ctx, DerivationRunInput{
+		Project: project, SessionID: session, Provider: "rules", DataBoundary: "local",
+		DerivationVersion: "v1", InputHash: "conf-hash-3",
+		WindowStartEpoch: now - 100, WindowEndEpoch: now,
+	})
+	if err != nil {
+		t.Fatalf("ensure null-meta run: %v", err)
+	}
+	// Pin the ordering dimension explicitly — the runs were minted within
+	// the same wall-clock second, and run ids are hashes, not monotonic.
+	for id, at := range map[string]int64{failedRun.ID: now - 10, run.ID: now - 1000, nullMetaRun.ID: now - 2000} {
+		if _, err := store.db.ExecContext(ctx,
+			`UPDATE derivation_runs SET created_at_epoch = ? WHERE id = ?`, at, id); err != nil {
+			t.Fatalf("age run %s: %v", id, err)
+		}
+	}
+	if _, err := store.db.ExecContext(ctx,
+		`UPDATE derivation_runs SET meta_json = NULL WHERE id = ?`, nullMetaRun.ID); err != nil {
+		t.Fatalf("null out meta_json: %v", err)
+	}
+	outcomes, err := store.RecentDeriveRunOutcomes(ctx, 100)
+	if err != nil {
+		t.Fatalf("recent derive run outcomes: %v", err)
+	}
+	if len(outcomes) != 3 {
+		t.Fatalf("recent outcomes: want 3 rows, got %d (%+v)", len(outcomes), outcomes)
+	}
+	if outcomes[0].Status != "failed" || outcomes[1].Status != "completed" || outcomes[2].Status != "pending" {
+		t.Fatalf("recent outcomes not newest-first: %+v", outcomes)
+	}
+	var gotFailure struct {
+		Failure struct{ Stage, Error string } `json:"failure"`
+	}
+	if err := json.Unmarshal(outcomes[0].Metadata, &gotFailure); err != nil {
+		t.Fatalf("failed run metadata did not round-trip: %v (%s)", err, outcomes[0].Metadata)
+	}
+	if gotFailure.Failure.Stage != "provider_call" || !strings.Contains(gotFailure.Failure.Error, "is not allowlisted") {
+		t.Fatalf("failure block lost in transit: %+v", gotFailure)
+	}
+	if outcomes[2].Metadata != nil {
+		t.Fatalf("NULL meta_json must scan to nil, got %s", outcomes[2].Metadata)
+	}
+	if capped, err := store.RecentDeriveRunOutcomes(ctx, 1); err != nil || len(capped) != 1 || capped[0].Status != "failed" {
+		t.Fatalf("limit not honored: %+v err %v", capped, err)
+	}
+
 	// --- Derived observations: RETURNING id, accepted, proposed ---
 	accepted, err := store.InsertDerivedObservation(ctx, DerivedObservationInput{
 		Project: project, SessionID: session, Kind: "decision", Text: "conformance accepted decision",
@@ -313,6 +434,79 @@ func runConformanceBattery(t *testing.T, store *Store) {
 	if proposed.ReviewState != "proposed" {
 		t.Fatalf("proposed insert: got state %q", proposed.ReviewState)
 	}
+
+	// --- Hit lineage: every dialect's search and timeline lane projects
+	// derivation_run_id, and the grouped sibling read pairs a run's rows
+	// on both engines (Fibery #335). The IN-list placeholders go through
+	// the dialect seam, so this is the pg rebind check too. ---
+	lineageFilter := ObservationFilter{Project: project, SessionID: session, Kind: "decision", Limit: 10}
+	for name, read := range map[string]func() ([]SearchHit, error){
+		"search":   func() ([]SearchHit, error) { return store.SearchWithFilter(ctx, "conformance", lineageFilter) },
+		"timeline": func() ([]SearchHit, error) { return store.TimelineWithFilter(ctx, lineageFilter) },
+	} {
+		lineage, err := read()
+		if err != nil || len(lineage) != 1 || lineage[0].ID != accepted.ID {
+			t.Fatalf("%s lineage read: want exactly the accepted decision, got %+v err %v", name, lineage, err)
+		}
+		if lineage[0].DerivationRunID != run.ID {
+			t.Fatalf("%s hit derivation_run_id = %q, want %q", name, lineage[0].DerivationRunID, run.ID)
+		}
+		if len(lineage[0].Siblings) != 0 {
+			t.Fatalf("%s lane must not fill siblings itself, got %+v", name, lineage[0].Siblings)
+		}
+		siblingFilter := lineageFilter
+		siblingFilter.IncludeProposed = true
+		if err := store.AttachRunSiblings(ctx, lineage, siblingFilter, SiblingsPerHit); err != nil {
+			t.Fatalf("%s attach run siblings: %v", name, err)
+		}
+		if len(lineage[0].Siblings) != 1 || lineage[0].Siblings[0].ID != proposed.ID ||
+			lineage[0].Siblings[0].Kind != "fact" || lineage[0].Siblings[0].ReviewState != "proposed" {
+			t.Fatalf("%s siblings: want the run's proposed fact %d, got %+v", name, proposed.ID, lineage[0].Siblings)
+		}
+	}
+
+	// Sibling visibility IS observationWhere's output over the reduced
+	// filter (operator ruling: a sibling must be fetchable by the same
+	// caller with the same filter), so the noise exclusion and the
+	// NOT EXISTS feed actor-gate must behave identically on both dialects.
+	// Run once, after the lane loop, so only one noisy row is ever inserted.
+	siblingsOf := func(what string, filter ObservationFilter) []ObservationSibling {
+		probe := []SearchHit{{ID: accepted.ID, DerivationRunID: run.ID}}
+		if err := store.AttachRunSiblings(ctx, probe, filter, SiblingsPerHit); err != nil {
+			t.Fatalf("attach siblings (%s): %v", what, err)
+		}
+		return probe[0].Siblings
+	}
+	// The accepted-only band hides the run's proposed row.
+	if sibs := siblingsOf("default band", lineageFilter); len(sibs) != 0 {
+		t.Fatalf("accepted-only band must hide the run's proposed row, got %+v", sibs)
+	}
+	noisy, err := store.InsertDerivedObservation(ctx, DerivedObservationInput{
+		Project: project, SessionID: session, Kind: "fact", Text: "conformance noisy sibling",
+		DerivationRunID: run.ID, ContentHash: "confhash-noisy",
+		SourceEventIDs: []int64{first.ID}, NoiseCandidate: true, OccurredAtEpoch: now - 45,
+	})
+	if err != nil {
+		t.Fatalf("insert noisy sibling: %v", err)
+	}
+	if sibs := siblingsOf("noise excluded", lineageFilter); len(sibs) != 0 {
+		t.Fatalf("noise-flagged sibling must be excluded by default, got %+v", sibs)
+	}
+	noiseFilter := lineageFilter
+	noiseFilter.IncludeNoise = true
+	if sibs := siblingsOf("noise included", noiseFilter); len(sibs) != 1 || sibs[0].ID != noisy.ID {
+		t.Fatalf("include_noise must surface the noisy sibling %d, got %+v", noisy.ID, sibs)
+	}
+	// The gate is fail-closed on both engines: include_agent_accepted is an
+	// opt-in the by-id route cannot express, so it never widens a sibling
+	// set. The noisy row stays excluded, proving the clause is still there.
+	agentFilter := lineageFilter
+	agentFilter.IncludeAgentAccepted = true
+	if sibs := siblingsOf("agent-accepted opt-in", agentFilter); len(sibs) != 0 {
+		t.Fatalf("include_agent_accepted must not widen a sibling set, got %+v", sibs)
+	}
+	// The noisy row is noise_candidate=1, so every other read in this
+	// battery already excludes it; no cleanup is needed.
 
 	// --- Governance trigger parity: the DB itself must refuse ---
 	_, err = store.db.ExecContext(ctx, `INSERT INTO observations(
@@ -667,6 +861,53 @@ func runConformanceBattery(t *testing.T, store *Store) {
 	}
 	if st.EventCount == 0 || st.DeletedEventCount != 1 || st.DBBytes == 0 {
 		t.Fatalf("stats: %+v", st)
+	}
+	// HealthStats keeps the max-receipt meaning of last_write_epoch without a
+	// scan. Independent oracle: a backfilled event with an OLD caller-supplied
+	// receipt becomes the newest row but must not lower the last write.
+	maxReceipt := st.LastWriteEpoch
+	if _, err := store.Ingest(ctx, EventInput{
+		Project: project, SessionID: session, SourceAdapter: "claude-code",
+		SourceEventID: "conf-evt-backfill", EventType: "claude_Stop",
+		OccurredAtEpoch: 1_000_000_000, ReceivedAtEpoch: 1_000_000_000,
+	}); err != nil {
+		t.Fatalf("backfill ingest: %v", err)
+	}
+	if st2, err := store.Stats(ctx, store.path); err != nil || st2.LastWriteEpoch != maxReceipt {
+		t.Fatalf("stats after backfill: want last write %d, got %+v err %v", maxReceipt, st2, err)
+	}
+	// A fresh process view (no ingest seen) whose seed is waiting out a retry
+	// delay, as after a failed scan: the newest row is the backfill, so the
+	// value is only a lower bound and must be reported as unknown.
+	store.lastWrite.Store(0)
+	store.seed.mu.Lock()
+	store.seed.done.Store(false)
+	store.seed.next = time.Now().Add(time.Hour)
+	store.seed.mu.Unlock()
+	hs, err := store.HealthStats(ctx, store.path)
+	if err != nil || hs.LastWriteKnown || hs.LastWriteEpoch != 1_000_000_000 || hs.EventCount != 0 || hs.DBBytes == 0 {
+		t.Fatalf("health stats while unseeded: %+v err %v", hs, err)
+	}
+	// The retry delay elapses: the next call reseeds and converges to the max.
+	store.seed.mu.Lock()
+	store.seed.next = time.Time{}
+	store.seed.mu.Unlock()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hs, err := store.HealthStats(ctx, store.path)
+		if err != nil {
+			t.Fatalf("health stats: %v", err)
+		}
+		if hs.LastWriteKnown {
+			if hs.LastWriteEpoch != maxReceipt {
+				t.Fatalf("health stats seeded to %d, want %d", hs.LastWriteEpoch, maxReceipt)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("health stats never seeded: %+v", hs)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	// --- Credentials round trip ---
@@ -1153,8 +1394,85 @@ func runConformanceBattery(t *testing.T, store *Store) {
 	if _, err := store.db.ExecContext(ctx, `UPDATE observations SET deleted_at_epoch = ? WHERE id = ?`, now, soIDs[0]); err != nil {
 		t.Fatalf("soft-delete matched: %v", err)
 	}
-	if res, liveMatch, err := store.InsertDerivedObservationUnlessMatchedLive(ctx, gatedIn, []int64{soIDs[0]}); err != nil || liveMatch != 0 || res.ID == 0 {
-		t.Fatalf("gated insert must proceed once the match is dead: res=%+v live=%d err %v", res, liveMatch, err)
+	gatedRes, gatedLive, err := store.InsertDerivedObservationUnlessMatchedLive(ctx, gatedIn, []int64{soIDs[0]})
+	if err != nil || gatedLive != 0 || gatedRes.ID == 0 {
+		t.Fatalf("gated insert must proceed once the match is dead: res=%+v live=%d err %v", gatedRes, gatedLive, err)
+	}
+
+	// --- Derivation-time supersede (Fibery #344) ---
+	// The same three-outcome transaction on both engines: CAS on the target,
+	// filiation on the successor, review-log plus audit on the target, and a
+	// CAS loser that writes nothing at all.
+	supOffer := []ObservationSupersedeOffer{{
+		TargetID: gatedRes.ID,
+		Metadata: json.RawMessage(`{"confidence_source":"model_self_report","supersede":{"of":` +
+			strconv.FormatInt(gatedRes.ID, 10) + `,"trigram":0.59,"containment":1,"growth":0.4}}`),
+	}}
+	supIn := DerivedObservationInput{
+		Project: soProject, SessionID: soSession, Kind: "fact",
+		Text: "session fact alpha, reworded and extended with the outcome", Confidence: &soConf,
+		ReviewState: "proposed", DerivationRunID: soRun.ID, ContentHash: "so-supersede-hash",
+		SourceEventIDs: []int64{soEvt.ID}, ModelDerived: true,
+	}
+	supOut, err := store.InsertDerivedObservationSuperseding(ctx, supIn, []int64{gatedRes.ID}, supOffer)
+	if err != nil {
+		t.Fatalf("superseding insert: %v", err)
+	}
+	if supOut.SupersededID != gatedRes.ID || supOut.LiveMatchID != 0 || supOut.Result.ID == 0 {
+		t.Fatalf("supersede outcome: %+v", supOut)
+	}
+	supRec, err := store.GetObservationWithFilter(ctx, supOut.Result.ID, ObservationFilter{IncludeProposed: true})
+	if err != nil {
+		t.Fatalf("read successor: %v", err)
+	}
+	if supRec.SupersedesID == nil || *supRec.SupersedesID != gatedRes.ID {
+		t.Fatalf("the read shape must carry filiation on both engines: %v", supRec.SupersedesID)
+	}
+	var supState string
+	if err := store.rdb.QueryRowContext(ctx, `SELECT review_state FROM observations WHERE id = ?`, gatedRes.ID).Scan(&supState); err != nil {
+		t.Fatalf("target state: %v", err)
+	}
+	if supState != "superseded" {
+		t.Fatalf("target state = %q, want superseded", supState)
+	}
+	supLog, err := store.ListObservationReviewLog(ctx, ObservationReviewLogFilter{ObservationID: gatedRes.ID})
+	if err != nil || len(supLog) != 1 || supLog[0].ToState != "superseded" || supLog[0].Actor != DeriveSupersedeActor {
+		t.Fatalf("target review-log parity: %+v err %v", supLog, err)
+	}
+	var supAudit int
+	if err := store.rdb.QueryRowContext(ctx,
+		`SELECT count(*) FROM audit_log WHERE action = 'observation.supersede' AND resource_id = ?`,
+		strconv.FormatInt(gatedRes.ID, 10)).Scan(&supAudit); err != nil {
+		t.Fatalf("audit parity: %v", err)
+	}
+	if supAudit != 1 {
+		t.Fatalf("want exactly one supersede audit row, got %d", supAudit)
+	}
+	// The CAS loser: the same offer against a target that is no longer
+	// proposed rejects, writes nothing, and leaves no second successor.
+	loserIn := supIn
+	loserIn.Text = "session fact alpha, reworded and extended once more with the outcome"
+	loserIn.ContentHash = "so-supersede-loser-hash"
+	loserOut, err := store.InsertDerivedObservationSuperseding(ctx, loserIn, []int64{gatedRes.ID}, supOffer)
+	if err != nil {
+		t.Fatalf("CAS-loser insert: %v", err)
+	}
+	if loserOut.LiveMatchID != gatedRes.ID || loserOut.SupersededID != 0 || loserOut.Result.ID != 0 {
+		t.Fatalf("CAS loser must reject and write nothing: %+v", loserOut)
+	}
+	var supChildren int
+	if err := store.rdb.QueryRowContext(ctx,
+		`SELECT count(*) FROM observations WHERE supersedes_id = ?`, gatedRes.ID).Scan(&supChildren); err != nil {
+		t.Fatalf("successor count: %v", err)
+	}
+	if supChildren != 1 {
+		t.Fatalf("want exactly one successor, got %d", supChildren)
+	}
+	// And the superseded row leaves the derivation read-back.
+	for _, obs := range mustListSessionObs(t, store, ctx, soProject, soSession) {
+		if obs.ID == gatedRes.ID {
+			t.Fatal("a superseded row must not be offered to derivation on either engine")
+		}
 	}
 
 	// --- No-work intent settlement (round-1 MED-4 policy) ---
@@ -1186,6 +1504,79 @@ func runConformanceBattery(t *testing.T, store *Store) {
 	}
 	if !openKeys[medianProject+"/"+medianSession] || !openKeys["conformance-ghost/ghost-recent"] {
 		t.Fatalf("with-events and recent intents must survive settle: %+v", openKeys)
+	}
+
+	// --- D257 feed actor-gate: fail-closed on every shape (a20 = A,
+	// round-3 F4) ---
+	// The reviewer's falsifier, engine-pair: a schema-valid raw row with
+	// an `agent:*` accept review-log entry, planted by direct SQL (no
+	// current API path writes the pair — transitions on raw are
+	// raw-locked since governance v1, elevation since 6f7228e; but the
+	// pgshadow copy carries legacy rows and review-log actors unchecked,
+	// so a migrated corpus can hold it). D257's predicate is
+	// exclusion-shaped and fail-closed: the row stays OUT of the default
+	// raw read on BOTH engines and every shape until a deliberate ruling
+	// moves the predicate. The control proves the row is otherwise
+	// eligible — the exclusion is the gate, not the seed.
+	gateProject := "conformance-actor-gate"
+	gateIn := EventInput{
+		Project:         gateProject,
+		SessionID:       "conf-actor-gate",
+		SourceAdapter:   "claude-code",
+		SourceEventID:   "conf-evt-actor-gate",
+		EventType:       "claude_UserPromptSubmit",
+		OccurredAtEpoch: now - 60,
+		Payload:         json.RawMessage(`{"prompt":"the falsifier lighthouse burned"}`),
+	}
+	gateRes, err := store.Ingest(ctx, gateIn)
+	if err != nil {
+		t.Fatalf("actor-gate ingest: %v", err)
+	}
+	var gateObs int64
+	if err := store.rdb.QueryRow(`SELECT id FROM observations WHERE event_id = ?`, gateRes.ID).Scan(&gateObs); err != nil {
+		t.Fatalf("actor-gate raw observation: %v", err)
+	}
+	// The falsifying log row — direct SQL through the writer handle (the
+	// SQLite read pool is query-only; the PG leg's rdb is the same handle).
+	if _, err := store.db.Exec(`INSERT INTO observation_review_log
+		(observation_id, from_state, to_state, actor, reason_text, occurred_at_epoch)
+		VALUES (?, 'proposed', 'accepted', 'agent:conf-falsifier', 'schema-valid counterexample', ?)`,
+		gateObs, now-50); err != nil {
+		t.Fatalf("actor-gate log row: %v", err)
+	}
+	for name, read := range map[string]func() ([]SearchHit, error){
+		"search (unbounded default raw read)": func() ([]SearchHit, error) {
+			return store.SearchWithFilter(ctx, "falsifier lighthouse", ObservationFilter{Project: gateProject, Kind: "raw", Limit: 20})
+		},
+		"context (30-day bounded)": func() ([]SearchHit, error) {
+			return store.SearchWithFilter(ctx, "falsifier lighthouse", ObservationFilter{Project: gateProject, Kind: "raw", OccurredAfterEpoch: now - 30*86400, Limit: 20})
+		},
+		"timeline": func() ([]SearchHit, error) {
+			return store.TimelineWithFilter(ctx, ObservationFilter{Project: gateProject, Kind: "raw", Limit: 20})
+		},
+	} {
+		hits, err := read()
+		if err != nil {
+			t.Fatalf("actor-gate %s: %v", name, err)
+		}
+		for _, h := range hits {
+			if h.ID == gateObs {
+				t.Fatalf("actor-gate %s: the agent-accepted raw row is visible — D257 fail-closed broken: %+v", name, h)
+			}
+		}
+	}
+	gateControl, err := store.SearchWithFilter(ctx, "falsifier lighthouse", ObservationFilter{Project: gateProject, Kind: "raw", IncludeAgentAccepted: true, Limit: 20})
+	if err != nil {
+		t.Fatalf("actor-gate control: %v", err)
+	}
+	gateFound := false
+	for _, h := range gateControl {
+		if h.ID == gateObs {
+			gateFound = true
+		}
+	}
+	if !gateFound {
+		t.Fatal("actor-gate control: the row must be visible with include_agent_accepted=true (it is otherwise eligible) — the exclusion is not the gate")
 	}
 
 	conformanceConcurrentVerdicts(t, store)

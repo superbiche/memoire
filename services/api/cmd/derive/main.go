@@ -48,7 +48,28 @@ import (
 // restating earlier session content, which coverage exclusion cannot see.
 // Context is advisory: excluded from the canonical input hash, so run
 // idempotency stays a function of the source events.
-const promptVersion = "derive-observations-v2.4"
+// v2.5 (2026-09-11, Fibery #365): content-less event runs render as one
+// compact `### events A..B` block, and a content-bearing event's project and
+// session_id lines are omitted when they repeat the Source Window header.
+// Every claude_PostToolUse event carries a tool name and no result summary —
+// no adapter in this repo produces one — so it rendered ~336 bytes of
+// envelope and zero content, stranding byte-heavy, content-light rhythm
+// segments above the prompt ceiling AND under the min-content floor: both
+// median halves were skipped as degenerate_window, wrote no run row, and were
+// re-cut identically on every later tick. Run meta gains
+// collapsed_event_count and collapsed_block_count so the saving is measurable
+// per run. The input manifest is unchanged (every event, collapsed ones
+// included), so coverage and the canonical input hash are untouched and the
+// derivation version does NOT bump — as in v2.3/v2.4, prompt_version stays
+// excluded from run idempotency, so no window re-keys.
+const promptVersionBase = "derive-observations-v2.5"
+
+// promptVersion is the base label plus the graduated-genre suffix (triage
+// lane v1, R-B). A graduation CHANGES the prompt, so it must change the
+// version too, or two materially different prompts would share one name in
+// the run ledger. With no genre graduated the suffix is empty and the label
+// is byte-identical to what it has always been.
+func promptVersion() string { return promptVersionBase + modelderive.GraduatedPromptSuffix() }
 
 // promptPreviewBytes caps how much of the built prompt is echoed in -json or
 // human output. The full prompt is only written when -prompt-out is given.
@@ -83,11 +104,18 @@ type options struct {
 	execute               bool
 	executeTimeout        time.Duration
 	maxCompletionTokens   int
+	reasoningEffort       string
 	ignoreDenylist        bool
 	noMinContentGuard     bool
 	forceRerun            bool
+	noSupersede           bool
+	provisional           bool
 	listTargets           bool
 	medianEpoch           bool
+	cutPoints             bool
+	cutGapSeconds         int64
+	cutMaxEvents          int
+	cutMaxSegments        int
 	listOpenIntents       bool
 	listOutstanding       bool
 	settleIntents         bool
@@ -99,6 +127,95 @@ type options struct {
 	byokAPIKeyEnv         string
 	byokAPIKeyFile        string
 	allowExternal         bool
+	// promptBytesFromFlag / completionTokensFromFlag record whether the
+	// operator passed the limit EXPLICITLY (fs.Visit), which is what lets an
+	// explicit -max-prompt-bytes=0 mean "no cap" against a profile that would
+	// otherwise supply one.
+	promptBytesFromFlag      bool
+	completionTokensFromFlag bool
+}
+
+// resolvedLimits is the outcome of the profile precedence: explicit flag >
+// endpoint profile > built-in default (docs/DERIVE-PROFILE-DESIGN.md §3). The
+// numbers are also written back into options so every existing consumer — the
+// prompt builder's Limits, the adapter config, the run provenance — inherits
+// one resolution instead of re-deriving it per site.
+type resolvedLimits struct {
+	promptBytesSource      string
+	completionTokensSource string
+	thinkingPolicy         string
+	thinkingBudgetTokens   int
+}
+
+// resolveLimits applies profile precedence to opts in place and reports where
+// each limit came from. A nil profile leaves today's behavior untouched, so it
+// is safe to call on paths that never see a registry entry.
+func resolveLimits(opts *options, profile *config.DeriveProfile) resolvedLimits {
+	source := func(fromFlag bool) string {
+		if fromFlag {
+			return "flag"
+		}
+		return "default"
+	}
+	res := resolvedLimits{
+		promptBytesSource:      source(opts.promptBytesFromFlag),
+		completionTokensSource: source(opts.completionTokensFromFlag),
+	}
+	if profile == nil {
+		return res
+	}
+	if !opts.promptBytesFromFlag {
+		opts.maxPromptBytes = profile.EffectiveMaxPromptBytes()
+		res.promptBytesSource = "profile"
+	}
+	if !opts.completionTokensFromFlag {
+		opts.maxCompletionTokens = profile.MaxCompletionTokens
+		res.completionTokensSource = "profile"
+	}
+	// The thinking declaration is orthogonal to the numeric precedence: it
+	// describes how the endpoint is SERVED, so it is recorded whenever the
+	// endpoint declares it, flags or no flags.
+	if profile.Thinking != nil {
+		res.thinkingPolicy = profile.Thinking.Policy
+		res.thinkingBudgetTokens = profile.Thinking.BudgetTokens
+	}
+	return res
+}
+
+// effectiveLimitsJSON is the additive dry-run field reporting the resolved
+// ceilings, so the sweep and the bench can read the numbers a run would use
+// instead of hardcoding them. One "source" when both limits agree; per-limit
+// sources when they do not.
+func (r resolvedLimits) effectiveLimitsJSON(opts options) map[string]any {
+	out := map[string]any{
+		"max_prompt_bytes":      opts.maxPromptBytes,
+		"max_completion_tokens": opts.maxCompletionTokens,
+	}
+	if r.promptBytesSource == r.completionTokensSource {
+		out["source"] = r.promptBytesSource
+		return out
+	}
+	out["max_prompt_bytes_source"] = r.promptBytesSource
+	out["max_completion_tokens_source"] = r.completionTokensSource
+	return out
+}
+
+// resolveLimitsBestEffort applies the endpoint's profile on a path that has no
+// registry requirement of its own — the dry-run. Best-effort by design: a
+// dry-run that works today must not gain a new failure mode, so a missing,
+// unreadable, or profile-less registry (and an endpoint absent from it) leaves
+// the flags and defaults exactly as they were. A malformed profile still fails
+// loudly where it matters, on -execute.
+func resolveLimitsBestEffort(opts *options) resolvedLimits {
+	var profile *config.DeriveProfile
+	if cfg, err := config.Load(); err == nil {
+		if endpoints, err := config.LoadModelEndpoints(cfg.ModelEndpointsPath); err == nil {
+			if ep, ok := findEndpoint(endpoints, opts.endpointID); ok {
+				profile = ep.Profile
+			}
+		}
+	}
+	return resolveLimits(opts, profile)
 }
 
 // defaultExecuteTimeout bounds the live provider call on the -execute path. It
@@ -131,11 +248,18 @@ func run(args []string, stdout, stderr io.Writer) error {
 	fs.BoolVar(&opts.execute, "execute", false, "model strategy: perform a real, persisted derivation run against the configured provider endpoint (mutually exclusive with -dry-run)")
 	fs.DurationVar(&opts.executeTimeout, "execute-timeout", defaultExecuteTimeout, "ceiling for the live provider call on the -execute path (e.g. 90s, 10m)")
 	fs.IntVar(&opts.maxCompletionTokens, "max-completion-tokens", 0, "cap on model completion tokens sent as max_tokens (0 = adapter default)")
+	fs.StringVar(&opts.reasoningEffort, "reasoning-effort", "", "model strategy: chat-template reasoning effort hint (none|low|medium|high|xhigh); empty = server default")
 	fs.BoolVar(&opts.ignoreDenylist, "ignore-denylist", false, "manual override: run even when -project matches the derive denylist")
 	fs.BoolVar(&opts.noMinContentGuard, "no-min-content-guard", false, "manual override: derive even a degenerate (near-empty) window")
 	fs.BoolVar(&opts.forceRerun, "force-rerun", false, "model strategy with -execute: mint a new derivation run even when the window would dedup (prompt/model A/B reruns; forced provenance recorded in run meta_json)")
+	fs.BoolVar(&opts.noSupersede, "no-supersede", false, "model strategy with -execute: kill switch for derivation-time supersede — a restatement of an earlier cut's proposed observation is rejected as a near-duplicate instead of superseding it (Fibery #344)")
+	fs.BoolVar(&opts.provisional, "provisional", false, "model strategy with -execute: mark the run and its observations provisional — the window's tail is still open, so its observations are \"so far\" statements a later cut may supersede (Fibery #344)")
 	fs.BoolVar(&opts.listTargets, "list-targets", false, "sweep helper: print project<US>session pairs with events in the last -since-hours, one per line, and exit (engine-agnostic via MEMOIRE_DB)")
 	fs.BoolVar(&opts.medianEpoch, "median-epoch", false, "sweep helper: print the median canonical-input event epoch for -project/-session-id inside [-start-epoch, -end-epoch] and exit (empty output when the window has none)")
+	fs.BoolVar(&opts.cutPoints, "cut-points", false, "sweep helper: print the session's rhythm cut epochs (long pause, event-count cap) for -project/-session-id, one per line, and exit (empty output when the window needs no cut; Fibery #343)")
+	fs.Int64Var(&opts.cutGapSeconds, "cut-gap-seconds", defaultCutGapSeconds, "with -cut-points: long-pause threshold in seconds between consecutive canonical events (0 disables the class)")
+	fs.IntVar(&opts.cutMaxEvents, "cut-max-events", defaultCutMaxEvents, "with -cut-points: cut after this many canonical events since the last cut (0 disables the class)")
+	fs.IntVar(&opts.cutMaxSegments, "cut-max-segments", defaultCutMaxSegments, "with -cut-points: maximum rhythm segments per pass; overflow merges into the last segment (0 = unbounded)")
 	fs.IntVar(&opts.sinceHours, "since-hours", 24, "with -list-targets or -list-outstanding: recency window in hours")
 	fs.BoolVar(&opts.listOpenIntents, "list-open-intents", false, "sweep helper: print project<US>session pairs with an open derive intent, oldest first, and exit (memoire:D165 R-10.2)")
 	fs.BoolVar(&opts.listOutstanding, "list-outstanding", false, "trigger helper: print project<US>session pairs with live canonical events not covered by any completed derivation run within -since-hours, and exit (memoire:D165 R-10.3; same store query as GET /v1/derive/outstanding)")
@@ -151,23 +275,40 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Which limits the operator set EXPLICITLY. A passed flag outranks an
+	// endpoint profile even at 0, where 0 keeps its existing meaning (no
+	// prompt cap / adapter default completion cap).
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "max-prompt-bytes":
+			opts.promptBytesFromFlag = true
+		case "max-completion-tokens":
+			opts.completionTokensFromFlag = true
+		}
+	})
 	if opts.executeTimeout <= 0 {
 		return errors.New("-execute-timeout must be positive")
 	}
+	if !isReasoningEffort(opts.reasoningEffort) {
+		return fmt.Errorf("unknown -reasoning-effort %q (want none|low|medium|high|xhigh, or empty for the server default)", opts.reasoningEffort)
+	}
 	modes := 0
-	for _, m := range []bool{opts.listTargets, opts.medianEpoch, opts.listOpenIntents, opts.listOutstanding, opts.settleIntents} {
+	for _, m := range []bool{opts.listTargets, opts.medianEpoch, opts.cutPoints, opts.listOpenIntents, opts.listOutstanding, opts.settleIntents} {
 		if m {
 			modes++
 		}
 	}
 	if modes > 1 {
-		return errors.New("-list-targets, -median-epoch, -list-open-intents, -list-outstanding and -settle-intents are mutually exclusive")
+		return errors.New("-list-targets, -median-epoch, -cut-points, -list-open-intents, -list-outstanding and -settle-intents are mutually exclusive")
 	}
 	if opts.listTargets {
 		return runListTargets(stdout, opts)
 	}
 	if opts.medianEpoch {
 		return runMedianEpoch(stdout, opts)
+	}
+	if opts.cutPoints {
+		return runCutPoints(stdout, opts)
 	}
 	if opts.listOpenIntents {
 		return runListOpenIntents(stdout)
@@ -324,6 +465,14 @@ func runModelStrategy(stdout io.Writer, opts options) error {
 	if opts.forceRerun && !opts.execute {
 		return errors.New("-force-rerun requires -execute")
 	}
+	// The write-time gate and the run metadata exist only where a run is
+	// persisted, so on a dry-run both #344 flags would silently mean nothing.
+	if opts.noSupersede && !opts.execute {
+		return errors.New("-no-supersede requires -execute")
+	}
+	if opts.provisional && !opts.execute {
+		return errors.New("-provisional requires -execute")
+	}
 
 	if opts.execute {
 		return runModelExecute(stdout, opts)
@@ -332,6 +481,11 @@ func runModelStrategy(stdout io.Writer, opts options) error {
 }
 
 func runModelDryRun(stdout io.Writer, opts options) error {
+	// Resolve the endpoint's declared geometry before sizing anything: the
+	// dry-run's whole job is to report the prompt a run WOULD send, which
+	// means reporting it against the ceiling that run would enforce.
+	limits := resolveLimitsBestEffort(&opts)
+
 	store, closeStore, err := openStore()
 	if err != nil {
 		return err
@@ -375,6 +529,11 @@ func runModelDryRun(stdout io.Writer, opts options) error {
 					"skipped":    "fully_covered",
 					"project":    opts.project,
 					"session_id": opts.sessionID,
+					// The resolved ceilings are reported on EVERY dry-run
+					// JSON, skip included (review r1 F2): a caller reading
+					// the endpoint's geometry must not have to hit a
+					// non-skipped window to learn it.
+					"effective_limits": limits.effectiveLimitsJSON(opts),
 				})
 			}
 			fmt.Fprintf(stdout, "strategy=model dry_run=true skipped=fully_covered project=%s session_id=%s\n",
@@ -400,7 +559,7 @@ func runModelDryRun(stdout io.Writer, opts options) error {
 		Model:             opts.model,
 		EndpointID:        opts.endpointID,
 		DerivationVersion: derive.DerivationVersionV2,
-		PromptVersion:     promptVersion,
+		PromptVersion:     promptVersion(),
 		OutputSchema:      modelderive.SchemaVersion,
 		Window: modelderive.Window{
 			Project:    opts.project,
@@ -413,7 +572,10 @@ func runModelDryRun(stdout io.Writer, opts options) error {
 			MaxInputEvents:        opts.maxInputEvents,
 			MaxPromptBytes:        opts.maxPromptBytes,
 			MaxOutputObservations: opts.maxOutputObservations,
+			MaxCompletionTokens:   opts.maxCompletionTokens,
 		},
+		ThinkingPolicy:       limits.thinkingPolicy,
+		ThinkingBudgetTokens: limits.thinkingBudgetTokens,
 	}
 
 	// Mirror the execute path's already-captured context (prompt v2.4) so the
@@ -477,6 +639,7 @@ func runModelDryRun(stdout io.Writer, opts options) error {
 		"prompt_bytes":       len(prompt),
 		"prompt_preview":     previewString(prompt),
 		"prompt_meta":        meta,
+		"effective_limits":   limits.effectiveLimitsJSON(opts),
 	}
 	if promptOverCap {
 		// Additive transparency marker: prompt_bytes is the capless BASE
@@ -581,6 +744,11 @@ func runModelExecute(stdout io.Writer, opts options) error {
 		}
 	}
 
+	// Limits resolution starts flag-or-default; the local-qwen branch below
+	// re-resolves it against the selected endpoint's profile. byok has no
+	// registry entry, so it keeps flags and defaults (D233 gets profiles later).
+	limits := resolveLimits(&opts, nil)
+
 	var adapter modelderive.Provider
 	if opts.provider == modelderive.ProviderBYOK {
 		byok, err := buildBYOKAdapter(opts)
@@ -600,6 +768,12 @@ func runModelExecute(stdout io.Writer, opts options) error {
 			return fmt.Errorf("endpoint-id %q is not present in model endpoints config %s", opts.endpointID, cfg.ModelEndpointsPath)
 		}
 
+		// The endpoint's declared geometry resolves ONCE, here, before the
+		// adapter and the request are built from opts — the composition root
+		// is where config and modelderive meet (D75), so it is where the
+		// profile becomes numbers.
+		limits = resolveLimits(&opts, ep.Profile)
+
 		// Secret seam (D73 / Finding 5): the bearer token is resolved by env-var NAME
 		// at call time via the injected EnvLookup. The value is never read into config
 		// and never printed. Pre-flight the required env var here so a missing secret
@@ -616,6 +790,7 @@ func runModelExecute(stdout io.Writer, opts options) error {
 			MaxPromptBytes:        opts.maxPromptBytes,
 			MaxOutputObservations: opts.maxOutputObservations,
 			MaxCompletionTokens:   opts.maxCompletionTokens,
+			ReasoningEffort:       opts.reasoningEffort,
 		}, nil, envLookup)
 		if err != nil {
 			return err
@@ -640,7 +815,7 @@ func runModelExecute(stdout io.Writer, opts options) error {
 		EndpointID:        opts.endpointID,
 		Dialect:           opts.byokDialect,
 		DerivationVersion: derive.DerivationVersionV2,
-		PromptVersion:     promptVersion,
+		PromptVersion:     promptVersion(),
 		OutputSchema:      modelderive.SchemaVersion,
 		Window: modelderive.Window{
 			Project:    opts.project,
@@ -654,8 +829,13 @@ func runModelExecute(stdout io.Writer, opts options) error {
 			MaxInputEvents:        opts.maxInputEvents,
 			MaxPromptBytes:        opts.maxPromptBytes,
 			MaxOutputObservations: opts.maxOutputObservations,
+			MaxCompletionTokens:   opts.maxCompletionTokens,
 		},
-		ForceRerun: opts.forceRerun,
+		ThinkingPolicy:       limits.thinkingPolicy,
+		ThinkingBudgetTokens: limits.thinkingBudgetTokens,
+		ForceRerun:           opts.forceRerun,
+		NoSupersede:          opts.noSupersede,
+		Provisional:          opts.provisional,
 	}
 
 	outcome, err := orch.Run(context.Background(), adapter, req)
@@ -713,21 +893,22 @@ func runModelExecute(stdout io.Writer, opts options) error {
 
 	if opts.jsonOut {
 		out := map[string]any{
-			"strategy":       "model",
-			"execute":        true,
-			"persisted":      true,
-			"provider":       opts.provider,
-			"model":          opts.model,
-			"endpoint_id":    opts.endpointID,
-			"project":        opts.project,
-			"session_id":     opts.sessionID,
-			"run_id":         outcome.RunID,
-			"status":         outcome.Status,
-			"duplicate":      outcome.Duplicate,
-			"written_count":  outcome.WrittenCount,
-			"rejected_count": outcome.RejectedCount,
-			"unknown_count":  outcome.UnknownCount,
-			"refused":        outcome.Refused,
+			"strategy":         "model",
+			"execute":          true,
+			"persisted":        true,
+			"provider":         opts.provider,
+			"model":            opts.model,
+			"endpoint_id":      opts.endpointID,
+			"project":          opts.project,
+			"session_id":       opts.sessionID,
+			"run_id":           outcome.RunID,
+			"status":           outcome.Status,
+			"duplicate":        outcome.Duplicate,
+			"written_count":    outcome.WrittenCount,
+			"rejected_count":   outcome.RejectedCount,
+			"unknown_count":    outcome.UnknownCount,
+			"superseded_count": outcome.SupersededCount,
+			"refused":          outcome.Refused,
 			"usage": map[string]any{
 				"prompt_tokens":     outcome.Usage.PromptTokens,
 				"completion_tokens": outcome.Usage.CompletionTokens,
@@ -757,9 +938,9 @@ func runModelExecute(stdout io.Writer, opts options) error {
 	if intentServed {
 		intentMark = fmt.Sprintf(" intent_latency_s=%d", intentLatency)
 	}
-	fmt.Fprintf(stdout, "strategy=model execute=true run_id=%s status=%s duplicate=%t written=%d rejected=%d unknown=%d refused=%t%s%s\n",
+	fmt.Fprintf(stdout, "strategy=model execute=true run_id=%s status=%s duplicate=%t written=%d superseded=%d rejected=%d unknown=%d refused=%t%s%s\n",
 		outcome.RunID, outcome.Status, outcome.Duplicate,
-		outcome.WrittenCount, outcome.RejectedCount, outcome.UnknownCount, outcome.Refused, forced, intentMark)
+		outcome.WrittenCount, outcome.SupersededCount, outcome.RejectedCount, outcome.UnknownCount, outcome.Refused, forced, intentMark)
 	return nil
 }
 
@@ -1086,6 +1267,67 @@ func runMedianEpoch(stdout io.Writer, opts options) error {
 	return nil
 }
 
+// runCutPoints prints the session's RHYTHM cut epochs, one per line — the
+// sweep's first splitter, ahead of the byte-ceiling halving that -median-epoch
+// serves (Fibery #343). Empty output (exit 0) means the window needs no cut and
+// derives whole, exactly the contract -median-epoch already has.
+//
+// The detector lives here rather than in the sweep script because memoire:D162
+// put every derive-lane store read behind this binary's helper flags, and
+// because the population it must walk is the one the prompt builder admits:
+// the window's live, UNCOVERED, canonical-input events, fetched with the very
+// same filter the dry-run builds (memoire:D211 ExcludeCovered — on a live
+// session the stream the model sees is the uncovered stream, so that is the
+// stream whose rhythm matters). Reusing ListEventsForDerivation is also what
+// lets the floor pass consult the real min-content guard: the guard measures
+// per-event extracted TEXT, which no epochs-only query could express, and a
+// second implementation of that floor would drift.
+//
+// -no-min-content-guard is honored so the detector's floor and the
+// orchestrator's guard are never in disagreement.
+func runCutPoints(stdout io.Writer, opts options) error {
+	if opts.project == "" || opts.sessionID == "" {
+		return errors.New("-cut-points requires -project and -session-id")
+	}
+	if opts.cutGapSeconds < 0 || opts.cutMaxEvents < 0 || opts.cutMaxSegments < 0 {
+		return errors.New("-cut-gap-seconds, -cut-max-events and -cut-max-segments must not be negative")
+	}
+	if opts.endEpoch > 0 && opts.startEpoch > 0 && opts.endEpoch < opts.startEpoch {
+		return errors.New("-cut-points requires -end-epoch >= -start-epoch when both are pinned")
+	}
+	policy := cutPolicy{
+		GapSeconds:  opts.cutGapSeconds,
+		MaxEvents:   opts.cutMaxEvents,
+		MaxSegments: opts.cutMaxSegments,
+		Guard:       modelderive.WindowGuard{Disabled: opts.noMinContentGuard},
+	}
+	// Both classes disabled is a legal "rhythm cuts off" configuration and must
+	// not cost a store open.
+	if policy.GapSeconds <= 0 && policy.MaxEvents <= 0 {
+		return nil
+	}
+	store, closeStore, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+	events, err := store.ListEventsForDerivation(context.Background(), db.DerivationEventFilter{
+		Project:          opts.project,
+		SessionID:        opts.sessionID,
+		WindowStartEpoch: opts.startEpoch,
+		WindowEndEpoch:   opts.endEpoch,
+		EventTypes:       modelderive.CanonicalInputEventTypes(),
+		ExcludeCovered:   true,
+	})
+	if err != nil {
+		return err
+	}
+	for _, epoch := range computeCutPoints(events, policy) {
+		fmt.Fprintf(stdout, "%d\n", epoch)
+	}
+	return nil
+}
+
 func openStore() (*db.Store, func(), error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -1131,6 +1373,20 @@ func isModelProvider(provider string) bool {
 func isLocalProvider(provider string) bool {
 	switch provider {
 	case "local-qwen":
+		return true
+	default:
+		return false
+	}
+}
+
+// isReasoningEffort reports whether a -reasoning-effort value is one the Qwen3.8
+// chat template accepts. Empty is valid and means "send no kwarg", leaving the
+// server's own default in force. The value is rejected at preflight rather than
+// forwarded blindly: an unknown level reaches the template as a silent no-op, so
+// a typo would run at the wrong effort for a whole unattended sweep.
+func isReasoningEffort(effort string) bool {
+	switch effort {
+	case "", "none", "low", "medium", "high", "xhigh":
 		return true
 	default:
 		return false

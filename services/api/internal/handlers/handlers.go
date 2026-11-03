@@ -31,40 +31,82 @@ type Handler struct {
 	// metrics is the /metrics TTL cache for the two expensive series; a
 	// pointer so every by-value Handler copy shares the one cache.
 	metrics *metricsCache
+	// reads counts read routes and the age of what they return (L0009);
+	// a pointer for the same reason as metrics.
+	reads *readTelemetry
+	// searchFn is a test seam: nil in production, where searchStore calls
+	// the store directly.
+	searchFn func(ctx context.Context, q string, filter db.ObservationFilter) ([]db.SearchHit, error)
 }
 
 func New(cfg config.Config, store *db.Store, logger *slog.Logger) Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return Handler{cfg: cfg, store: store, logger: logger, metrics: newMetricsCache(store)}
+	return Handler{cfg: cfg, store: store, logger: logger, metrics: newMetricsCache(store), reads: newReadTelemetry()}
+}
+
+// healthStoreTimeout bounds EACH store read behind /v1/health. The liveness
+// probe calls this endpoint, so it must answer well inside the probe timeout
+// even when the database is slow. Each read has its own budget, so one slow
+// read never expires the next.
+const healthStoreTimeout = 3 * time.Second
+
+// healthRead runs one store read under its own healthStoreTimeout budget.
+func healthRead[T any](parent context.Context, read func(context.Context) (T, error)) (T, error) {
+	ctx, cancel := context.WithTimeout(parent, healthStoreTimeout)
+	defer cancel()
+	return read(ctx)
+}
+
+// healthCount is a lifetime counter for the health body: null when the read
+// failed, so a consumer never mistakes "unknown" for a count of 0.
+func healthCount(n int64, err error) any {
+	if err != nil {
+		return nil
+	}
+	return n
 }
 
 func (h Handler) Health(w http.ResponseWriter, r *http.Request) {
-	st, _ := h.store.Stats(r.Context(), h.cfg.DBPath)
+	// HealthStats, not Stats: the exact counts are full table scans (11 s on
+	// the hub's 26 GB observations table, which crash-looped the hub under
+	// liveness on 2026-10-29), and this body reports none of them. Health
+	// stays best-effort: a failed read keeps what was read.
+	st, _ := healthRead(r.Context(), func(ctx context.Context) (db.Stats, error) {
+		return h.store.HealthStats(ctx, h.cfg.DBPath)
+	})
+	var lastWrite any
+	if st.LastWriteKnown {
+		lastWrite = st.LastWriteEpoch
+	}
 	// Both additions are memoire:D136: queue_failed_depth makes the poison
 	// residual visible (R-3), redaction_contract_violations surfaces
-	// liaison-evidence backstop rewrites (R-2). Health stays best-effort: a
-	// count error reports 0 rather than failing the endpoint.
-	violations, _ := h.store.CountRedactionContractViolations(r.Context())
+	// liaison-evidence backstop rewrites (R-2). Both counters below are
+	// null when their read fails or overruns its budget.
+	violations := healthCount(healthRead(r.Context(), h.store.CountRedactionContractViolations))
 	// clock_skew_future_events is the memoire:D152 one-sided future-skew
 	// alert (occurred_at ahead of received_at beyond the threshold = producer
 	// clock fault; the lag direction is queue buffering and never alerted).
-	// Same best-effort stance as the other counters; 0 threshold disables.
-	var futureSkew int64
+	// 0 threshold disables (reported as 0, not null).
+	var futureSkew any = int64(0)
 	if h.cfg.SkewAlertSeconds > 0 {
-		futureSkew, _ = h.store.CountFutureSkewEvents(r.Context(), h.cfg.SkewAlertSeconds)
+		futureSkew = healthCount(healthRead(r.Context(), func(ctx context.Context) (int64, error) {
+			return h.store.CountFutureSkewEvents(ctx, h.cfg.SkewAlertSeconds)
+		}))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
 		// Stamped from the repo's VERSION file at build time (MISSING #7);
 		// "dev" on unstamped builds. Public() bounds the stamp to a version
 		// token — this body is unauthenticated (D224; review F1).
-		"version":                       buildinfo.Public(),
-		"queue_depth":                   queueDepth(h.cfg.Queue.Pending),
-		"queue_failed_depth":            failedQueueDepth(h.cfg.Queue.Failed),
-		"oldest_queue_age_seconds":      oldestQueueAgeSeconds(h.cfg.Queue.Pending),
-		"last_write_epoch":              st.LastWriteEpoch,
+		"version":                  buildinfo.Public(),
+		"queue_depth":              queueDepth(h.cfg.Queue.Pending),
+		"queue_failed_depth":       failedQueueDepth(h.cfg.Queue.Failed),
+		"oldest_queue_age_seconds": oldestQueueAgeSeconds(h.cfg.Queue.Pending),
+		// null until the exact seed behind HealthStats has landed: a lower
+		// bound must not read as the last write (write-stall checks).
+		"last_write_epoch":              lastWrite,
 		"db_bytes":                      st.DBBytes,
 		"wal_bytes":                     st.WALBytes,
 		"redaction_contract_violations": violations,
@@ -177,7 +219,7 @@ func (h Handler) ListDerivationRuns(w http.ResponseWriter, r *http.Request) {
 	filter := derivationRunFilterFromQuery(r, 50)
 	runs, err := h.store.ListDerivationRuns(r.Context(), filter)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		h.writeReadError(w, r, err, 0, db.ObservationFilter{Project: filter.Project, Limit: filter.Limit})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"derivation_runs": runs, "total": len(runs), "next_cursor": nil})
@@ -290,7 +332,7 @@ func (h Handler) ListToolEventsInWindow(w http.ResponseWriter, r *http.Request) 
 		Limit:      parseLimit(q.Get("limit"), 100),
 	})
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		h.writeReadError(w, r, err, 0, db.ObservationFilter{Project: q.Get("project"), Limit: parseLimit(q.Get("limit"), 100)})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "total": len(events), "next_cursor": nil})
@@ -327,6 +369,14 @@ func (h Handler) GetObservation(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("include_noise") == "true" {
 		filter.IncludeNoise = true
 	}
+	// L0010 R1 = A: the default by-id read serves raw projections only. No
+	// 400 here — this route takes no kind or exclude_kind, so there is
+	// nothing to reject; the forced kind simply leaves a derived row
+	// unfound, and it 404s until include_derived=true.
+	// occurred_after does not apply: a by-id fetch is exact, not a window.
+	if r.URL.Query().Get("include_derived") != "true" {
+		filter.Kind = "raw"
+	}
 	rec, err := h.store.GetObservationWithFilter(r.Context(), id, filter)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, err)
@@ -336,22 +386,89 @@ func (h Handler) GetObservation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"observation": rec})
+	// The single-observation route serves siblings next to the record, from
+	// the same store method over a one-element slice (Fibery #335).
+	probe := []db.SearchHit{{ID: rec.ID, DerivationRunID: rec.DerivationRunID}}
+	if err := h.store.AttachRunSiblings(r.Context(), probe, filter, db.SiblingsPerHit); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	one := []db.ObservationRecord{rec}
+	if err := h.store.AttachUsage(r.Context(), one); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.reads.records(readObservationGet, filter, one)
+	resp := map[string]any{"observation": one[0]}
+	if len(probe[0].Siblings) > 0 {
+		resp["siblings"] = probe[0].Siblings
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ListObservationUsage serves the attribution lines of one observation
+// (attribution at Stop): the verdict and reason each consuming turn gave the
+// hit, newest first, with the aggregate the list routes attach. Read scope,
+// like the observation itself; proposed and noise rows resolve, since the
+// review UI is the consumer.
+func (h Handler) ListObservationUsage(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	rec, err := h.store.GetObservationWithFilter(r.Context(), id, db.ObservationFilter{IncludeProposed: true, IncludeNoise: true})
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	one := []db.ObservationRecord{rec}
+	if err := h.store.AttachUsage(r.Context(), one); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	lines, err := h.store.ListObservationUsage(r.Context(), id, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"observation_id": id, "usage": one[0].Usage, "lines": lines, "total": len(lines)})
 }
 
 func (h Handler) ListObservations(w http.ResponseWriter, r *http.Request) {
-	filter := observationFilterFromQuery(r, 50)
+	filter, err := observationFilterFromQuery(r, 50)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := gateDefaultRawReads(r.URL.Query().Get("include_derived") == "true", &filter); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	recs, nextCursor, err := h.store.ListObservations(r.Context(), filter)
 	if errors.Is(err, db.ErrBadCursor) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err != nil {
-		// Preserves pre-cursor behavior: ListObservations errors other than
-		// ErrBadCursor (query-shape issues) map to 400, not 500.
-		writeError(w, http.StatusBadRequest, err)
+		h.writeReadError(w, r, err, 0, filter)
 		return
 	}
+	if err := h.store.AttachUsage(r.Context(), recs); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.reads.records(readObservationList, filter, recs)
 	var nextCursorJSON any
 	if nextCursor != "" {
 		nextCursorJSON = nextCursor
@@ -374,6 +491,7 @@ func (h Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	h.reads.request(readSessionGet, rawNA)
 	writeJSON(w, http.StatusOK, map[string]any{"session": rec})
 }
 
@@ -394,57 +512,80 @@ func (h Handler) DeleteEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) SearchGET(w http.ResponseWriter, r *http.Request) {
-	h.search(w, r, r.URL.Query().Get("q"), observationFilterFromQuery(r, 20))
+	filter, err := observationFilterFromQuery(r, 20)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := gateDefaultRawReads(r.URL.Query().Get("include_derived") == "true", &filter); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	h.search(w, r, r.URL.Query().Get("q"), filter)
 }
 
 func (h Handler) SearchPOST(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Q               string `json:"q"`
-		Project         string `json:"project"`
-		SessionID       string `json:"session_id"`
-		Kind            string `json:"kind"`
-		ExcludeKind     string `json:"exclude_kind"`
-		ReviewState     string `json:"review_state"`
-		DerivationRunID string `json:"derivation_run_id"`
-		Limit           int    `json:"limit"`
-		IncludeNoise    bool   `json:"include_noise"`
-		IncludeProposed bool   `json:"include_proposed"`
-		CanInstruct     bool   `json:"can_instruct"`
-		Hybrid          *bool  `json:"hybrid"`
+		Q                  string `json:"q"`
+		Project            string `json:"project"`
+		SessionID          string `json:"session_id"`
+		Kind               string `json:"kind"`
+		ExcludeKind        string `json:"exclude_kind"`
+		ReviewState        string `json:"review_state"`
+		DerivationRunID    string `json:"derivation_run_id"`
+		Limit              int    `json:"limit"`
+		IncludeNoise       bool   `json:"include_noise"`
+		IncludeProposed    bool   `json:"include_proposed"`
+		IncludeDerived     bool   `json:"include_derived"`
+		CanInstruct        bool   `json:"can_instruct"`
+		Hybrid             *bool  `json:"hybrid"`
+		OccurredAfterEpoch int64  `json:"occurred_after"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	h.search(w, r, body.Q, db.ObservationFilter{
-		Project:         body.Project,
-		SessionID:       body.SessionID,
-		Kind:            body.Kind,
-		ExcludeKind:     body.ExcludeKind,
-		ReviewState:     body.ReviewState,
-		DerivationRunID: body.DerivationRunID,
-		Limit:           body.Limit,
-		IncludeNoise:    body.IncludeNoise,
-		IncludeProposed: body.IncludeProposed,
-		CanInstruct:     body.CanInstruct,
-		Hybrid:          body.Hybrid,
-	})
+	if body.OccurredAfterEpoch < 0 {
+		writeError(w, http.StatusBadRequest, errors.New("occurred_after must be a unix epoch seconds bound"))
+		return
+	}
+	filter := db.ObservationFilter{
+		Project:            body.Project,
+		SessionID:          body.SessionID,
+		Kind:               body.Kind,
+		ExcludeKind:        body.ExcludeKind,
+		ReviewState:        body.ReviewState,
+		DerivationRunID:    body.DerivationRunID,
+		Limit:              body.Limit,
+		IncludeNoise:       body.IncludeNoise,
+		IncludeProposed:    body.IncludeProposed,
+		CanInstruct:        body.CanInstruct,
+		Hybrid:             body.Hybrid,
+		OccurredAfterEpoch: body.OccurredAfterEpoch,
+	}
+	if err := gateDefaultRawReads(body.IncludeDerived, &filter); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	h.search(w, r, body.Q, filter)
 }
 
 func (h Handler) Context(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Q               string `json:"q"`
-		Project         string `json:"project"`
-		SessionID       string `json:"session_id"`
-		Kind            string `json:"kind"`
-		ExcludeKind     string `json:"exclude_kind"`
-		ReviewState     string `json:"review_state"`
-		DerivationRunID string `json:"derivation_run_id"`
-		Limit           int    `json:"limit"`
-		IncludeNoise    bool   `json:"include_noise"`
-		IncludeProposed bool   `json:"include_proposed"`
-		CanInstruct     bool   `json:"can_instruct"`
-		Hybrid          *bool  `json:"hybrid"`
+		Q                  string `json:"q"`
+		Project            string `json:"project"`
+		SessionID          string `json:"session_id"`
+		Kind               string `json:"kind"`
+		ExcludeKind        string `json:"exclude_kind"`
+		ReviewState        string `json:"review_state"`
+		DerivationRunID    string `json:"derivation_run_id"`
+		Limit              int    `json:"limit"`
+		IncludeNoise       bool   `json:"include_noise"`
+		IncludeProposed    bool   `json:"include_proposed"`
+		IncludeDerived     bool   `json:"include_derived"`
+		CanInstruct        bool   `json:"can_instruct"`
+		Hybrid             *bool  `json:"hybrid"`
+		OccurredAfterEpoch int64  `json:"occurred_after"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -454,39 +595,71 @@ func (h Handler) Context(w http.ResponseWriter, r *http.Request) {
 	if !body.IncludeNoise && r.URL.Query().Get("include_noise") == "true" {
 		body.IncludeNoise = true
 	}
-	hits, err := h.store.SearchWithFilter(r.Context(), body.Q, db.ObservationFilter{
-		Project:         body.Project,
-		SessionID:       body.SessionID,
-		Kind:            body.Kind,
-		ExcludeKind:     body.ExcludeKind,
-		ReviewState:     body.ReviewState,
-		DerivationRunID: body.DerivationRunID,
-		Limit:           body.Limit,
-		IncludeNoise:    body.IncludeNoise,
-		IncludeProposed: body.IncludeProposed,
-		CanInstruct:     body.CanInstruct,
-		Hybrid:          body.Hybrid,
-	})
-	if err != nil {
+	if body.OccurredAfterEpoch < 0 {
+		writeError(w, http.StatusBadRequest, errors.New("occurred_after must be a unix epoch seconds bound"))
+		return
+	}
+	filter := db.ObservationFilter{
+		Project:            body.Project,
+		SessionID:          body.SessionID,
+		Kind:               body.Kind,
+		ExcludeKind:        body.ExcludeKind,
+		ReviewState:        body.ReviewState,
+		DerivationRunID:    body.DerivationRunID,
+		Limit:              body.Limit,
+		IncludeNoise:       body.IncludeNoise,
+		IncludeProposed:    body.IncludeProposed,
+		CanInstruct:        body.CanInstruct,
+		Hybrid:             body.Hybrid,
+		OccurredAfterEpoch: body.OccurredAfterEpoch,
+	}
+	if err := gateDefaultRawReads(body.IncludeDerived, &filter); err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	hits, err := h.searchStore(r.Context(), body.Q, filter)
+	if err != nil {
+		h.writeReadError(w, r, err, len(body.Q), filter)
+		return
+	}
+	// One attach serves both the hits array and the prompt-ready string.
+	if err := h.store.AttachRunSiblings(r.Context(), hits, filter, db.SiblingsPerHit); err != nil {
+		h.writeReadError(w, r, err, len(body.Q), filter)
 		return
 	}
 	var parts []string
 	for _, hit := range hits {
-		parts = append(parts, fmt.Sprintf("[%d] %s %s: %s", hit.ID, hit.Project, searchHitLabel(hit), hit.Snippet))
+		parts = append(parts, fmt.Sprintf("[%d] %s %s %s: %s", hit.ID, time.Unix(hit.OccurredAtEpoch, 0).UTC().Format("2006-01-02"), hit.Project, searchHitLabel(hit), hit.Snippet))
+		if line := siblingContinuationLine(hit.Siblings); line != "" {
+			parts = append(parts, line)
+		}
 	}
+	h.reads.hits(readContext, filter, hits)
 	resp := map[string]any{"hits": hits, "context": strings.Join(parts, "\n")}
 	h.attachIdentityAlerts(r, body.Project, resp)
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h Handler) Timeline(w http.ResponseWriter, r *http.Request) {
-	filter := observationFilterFromQuery(r, 50)
+	filter, err := observationFilterFromQuery(r, 50)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := gateDefaultRawReads(r.URL.Query().Get("include_derived") == "true", &filter); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	hits, err := h.store.TimelineWithFilter(r.Context(), filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err := h.store.AttachRunSiblings(r.Context(), hits, filter, db.SiblingsPerHit); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	h.reads.hits(readTimeline, filter, hits)
 	resp := map[string]any{"hits": hits, "total": len(hits), "next_cursor": nil}
 	h.attachIdentityAlerts(r, filter.Project, resp)
 	writeJSON(w, http.StatusOK, resp)
@@ -657,6 +830,7 @@ func (h Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	if sessions == nil {
 		sessions = []db.SessionSummary{}
 	}
+	h.reads.request(readSessionList, rawNA)
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
 }
 
@@ -954,11 +1128,16 @@ func (h Handler) DisputeObservation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) search(w http.ResponseWriter, r *http.Request, q string, filter db.ObservationFilter) {
-	hits, err := h.store.SearchWithFilter(r.Context(), q, filter)
+	hits, err := h.searchStore(r.Context(), q, filter)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		h.writeReadError(w, r, err, len(q), filter)
 		return
 	}
+	if err := h.store.AttachRunSiblings(r.Context(), hits, filter, db.SiblingsPerHit); err != nil {
+		h.writeReadError(w, r, err, len(q), filter)
+		return
+	}
+	h.reads.hits(readSearch, filter, hits)
 	resp := map[string]any{"hits": hits, "total": len(hits), "next_cursor": nil}
 	h.attachIdentityAlerts(r, filter.Project, resp)
 	writeJSON(w, http.StatusOK, resp)
@@ -966,7 +1145,29 @@ func (h Handler) search(w http.ResponseWriter, r *http.Request, q string, filter
 
 func boolPtr(b bool) *bool { return &b }
 
-func observationFilterFromQuery(r *http.Request, fallbackLimit int) db.ObservationFilter {
+// L0010 R1 = A: Hindsight owns memory reads, so the five default read
+// routes (search, timeline, context, observation list, observation by-id)
+// serve raw capture projections only. Without include_derived the filter is
+// forced to kind='raw' — the store's existing kind clause does the rest —
+// and a derived-kind ask (a non-raw kind, or exclude_kind='raw') is a 400
+// that names the opt-in, so a stale client learns why it gets nothing
+// instead of reading an empty answer. The gate sits on the routes: store-
+// internal callers (purge, redact-derived, triage, review routes) keep the
+// full kind surface and never pass through it. HTTP clients that read
+// derived rows on purpose (the review UI, the opt-in SessionStart
+// injector) must send include_derived=true.
+func gateDefaultRawReads(includeDerived bool, filter *db.ObservationFilter) error {
+	if includeDerived {
+		return nil
+	}
+	if (filter.Kind != "" && filter.Kind != "raw") || filter.ExcludeKind == "raw" {
+		return errors.New("derived observations are not served by default; pass include_derived=true")
+	}
+	filter.Kind = "raw"
+	return nil
+}
+
+func observationFilterFromQuery(r *http.Request, fallbackLimit int) (db.ObservationFilter, error) {
 	filter := db.ObservationFilter{
 		Project:         r.URL.Query().Get("project"),
 		SessionID:       r.URL.Query().Get("session_id"),
@@ -985,6 +1186,13 @@ func observationFilterFromQuery(r *http.Request, fallbackLimit int) db.Observati
 	if v := r.URL.Query().Get("can_instruct"); v == "true" {
 		filter.CanInstruct = true
 	}
+	// The feed actor-gate (R-D) is fail-closed, so lifting it is an
+	// explicit opt-in the operator surfaces send: the review and browse
+	// screens must show every accepted row, including one a machine
+	// verdict would have accepted, or the gate would hide its own subject.
+	if v := r.URL.Query().Get("include_agent_accepted"); v == "true" {
+		filter.IncludeAgentAccepted = true
+	}
 	// hybrid is Search-only (D218): explicit "1"/"true" or "0"/"false"
 	// overrides the deployment default; anything else follows it.
 	switch r.URL.Query().Get("hybrid") {
@@ -999,7 +1207,18 @@ func observationFilterFromQuery(r *http.Request, fallbackLimit int) db.Observati
 	// behavior.
 	filter.Order = r.URL.Query().Get("order")
 	filter.Cursor = r.URL.Query().Get("cursor")
-	return filter
+	// L0010 dated reads: occurred_after bounds the read to a recent window
+	// by occurred time. A malformed bound is a 400, not a silent
+	// full-history read; a negative epoch is likewise refused (there is no
+	// window before 1970, and 0 already means no bound).
+	if v := r.URL.Query().Get("occurred_after"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return filter, errors.New("occurred_after must be a unix epoch seconds bound")
+		}
+		filter.OccurredAfterEpoch = n
+	}
+	return filter, nil
 }
 
 func derivationRunFilterFromQuery(r *http.Request, fallbackLimit int) db.DerivationRunFilter {
@@ -1032,6 +1251,38 @@ func searchHitLabel(hit db.SearchHit) string {
 		return hit.Kind
 	}
 	return "observation"
+}
+
+// siblingContinuationLine renders a hit's run-siblings as one indented
+// continuation line under the hit, indented by two spaces:
+//
+//	↳ same run: [204165] task~, [204164] task~!
+//
+// `~` after the kind marks unreviewed (proposed or lapsed), `!` marks
+// can_instruct=1 — the same two markers the compact line uses. No text
+// travels, so the line is a pointer set a consumer can fetch by id.
+// Returns "" when the hit has no siblings, so a hit without any renders
+// exactly as before (Fibery #335).
+//
+// The MCP server renders the identical shape from the fields the API sent.
+// The two live in separate Go modules, so the shape is written twice and
+// docs/INJECTION-AND-SEARCH.md is its single source.
+func siblingContinuationLine(siblings []db.ObservationSibling) string {
+	if len(siblings) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(siblings))
+	for _, sib := range siblings {
+		marker := ""
+		if sib.ReviewState == "proposed" || sib.ReviewState == "lapsed" {
+			marker = "~"
+		}
+		if sib.CanInstruct == 1 {
+			marker += "!"
+		}
+		parts = append(parts, fmt.Sprintf("[%d] %s%s", sib.ID, sib.Kind, marker))
+	}
+	return "  ↳ same run: " + strings.Join(parts, ", ")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

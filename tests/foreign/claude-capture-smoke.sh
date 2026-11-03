@@ -49,6 +49,7 @@ NEEDLE="claude-capture-$(date +%s)"
 RAW_ONLY="zzclauderawonly$(date +%s)"
 PROMPT_NEEDLE="claude-prompt-capture-$(date +%s)"
 PROMPT_RAW_ONLY="zzclaudepromptrawonly$(date +%s)"
+FAIL_RAW_ONLY="zzclaudefailrawonly$(date +%s)"
 payload="$(
   jq -nc \
     --arg needle "$NEEDLE" \
@@ -93,6 +94,31 @@ printf '%s' "$prompt_payload" | \
   "$ROOT/scripts/memoire-capture-claude.sh" \
     --project memoire-claude-capture >/dev/null
 
+# A failed tool call reaches the hook as PostToolUseFailure, never as
+# PostToolUse: top-level `error`, no tool_response.
+failure_payload="$(
+  jq -nc \
+    --arg raw_only "$FAIL_RAW_ONLY" \
+    --arg cwd "$ROOT" \
+    '{
+      session_id: "claude-capture-smoke-session",
+      cwd: $cwd,
+      hook_event_name: "PostToolUseFailure",
+      tool_name: "Bash",
+      tool_use_id: "tool-smoke-fail-456",
+      tool_input: {command: "false"},
+      error: ("Exit code 1\n" + $raw_only),
+      is_interrupt: false,
+      duration_ms: 12
+    }'
+)"
+
+printf '%s' "$failure_payload" | \
+  MEMOIRE_HOME="$HOME_DIR" \
+  MEMOIRE_CLAUDE_STRICT=1 \
+  "$ROOT/scripts/memoire-capture-claude.sh" \
+    --project memoire-claude-capture >/dev/null
+
 TOKEN="$(tr -d '\r\n' < "$HOME_DIR/token")"
 for _ in $(seq 1 30); do
   if curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE/search?q=$NEEDLE&project=memoire-claude-capture&limit=5" | grep -q "$NEEDLE" &&
@@ -111,6 +137,22 @@ for _ in $(seq 1 30); do
     fi
     if curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE/search?q=$PROMPT_RAW_ONLY&project=memoire-claude-capture&limit=5" | grep -q "$PROMPT_RAW_ONLY"; then
       echo "Memoire Claude capture smoke failed: raw-only prompt payload became search-visible" >&2
+      exit 1
+    fi
+    if ! grep -R -q "$FAIL_RAW_ONLY" "$HOME_DIR/raw"; then
+      echo "Memoire Claude capture smoke failed: raw payload did not preserve the tool failure error" >&2
+      exit 1
+    fi
+    if ! grep -R -q "claude_PostToolUseFailure" "$HOME_DIR/raw"; then
+      echo "Memoire Claude capture smoke failed: tool failure was not typed claude_PostToolUseFailure" >&2
+      exit 1
+    fi
+    if ! grep -R -q "claude-posttoolusefailure-" "$HOME_DIR/raw"; then
+      echo "Memoire Claude capture smoke failed: tool failure has no stable tool_use_id-based source event id" >&2
+      exit 1
+    fi
+    if curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE/search?q=$FAIL_RAW_ONLY&project=memoire-claude-capture&limit=5" | grep -q "$FAIL_RAW_ONLY"; then
+      echo "Memoire Claude capture smoke failed: raw-only tool failure error became search-visible" >&2
       exit 1
     fi
     echo "memoire claude capture smoke passed"

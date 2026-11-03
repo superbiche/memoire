@@ -30,6 +30,7 @@ done
 mkdir -p "$TMP/home"
 printf 'test-token\n' > "$TMP/home/token"
 export MEMOIRE_HOME="$TMP/home"
+export MEMOIRE_INJECT=on                 # injection is opt-in; this suite tests its content
 export MEMOIRE_ADDR="127.0.0.1:1"        # dead port: timeline blocks fail open
 export MEMOIRE_PROJECTS_REGISTRY="$TMP/registry.json"
 export MEMOIRE_KEY_PREFIXES="$TMP/dev"

@@ -5,9 +5,18 @@
 // see internal/purge). DRY-RUN by default. Apply is double-gated: --apply
 // AND MEMOIRE_PURGE_APPLY=yes, and refuses while a memoire-derive OR
 // memoire-api process is alive (the API's drainer copies queue files into
-// raw/ and its writer would queue behind the purge transaction —
-// MEMOIRE_PURGE_SKIP_QUIESCE=yes is for hermetic test fixtures only, never
-// the live store). Operator runbook: stop memoire.service around --apply.
+// raw/ and its writer would queue behind the purge transaction against
+// the live store). The quiesce guard has no environment bypass (the
+// MEMOIRE_PURGE_SKIP_QUIESCE fixture hatch was removed in #616 slice E;
+// hermetic tests substitute guardedProcessRunning in-process). Operator
+// runbook: stop memoire.service around --apply.
+//
+// Postgres hub (Fibery #616 slice B): --db postgresql://… (or a postgres
+// DSN in MEMOIRE_DB) selects the Postgres engine; files still resolve from
+// --home. The process check is meaningless there (the API runs in another
+// pod), so a Postgres apply/resume instead refuses without the explicit
+// operator attestation --i-have-quiesced-the-hub (RUNBOOK "Hard purge on
+// the Postgres hub"). The tool never scales anything itself.
 package main
 
 import (
@@ -24,8 +33,10 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 
+	memdb "memoire/services/api/internal/db"
 	"memoire/services/api/internal/purge"
 )
 
@@ -37,6 +48,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "memoire-purge:", err)
 		os.Exit(1)
 	}
+}
+
+// guardedProcessRunning reports the first live process whose name the
+// SQLite engine's quiesce guard watches, with the pgrep listing for stderr.
+// It is a package variable so hermetic tests can substitute it in-process;
+// there is deliberately NO environment override (an env bypass is reachable
+// from an operator shell, a test seam is not).
+var guardedProcessRunning = func() (proc string, listing []byte) {
+	for _, name := range []string{"memoire-derive", "memoire-api"} {
+		out, err := exec.Command("pgrep", "-af", name).Output()
+		if err == nil && len(out) > 0 {
+			return name, out
+		}
+	}
+	return "", nil
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
@@ -51,6 +77,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	var (
 		home           string
+		dbPath         string
+		hubQuiesced    bool
 		project        string
 		eventIDs       string
 		observationIDs string
@@ -59,6 +87,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		opts           purge.Options
 	)
 	fs.StringVar(&home, "home", defHome, "Memoire home (db, raw/, queue/ derived from it)")
+	fs.StringVar(&dbPath, "db", "", "store: SQLite path or postgres:// DSN (default: a postgres DSN in MEMOIRE_DB, else <home>/memoire.db)")
+	fs.BoolVar(&hubQuiesced, "i-have-quiesced-the-hub", false, "Postgres only: attest the hub Deployment is scaled to 0 and no store CronJob is running (required for --apply)")
 	fs.StringVar(&project, "project", "", "purge everything captured under this project key")
 	fs.StringVar(&eventIDs, "event-ids", "", "comma-separated event ids to purge (with linked observations)")
 	fs.StringVar(&observationIDs, "observation-ids", "", "comma-separated observation ids to purge (DB-only)")
@@ -73,7 +103,21 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	opts.DBPath = filepath.Join(home, "memoire.db")
+	// MEMOIRE_DB is consulted only for a Postgres DSN (the hub pods carry
+	// it from the memoire-pg-app secret): the SQLite default stays
+	// <home>/memoire.db exactly as before the engine seam.
+	switch {
+	case dbPath != "":
+		opts.DBPath = dbPath
+	case memdb.IsPostgresDSN(os.Getenv("MEMOIRE_DB")):
+		opts.DBPath = os.Getenv("MEMOIRE_DB")
+	default:
+		opts.DBPath = filepath.Join(home, "memoire.db")
+	}
+	isPG := memdb.IsPostgresDSN(opts.DBPath)
+	if hubQuiesced && !isPG {
+		return errors.New("--i-have-quiesced-the-hub applies only to a Postgres store; the SQLite engine checks for live memoire-api/memoire-derive processes itself")
+	}
 	opts.RawDir = filepath.Join(home, "raw")
 	opts.PendingDir = filepath.Join(home, "queue", "pending")
 	opts.InflightDir = filepath.Join(home, "queue", "inflight")
@@ -91,18 +135,18 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if os.Getenv("MEMOIRE_PURGE_APPLY") != "yes" {
 			return errors.New("REFUSING destructive mode: MEMOIRE_PURGE_APPLY=yes not set (double gate)")
 		}
-		if os.Getenv("MEMOIRE_PURGE_SKIP_QUIESCE") == "yes" {
-			// Fixture escape hatch (same pattern as memoire-redact-derived,
-			// D145) — loud so it can never pass silently in operator use.
-			fmt.Fprintln(stderr, "WARNING: MEMOIRE_PURGE_SKIP_QUIESCE=yes — quiesce guard BYPASSED. This is for hermetic test fixtures ONLY; never run this against the live store.")
-		} else {
-			for _, proc := range []string{"memoire-derive", "memoire-api"} {
-				out, err := exec.Command("pgrep", "-af", proc).Output()
-				if err == nil && len(out) > 0 {
-					fmt.Fprintf(stderr, "%s", out)
-					return fmt.Errorf("REFUSING destructive mode: a %s process is running — quiesce first", proc)
-				}
+		if isPG {
+			// No process check across pods: explicit operator attestation
+			// (locked decision 5, #616 slice B).
+			if !hubQuiesced {
+				return errors.New("REFUSING destructive mode on Postgres: pass --i-have-quiesced-the-hub after scaling deploy/memoire-hub to 0 and letting the store CronJobs finish (RUNBOOK \"Hard purge on the Postgres hub\")")
 			}
+		} else if proc, listing := guardedProcessRunning(); proc != "" {
+			// No environment variable can disarm this guard (#616 slice E,
+			// decision 4): hermetic tests substitute guardedProcessRunning
+			// in-process; operators quiesce.
+			fmt.Fprintf(stderr, "%s", listing)
+			return fmt.Errorf("REFUSING destructive mode: a %s process is running — quiesce first", proc)
 		}
 	}
 
@@ -128,8 +172,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 	if opts.Apply && !opts.NoQuarantine && opts.QuarantineOut == "" {
 		opts.QuarantineOut = filepath.Join(home, fmt.Sprintf("quarantine-purge-%d.tar.age", time.Now().Unix()))
 	}
-	if _, err := os.Stat(opts.DBPath); err != nil {
-		return fmt.Errorf("database not found: %s", opts.DBPath)
+	if !isPG {
+		if _, err := os.Stat(opts.DBPath); err != nil {
+			return fmt.Errorf("database not found: %s", opts.DBPath)
+		}
 	}
 
 	report, err := purge.Run(context.Background(), opts)

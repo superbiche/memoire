@@ -99,7 +99,7 @@
     {
       "method": "DELETE",
       "path": "/v1/events/{id}",
-      "auth": "write"
+      "auth": "admin"
     },
     {
       "method": "GET",
@@ -125,6 +125,12 @@
       "method": "POST",
       "path": "/v1/observations/{id}/accept",
       "auth": "admin"
+    },
+    {
+      "method": "POST",
+      "path": "/v1/observations/{id}/action",
+      "auth": "admin",
+      "required_body": ["action"]
     },
     {
       "method": "POST",
@@ -166,6 +172,11 @@
       "method": "GET",
       "path": "/v1/observations/{id}/review-log",
       "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/observations/{id}/usage",
+      "auth": "read"
     },
     {
       "method": "POST",
@@ -214,12 +225,38 @@
       "method": "GET",
       "path": "/v1/timeline",
       "auth": "read"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/triage/genres",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/triage/graduation-candidates",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/triage/override-rates",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/triage/queue",
+      "auth": "admin"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/triage/validated",
+      "auth": "admin"
     }
   ],
   "mcp_tools": [
     {
       "name": "memoire_context",
       "params": [
+        {"name": "days", "type": "number", "required": false},
         {"name": "limit", "type": "number", "required": false},
         {"name": "project", "type": "string", "required": false},
         {"name": "q", "type": "string", "required": true}
@@ -234,9 +271,7 @@
     {
       "name": "memoire_search",
       "params": [
-        {"name": "exclude_kind", "type": "string", "required": false},
-        {"name": "include_proposed", "type": "boolean", "required": false},
-        {"name": "kind", "type": "string", "required": false},
+        {"name": "days", "type": "number", "required": false},
         {"name": "limit", "type": "number", "required": false},
         {"name": "project", "type": "string", "required": false},
         {"name": "q", "type": "string", "required": true}
@@ -245,8 +280,7 @@
     {
       "name": "memoire_timeline",
       "params": [
-        {"name": "exclude_kind", "type": "string", "required": false},
-        {"name": "include_proposed", "type": "boolean", "required": false},
+        {"name": "days", "type": "number", "required": false},
         {"name": "limit", "type": "number", "required": false},
         {"name": "project", "type": "string", "required": false}
       ]

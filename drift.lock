@@ -1,0 +1,91 @@
+version = 1
+
+[[bindings]]
+doc = "AGENTS.md"
+target = "schema/0001_initial.sql"
+sig = "3bcc1109ce72a0e2"
+
+[[bindings]]
+doc = "AGENTS.md"
+target = "scripts/smoke.sh"
+sig = "c382d025c1d4d2b2"
+
+[[bindings]]
+doc = "AGENTS.md"
+target = "services/api/internal/queuewriter/queuewriter.go"
+sig = "575f3ed4ff8cd197"
+
+[[bindings]]
+doc = "AGENTS.md"
+target = "services/api/internal/server/server.go#New"
+sig = "35fa0de0f3b2704f"
+
+[[bindings]]
+doc = "docs/ARCHITECTURE.md"
+target = "docs/DERIVATION.md"
+sig = "9d25798cb8671afa"
+
+[[bindings]]
+doc = "docs/ARCHITECTURE.md"
+target = "scripts/memoire-capture-claude.sh"
+sig = "0f87afcc1dd81e3d"
+
+[[bindings]]
+doc = "docs/ARCHITECTURE.md"
+target = "services/api/cmd/api/main.go"
+sig = "46da365c33c2c888"
+
+[[bindings]]
+doc = "docs/INJECTION-AND-SEARCH.md"
+target = "scripts/memoire-inject-claude.sh"
+sig = "de043d0401398a30"
+
+[[bindings]]
+doc = "docs/INJECTION-AND-SEARCH.md"
+target = "scripts/memoire-inject-envelope.sh"
+sig = "c5bc55a83c252125"
+
+[[bindings]]
+doc = "docs/INJECTION-AND-SEARCH.md"
+target = "services/api/internal/server/server.go"
+sig = "042a847876eb00c6"
+
+[[bindings]]
+doc = "docs/INJECTION-AND-SEARCH.md"
+target = "services/mcp/tools.go"
+sig = "7dd36cd19f53a155"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/capture-acpx-tick-timer.sh"
+sig = "26052f6eb0a95b38"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/capture-muse-tick-timer.sh"
+sig = "0851ba905aa14b5d"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/capture-qwen-tick-timer.sh"
+sig = "6561ed2f6c8f10d3"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/memoire-capture-acpx-tick.sh"
+sig = "c7f099a8c3cead40"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/memoire-capture-muse-tick.sh"
+sig = "eac887674b708beb"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/memoire-capture-muse.sh"
+sig = "b9323e6fb0f659e4"
+
+[[bindings]]
+doc = "docs/RUNBOOK.md"
+target = "scripts/memoire-capture-qwen-tick.sh"
+sig = "dd019bb9fffbe89e"

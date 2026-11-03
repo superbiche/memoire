@@ -229,16 +229,17 @@ onMounted(load)
       <template v-if="appliedProject && hits.length >= appliedLimit">
         ⚠ at least {{ hits.length }} elevated in {{ appliedProject }} (window full) — the
         injection cap defaults to 10; older standing orders are benched (not riding
-        sessions). Demote until the brief fits.
+        sessions, even when session-start injection is on). Demote until the brief fits.
       </template>
       <template v-else-if="appliedProject && hits.length > 10">
         ⚠ {{ hits.length }} elevated in {{ appliedProject }} — the injection cap defaults to 10,
         so the {{ hits.length - 10 }} oldest standing order{{ hits.length - 10 === 1 ? ' is' : 's are' }}
-        benched (not riding sessions). Demote until the brief fits.
+        benched (not riding sessions, even when session-start injection is on). Demote until
+        the brief fits.
       </template>
       <template v-else-if="appliedProject">
-        {{ hits.length }} elevated in {{ appliedProject }} — all riding (injection cap defaults
-        to 10)
+        {{ hits.length }} elevated in {{ appliedProject }} — all riding when session-start
+        injection is on (injection cap defaults to 10)
       </template>
       <template v-else>
         {{ hits.length >= appliedLimit ? 'at least ' : '' }}{{ hits.length }} elevated across

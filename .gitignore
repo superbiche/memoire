@@ -14,3 +14,15 @@ services/api/internal/ui/dist/*
 services/mcp/mcp
 /dist/
 services/embed-worker/node_modules/
+
+# Derive-bench custody (docs/DERIVE-BENCH-DESIGN.md): frozen transcripts,
+# throwaway homes, and built bench binaries are the user's data, never the
+# repo's. The harness ships; the data never does.
+bench/derive/data/
+__pycache__/
+*.pyc
+
+# harness-local MCP wiring projections (registry ~/.agents/mcp.json is the intent; per-machine, liaison Task #205)
+.codex/
+.qwen/
+opencode.json

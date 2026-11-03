@@ -1,0 +1,4 @@
+{"timestamp": "2026-05-01T12:00:00.000Z", "type": "session_meta", "payload": {"id": "cx-seg-0004", "session_id": "cx-alpha-0001", "timestamp": "2026-05-01T12:00:00.000Z", "cwd": "/tmp/census-proj", "history_base": {"thread_id": "cx-seg-base-0004", "end_ordinal_exclusive": 100, "end_byte_offset": 12345}}}
+{"timestamp": "2026-05-01T09:00:01.001Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "s1"}, "ordinal": 100}
+{"timestamp": "2026-05-01T09:00:02.002Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_0013", "content": [{"type": "output_text", "text": "inventé — 😀 segment answer"}]}, "ordinal": 101}
+{"timestamp": "2026-05-01T09:00:03.003Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "s1"}, "ordinal": 102}

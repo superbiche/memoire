@@ -72,7 +72,16 @@ else
   fail "home-missing: $HOME_DIR"
 fi
 
-if (( MAX_LAST_WRITE_AGE_SECONDS > 0 )); then
+# last_write_epoch is null while the hub has not finished its exact last-write
+# scan (shortly after a start, or after a failed scan): unknown, not a stall.
+last_write_unknown=0
+if [[ "$health" =~ \"last_write_epoch\"[[:space:]]*:[[:space:]]*null ]]; then
+  last_write_unknown=1
+fi
+
+if (( MAX_LAST_WRITE_AGE_SECONDS > 0 && last_write_unknown )); then
+  printf 'note write-stall: skipped, last_write_epoch not yet known\n' >&2
+elif (( MAX_LAST_WRITE_AGE_SECONDS > 0 )); then
   if (( last_write_epoch == 0 )); then
     fail "write-stall: no writes recorded"
   else

@@ -511,19 +511,19 @@ func secondCleanEnvelope() []byte {
 }
 
 func hitEnvelope() []byte {
-	return []byte("{\n  \"schema_version\": 1,\n  \"project\": \"memoire-test\",\n  \"session_id\": \"hit-session\",\n  \"source_adapter\": \"claude-code\",\n  \"event_type\": \"claude_PostToolUse\",\n  \"text\": \"Authorization: Bearer topsecretbearer99\",\n  \"payload\": {\n    \"message\": \"AWS key AKIAIOSFODNN7EXAMPLE leaked\",\n    \"nested\": {\"env\": \"DATABASE_PASSWORD=hunter2hunter2\"}\n  },\n  \"metadata\": {\n    \"ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD\": \"secret-shaped key must be redacted\",\n    \"safe\": \"ordinary\"\n  }\n}\n")
+	return []byte("{\n  \"schema_version\": 1,\n  \"project\": \"memoire-test\",\n  \"session_id\": \"hit-session\",\n  \"source_adapter\": \"claude-code\",\n  \"event_type\": \"claude_PostToolUse\",\n  \"text\": \"Authorization: Bearer topsecretbearer99\",\n  \"payload\": {\n    \"message\": \"AWS key AKIA" + "IOSFODNN7EXAMPLE leaked\",\n    \"nested\": {\"env\": \"DATABASE_PASSWORD=hunter2hunter2\"}\n  },\n  \"metadata\": {\n    \"ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD\": \"secret-shaped key must be redacted\",\n    \"safe\": \"ordinary\"\n  }\n}\n")
 }
 
 func secondHitEnvelope() []byte {
-	return []byte("{\n  \"schema_version\": 1,\n  \"project\": \"memoire-test\",\n  \"session_id\": \"hit-session-2\",\n  \"source_adapter\": \"manual\",\n  \"event_type\": \"note\",\n  \"text\": \"token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P\",\n  \"payload\": {\"pem\": \"-----BEGIN RSA PRIVATE KEY-----\\nMIIEfakefakefakefake\\nfakefakefake==\\n-----END RSA PRIVATE KEY-----\"},\n  \"metadata\": {}\n}\n")
+	return []byte("{\n  \"schema_version\": 1,\n  \"project\": \"memoire-test\",\n  \"session_id\": \"hit-session-2\",\n  \"source_adapter\": \"manual\",\n  \"event_type\": \"note\",\n  \"text\": \"token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9P\",\n  \"payload\": {\"pem\": \"-----BEGIN RSA PRIVATE" + " KEY-----\\nMIIEfakefakefakefake\\nfakefakefake==\\n-----END RSA PRIVATE KEY-----\"},\n  \"metadata\": {}\n}\n")
 }
 
 func plantedSecrets() []string {
 	return []string{
 		"topsecretbearer99",
-		"AKIAIOSFODNN7EXAMPLE",
+		"AKIA" + "IOSFODNN7EXAMPLE",
 		"hunter2hunter2",
-		"ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+		"ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD",
 	}
 }
 
@@ -535,13 +535,13 @@ func expectedMarkers(t *testing.T, key []byte) []string {
 		rule string
 	}{
 		{"Authorization: Bearer topsecretbearer99", "bearer-header"},
-		{"AKIAIOSFODNN7EXAMPLE", "aws-access-key"},
+		{"AKIA" + "IOSFODNN7EXAMPLE", "aws-access-key"},
 		{"DATABASE_PASSWORD=hunter2hunter2", "env-secret-assignment"},
-		{"ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD", "github-token"},
+		{"ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789ABCD", "github-token"},
 	}
 	markers := make([]string, 0, len(inputs))
 	for _, in := range inputs {
-		out, _ := r.String(in.text)
+		out, _, _ := r.String(in.text)
 		markers = append(markers, extractMarker(t, out, in.rule))
 	}
 	return markers
@@ -564,7 +564,7 @@ func extractMarker(t *testing.T, s, rule string) string {
 func assertJSONRedactedSemantically(t *testing.T, key, original, output []byte) {
 	t.Helper()
 	r := redact.New(key)
-	wantRaw, hits := r.JSON(json.RawMessage(original))
+	wantRaw, hits, _ := r.JSON(json.RawMessage(original))
 	if len(hits) == 0 {
 		t.Fatalf("fixture invalid: hit file produced no redaction hits")
 	}
@@ -591,7 +591,7 @@ func expectedFilesWithHits(t *testing.T, key []byte, inputs map[string][]byte) i
 	r := redact.New(key)
 	n := 0
 	for _, raw := range inputs {
-		_, hits := r.JSON(json.RawMessage(raw))
+		_, hits, _ := r.JSON(json.RawMessage(raw))
 		if len(hits) > 0 {
 			n++
 		}
@@ -604,7 +604,7 @@ func expectedHitsByRule(t *testing.T, key []byte, inputs map[string][]byte) map[
 	r := redact.New(key)
 	out := map[string]int{}
 	for _, raw := range inputs {
-		_, hits := r.JSON(json.RawMessage(raw))
+		_, hits, _ := r.JSON(json.RawMessage(raw))
 		for _, h := range hits {
 			out[h.Rule] += h.Count
 		}

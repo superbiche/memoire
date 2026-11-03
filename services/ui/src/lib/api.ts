@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Michel Tomas
 
-import type { Observation, SessionSummary, Stats, TimelineHit } from './types'
+import type {
+  Observation,
+  SessionSummary,
+  Stats,
+  TimelineHit,
+  TriageCounts,
+  TriageGenreCandidate,
+  TriageOperatorGenre,
+  TriageOverrideRate,
+  TriageRow,
+  UsageLine,
+  UsageSummary,
+} from './types'
 
 const TOKEN_KEY = 'memoire.token'
 
@@ -132,6 +144,7 @@ export const api = {
   ): Promise<{ observations: Observation[]; total: number; next_cursor: string | null }> {
     const params = new URLSearchParams({
       review_state: 'proposed',
+      include_derived: 'true',
       limit: String(limit),
     })
     if (includeNoise) params.set('include_noise', 'true')
@@ -141,7 +154,11 @@ export const api = {
   },
 
   getObservation(id: number): Promise<{ observation: Observation }> {
-    return request(`/v1/observations/${id}?include_proposed=true&include_noise=true`)
+    return request(`/v1/observations/${id}?include_proposed=true&include_noise=true&include_derived=true`)
+  },
+
+  getUsage(id: number): Promise<{ observation_id: number; usage: UsageSummary | null; lines: UsageLine[]; total: number }> {
+    return request(`/v1/observations/${id}/usage`)
   },
 
   accept(id: number, reason?: string, expected?: Expected): Promise<{ observation: Observation }> {
@@ -184,6 +201,7 @@ export const api = {
     const params = new URLSearchParams({
       exclude_kind: 'raw',
       include_proposed: 'true',
+      include_derived: 'true',
       limit: String(opts.limit ?? 100),
     })
     if (opts.project) params.set('project', opts.project)
@@ -247,12 +265,81 @@ export const api = {
       session_id: sessionID,
       exclude_kind: 'raw',
       include_proposed: 'true',
+      include_derived: 'true',
       include_noise: 'true',
       order: 'asc',
       limit: '200',
     })
     if (cursor) params.set('cursor', cursor)
     return request(`/v1/observations?${params}`)
+  },
+
+  // --- Triage lane v1 (R-C): READ-ONLY. There is no suggestion write and
+  // no batch verdict here on purpose — the surface applies its stakes
+  // through the same per-row preconditioned verdict routes above, because
+  // memoire:D146's "no batch verdict route" stands and D208's compare-and-set
+  // is what makes a bulk apply safe.
+  // `pool: 'de-noise'` selects the fourth pool — rows carrying an unhandled
+  // stage-1 noise signal — and the filter is SERVER-side on purpose: a page
+  // of the main scope filtered in the browser would be mostly non-noise, so
+  // the batch the operator came to clear would sit unreachable behind the
+  // limit. The main pools exclude those rows in the same read.
+  triageQueue(opts: {
+    project?: string
+    sessionID?: string
+    reviewState?: 'proposed' | 'lapsed'
+    pool?: 'de-noise'
+    limit?: number
+    afterID?: number
+  }): Promise<{ rows: TriageRow[]; counts: TriageCounts; total: number }> {
+    const params = new URLSearchParams({ limit: String(opts.limit ?? 100) })
+    if (opts.project) params.set('project', opts.project)
+    if (opts.sessionID) params.set('session_id', opts.sessionID)
+    if (opts.reviewState) params.set('review_state', opts.reviewState)
+    if (opts.pool) params.set('pool', opts.pool)
+    if (opts.afterID) params.set('after_id', String(opts.afterID))
+    return request(`/v1/triage/queue?${params}`)
+  },
+
+  // The memoire:D125 flag-verb path: the operator's encounter with a row
+  // whose review_state already says what they want. It changes flags, never
+  // review_state, so lapsed -> lapsed stays illegal and the state machine is
+  // untouched.
+  reviewAction(id: number, action: string, reason?: string): Promise<{ observation: Observation }> {
+    return request(`/v1/observations/${id}/action`, {
+      method: 'POST',
+      body: JSON.stringify({ action, ...(reason ? { reason_text: reason } : {}) }),
+    })
+  },
+
+  // Stage 2's scope: rows a HUMAN validated. Rules-born accepted rows are
+  // excluded server-side — nobody ever validated them.
+  triageStage2Queue(opts: { project?: string; limit?: number }): Promise<{
+    rows: TriageRow[]
+    total: number
+  }> {
+    const params = new URLSearchParams({ limit: String(opts.limit ?? 100) })
+    if (opts.project) params.set('project', opts.project)
+    return request(`/v1/triage/validated?${params}`)
+  },
+
+  triageOverrideRates(): Promise<{ override_rates: TriageOverrideRate[] }> {
+    return request('/v1/triage/override-rates')
+  },
+
+  triageGenres(): Promise<{
+    judge_genres: TriageGenreCandidate[]
+    operator_genres: TriageOperatorGenre[]
+  }> {
+    return request('/v1/triage/genres')
+  },
+  triageGraduationCandidates(): Promise<{
+    candidates: TriageGenreCandidate[]
+    operator_genres: TriageOperatorGenre[]
+    threshold: number
+    gesture: string
+  }> {
+    return request('/v1/triage/graduation-candidates')
   },
 
   lapseRemaining(sessionID: string, reason?: string): Promise<{ lapsed_count: number }> {

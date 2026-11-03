@@ -1,2 +1,2 @@
-0.7.0
-memoire ships its first public release — curated fresh-history export (code, Great Book edition, MISSING, QUICKSTART), signed dist tarball, and bootstrap; honest read surfaces; ledgers and inbox stay home
+0.8.0
+memoire is developed in the open: one public repository with green public CI, the private ledger, images built from a public SHA

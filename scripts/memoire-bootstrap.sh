@@ -261,6 +261,23 @@ UNIT
 }
 
 hooks_claude() {
+  # The Stop entry (attribution at Stop) is printed only where this layout
+  # ships the hook: a dist without it must not hand out a dangling command.
+  local stop_entry="" stop_note=""
+  if [[ -x "$ROOT/scripts/memoire-attribute-claude.sh" ]]; then
+    stop_entry=",
+    \"Stop\": [
+      { \"hooks\": [ { \"type\": \"command\", \"command\": \"$ROOT/scripts/memoire-attribute-claude.sh\", \"timeout\": 15 } ] }
+    ]"
+    stop_note="
+Stop = attribution at Stop (optional): after a turn that consulted Memoire, a
+headless fork of the session says which hits it used; one memory_usage event
+per turn. Each attribution runs as a transient systemd user unit, capped at
+200 s and stopped as a whole; the hook starts it and returns, so the turn ends
+at once. MEMOIRE_ATTRIB=off disables. Needs the claude CLI, python3 and a user
+systemd manager (systemd-run --user); without one the hook does nothing.
+"
+  fi
   cat <<JSON
 Add to ~/.claude/settings.json (merge into any existing "hooks" object):
 
@@ -274,12 +291,12 @@ Add to ~/.claude/settings.json (merge into any existing "hooks" object):
     ],
     "PostToolUse": [
       { "hooks": [ { "type": "command", "command": "$ROOT/scripts/memoire-capture-claude.sh", "timeout": 5 } ] }
-    ]
+    ]$stop_entry
   }
 }
-
-Derivation (observations from raw events) is opt-in and needs a model
-endpoint; Codex / Qwen / opencode wiring: see QUICKSTART.md.
+$stop_note
+Session-start injection is opt-in (MEMOIRE_INJECT); Codex / Qwen / opencode
+capture wiring: see QUICKSTART.md.
 JSON
 }
 

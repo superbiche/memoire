@@ -336,11 +336,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
             v-for="o in visibleStory"
             :key="o.id"
             :data-obs-id="o.id"
-            class="rounded-lg border p-3 transition"
+            class="cursor-pointer rounded-lg border p-3 transition"
             :class="
               s.cursorId === o.id
-                ? 'border-violet-400 ring-1 ring-violet-400/60 dark:border-violet-600 dark:ring-violet-500/40'
-                : 'border-zinc-200 dark:border-zinc-800'
+                ? 'border-violet-400 border-l-4 border-l-violet-500 ring-2 ring-violet-500/70 shadow-md shadow-violet-500/10 dark:border-violet-600 dark:border-l-violet-400 dark:ring-violet-400/60'
+                : 'border-zinc-200 hover:ring-2 hover:ring-violet-300/50 dark:border-zinc-800 dark:hover:ring-violet-500/30'
             "
             @click="s.cursorId = o.id"
           >

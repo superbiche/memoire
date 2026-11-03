@@ -21,6 +21,7 @@ import (
 	"memoire/services/api/internal/config"
 	"memoire/services/api/internal/db"
 	"memoire/services/api/internal/queuefile"
+	"memoire/services/api/internal/rawstore"
 )
 
 type Drainer struct {
@@ -191,19 +192,40 @@ func (d Drainer) process(ctx context.Context, name string) {
 		d.fail(inflight, name, "read: "+err.Error())
 		return
 	}
-	if err := d.copyRaw(inflight, name); err != nil {
-		d.fail(inflight, name, "raw: "+err.Error())
-		return
-	}
 	event, err := NormalizeEnvelope(b)
 	if err != nil {
+		// A malformed item keeps its raw custody copy (forensics), as before.
+		if rerr := d.copyRaw(inflight, name); rerr != nil {
+			d.fail(inflight, name, "raw: "+rerr.Error())
+			return
+		}
 		d.fail(inflight, name, "envelope: "+err.Error())
 		return
+	}
+	// Operator ruling a65: an exact duplicate — key already stored AND its
+	// session known, so Ingest writes nothing — gets no raw/ copy. First
+	// write wins; raw/ stays a complete replay source. Raw is written BEFORE
+	// ingest for everything else, so a stored event always has custody. A
+	// failed probe falls back to copying.
+	noop, perr := d.store.IsNoOpDuplicate(ctx, event)
+	if perr != nil || !noop {
+		if err := d.copyRaw(inflight, name); err != nil {
+			d.fail(inflight, name, "raw: "+err.Error())
+			return
+		}
 	}
 	res, err := d.store.Ingest(ctx, event)
 	if err != nil {
 		d.fail(inflight, name, "ingest: "+err.Error())
 		return
+	}
+	if noop && perr == nil && !res.Duplicate {
+		// Cannot happen with one drainer and a quiesced purge; if it does,
+		// restore custody for the event that was just stored.
+		d.logger.Warn("duplicate probe disagreed with ingest; copying raw", "file", name, "event_id", res.ID)
+		if err := d.copyRaw(inflight, name); err != nil {
+			d.logger.Error("raw custody copy after ingest failed", "file", name, "err", err)
+		}
 	}
 	if err := os.Remove(inflight); err != nil {
 		d.logger.Warn("remove ingested queue file", "file", name, "event_id", res.ID, "err", err)
@@ -225,40 +247,61 @@ func (d Drainer) fail(path, name, reason string) {
 	d.logger.Warn("queue item failed", "file", name, "reason", reason)
 }
 
+// beforeRawPublish is a test seam: it runs after the raw copy is complete
+// and synced in the staging dir, before it becomes visible in raw/.
+var beforeRawPublish = func() {}
+
+// copyRaw publishes the queue item into raw/ custody. The copy is staged in
+// rawstore.IncomingDir (beside raw/, same filesystem), fsynced, then linked
+// to its final name: raw/ only ever shows a complete file, so the packer
+// can never pack a prefix of a file still being written (cold-archive
+// review R4). link(2) refuses an existing name, which keeps the original
+// first-copy-wins semantics of O_EXCL.
 func (d Drainer) copyRaw(src, name string) error {
 	if err := os.MkdirAll(d.cfg.Raw, 0o700); err != nil {
 		return err
 	}
 	dst := filepath.Join(d.cfg.Raw, name)
+	if _, err := os.Lstat(dst); err == nil {
+		return nil
+	}
+	stage := rawstore.IncomingDir(d.cfg.Raw)
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
-		return nil
-	}
+	out, err := os.CreateTemp(stage, name+".*.tmp")
 	if err != nil {
 		return err
 	}
-	closed := false
-	defer func() {
-		if !closed {
-			_ = out.Close()
-			_ = os.Remove(dst)
-		}
-	}()
+	tmp := out.Name()
+	defer os.Remove(tmp)
+	if err := out.Chmod(0o600); err != nil {
+		_ = out.Close()
+		return err
+	}
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
 		return err
 	}
 	if err := out.Sync(); err != nil {
+		_ = out.Close()
 		return err
 	}
 	if err := out.Close(); err != nil {
 		return err
 	}
-	closed = true
+	beforeRawPublish()
+	if err := os.Link(tmp, dst); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return err
+	}
 	_ = syncDir(d.cfg.Raw)
 	return nil
 }

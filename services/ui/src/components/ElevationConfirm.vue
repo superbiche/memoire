@@ -6,7 +6,7 @@ import { onMounted, ref } from 'vue'
 // The elevation friction box, extracted (harmony pass, 2026-07-31) so the
 // live-queue elevate and the history/browse elevate/demote share one moment.
 // This is the one place in this app where friction is a feature: an elevated
-// observation rides every future session (memoire:D191/D192).
+// observation rides every future session while injection is on (memoire:D191/D192).
 const props = defineProps<{
   mode: 'elevate' | 'demote'
   project: string
@@ -42,15 +42,17 @@ function submit() {
     <p class="text-xs leading-relaxed text-zinc-600 dark:text-zinc-300">
       <template v-if="mode === 'elevate'">
         Elevated observations ride the operating notes of
-        <strong>every future {{ project }} session</strong> until demoted. Rare by design — is
-        this one of them?
+        <strong>every future {{ project }} session</strong> until demoted, when session-start injection is on — a standing order,
+        not a truth tier: elevate <strong>subject-independent constraints</strong> (caveats,
+        gotchas, invariants). An important fact is <strong>confirmed</strong>, not elevated.
+        Rare by design — is this one of them?
         <template v-if="props.chain">
           <br />This will <strong>confirm first</strong> (provenance → user_confirmed, "I
           vouch"), then elevate — two review-log rows.
         </template>
       </template>
       <template v-else>
-        Demote takes this observation out of the operating notes: future sessions stop seeing
+        Demote takes this observation out of the operating notes: future sessions (when injection is on) stop seeing
         it. It stays accepted in memory.
       </template>
     </p>

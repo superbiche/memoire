@@ -1,0 +1,6 @@
+{"timestamp": "2026-05-01T11:00:00.000Z", "type": "session_meta", "payload": {"id": "cx-legacy-0003", "timestamp": "2026-05-01T11:00:00.000Z", "cwd": "/tmp/census-proj"}}
+{"timestamp": "2026-05-01T09:00:01.001Z", "type": "event_msg", "payload": {"type": "user_message", "message": "inventé — 😀 legacy prompt"}}
+{"timestamp": "2026-05-01T09:00:02.002Z", "type": "event_msg", "payload": {"type": "task_started", "turn_id": "l1"}}
+{"timestamp": "2026-05-01T09:00:03.003Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "msg_0012", "content": [{"type": "output_text", "text": "inventé — 😀 legacy answer"}]}}
+{"timestamp": "2026-05-01T09:00:04.004Z", "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "l1"}}
+{"timestamp": "2026-05-01T09:00:05.005Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "inventé — 😀 legacy agent message"}}

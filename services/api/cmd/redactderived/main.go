@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Michel Tomas
 
-// memoire-redact-derived — apply redact-v1 to the derived stores
+// memoire-redact-derived — apply the current redaction ruleset to the derived stores
 // (memoire:D144 residual; see internal/redactderived). DRY-RUN by default.
 // Apply is double-gated: --apply AND MEMOIRE_REDACT_DERIVED_APPLY=yes, and
 // refuses while a memoire-derive process is alive
 // (MEMOIRE_REDACT_DERIVED_SKIP_QUIESCE=yes for hermetic fixtures only).
 // Operator runbook: stop memoire.service around --apply so the drainer's
 // writes cannot queue behind the big IMMEDIATE transaction and poison.
+//
+// Postgres hub (redact-v5 S2a): --db postgres://… (or a postgres DSN in
+// MEMOIRE_DB) selects the Postgres engine — the store is opened raw, no
+// migrations or DDL, and every run rides ONE REPEATABLE READ transaction
+// (apply: all-or-nothing; dry-run: READ ONLY). The process check is
+// meaningless there (the API runs in another pod), so a Postgres apply
+// instead refuses without the explicit operator attestation
+// --i-have-quiesced-the-hub (RUNBOOK "Re-sweep on the Postgres hub"). The
+// report names the store by its password-redacted DSN; the DSN password
+// never reaches stdout, stderr or the report file.
 package main
 
 import (
@@ -19,10 +29,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
+	"path/filepath"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 
+	memdb "memoire/services/api/internal/db"
 	"memoire/services/api/internal/redactderived"
 )
 
@@ -43,29 +55,49 @@ func run(args []string, stdout, stderr io.Writer) error {
 	home, _ := os.UserHomeDir()
 	var opts redactderived.Options
 	var reportPath string
-	fs.StringVar(&opts.DBPath, "db", home+"/.memoire/memoire.db", "SQLite database path")
+	var hubQuiesced bool
+	fs.StringVar(&opts.DBPath, "db", "", "store: SQLite path or postgres:// DSN (default: a postgres DSN in MEMOIRE_DB, else <home>/memoire.db)")
 	fs.StringVar(&opts.RedactionKeyPath, "redaction-key", home+"/.memoire/redaction-key", "redaction HMAC key path")
 	fs.BoolVar(&opts.Apply, "apply", false, "apply changes (also requires MEMOIRE_REDACT_DERIVED_APPLY=yes)")
+	fs.BoolVar(&hubQuiesced, "i-have-quiesced-the-hub", false, "Postgres only: attest the hub is quiesced (no API/derive work against the store; required for --apply)")
 	fs.StringVar(&reportPath, "report", "", "optional machine-readable JSON report path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.HasPrefix(opts.DBPath, "postgres://") || strings.HasPrefix(opts.DBPath, "postgresql://") {
-		// Dialect-seam residual (slice-5 execution round-1 finding 4): the
-		// derived-redaction path is SQLite-file-only today; its Postgres port
-		// is post-cutover work. Reject the DSN loudly instead of failing an
-		// os.Stat on a URL.
-		return errors.New("memoire-redact-derived is SQLite-only: -db must be a database FILE, not a postgres:// DSN (PG port tracked as a post-cutover residual)")
+
+	// MEMOIRE_DB is consulted only for a Postgres DSN (the hub pods carry
+	// it from the memoire-pg-app secret): an explicit --db wins, and the
+	// default otherwise stays <home>/memoire.db (a non-postgres MEMOIRE_DB
+	// is ignored).
+	switch {
+	case opts.DBPath != "":
+	case memdb.IsPostgresDSN(os.Getenv("MEMOIRE_DB")):
+		opts.DBPath = os.Getenv("MEMOIRE_DB")
+	default:
+		opts.DBPath = filepath.Join(home, ".memoire", "memoire.db")
 	}
-	if _, err := os.Stat(opts.DBPath); err != nil {
-		return fmt.Errorf("database not found: %s", opts.DBPath)
+	isPG := memdb.IsPostgresDSN(opts.DBPath)
+	if hubQuiesced && !isPG {
+		return errors.New("--i-have-quiesced-the-hub applies only to a Postgres store; the SQLite engine checks for a live memoire-derive process itself")
+	}
+
+	if !isPG {
+		if _, err := os.Stat(opts.DBPath); err != nil {
+			return fmt.Errorf("database not found: %s", opts.DBPath)
+		}
 	}
 
 	if opts.Apply {
 		if os.Getenv("MEMOIRE_REDACT_DERIVED_APPLY") != "yes" {
 			return errors.New("REFUSING --apply: MEMOIRE_REDACT_DERIVED_APPLY=yes not set (double gate)")
 		}
-		if os.Getenv("MEMOIRE_REDACT_DERIVED_SKIP_QUIESCE") != "yes" {
+		if isPG {
+			// No process check across pods: explicit operator attestation
+			// (same model as memoire-purge's Postgres gate).
+			if !hubQuiesced {
+				return errors.New("REFUSING --apply on Postgres: pass --i-have-quiesced-the-hub after quiescing the hub — no API or derive work against the store (RUNBOOK \"Re-sweep on the Postgres hub\")")
+			}
+		} else if os.Getenv("MEMOIRE_REDACT_DERIVED_SKIP_QUIESCE") != "yes" {
 			out, err := exec.Command("pgrep", "-af", "memoire-derive").Output()
 			if err == nil && len(out) > 0 {
 				fmt.Fprintf(stderr, "%s", out)

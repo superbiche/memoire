@@ -27,6 +27,10 @@
 //     drainer writes, so queue_failed_depth, the TTL reaper, and the operator
 //     triage story all apply unchanged.
 //
+// Order: items of priority adapters (cfg.ForwardPriorityAdapters, default the
+// hook-fed claude-code) go before any other item, name order inside each
+// class, so a backlog never delays live capture by more than one slice.
+//
 // The forwarder must be the ONLY consumer of the queue it drains: running it
 // against a MEMOIRE_HOME that a local memoire-api is also draining splits
 // custody between the local store and the hub (each file goes to exactly one,
@@ -57,6 +61,12 @@ const (
 	pollInterval   = 2 * time.Second
 	backoffBase    = 2 * time.Second
 	backoffCap     = 5 * time.Minute
+
+	// sliceSize is how many non-priority items a cycle forwards before it
+	// re-reads the pending directory to look for priority arrivals. At the
+	// measured ~47 items/s (2026-09-30) 150 items take about three seconds,
+	// which bounds how long a live item waits behind a backlog.
+	sliceSize = 150
 )
 
 // Status is the forwarder's client-visible state, persisted atomically to
@@ -161,36 +171,90 @@ func (f *Forwarder) Reconcile(ctx context.Context) {
 	}
 }
 
-// ForwardOnce drains the pending queue once, in name order (timestamp
-// prefixes make that arrival order). A systemic failure stops the cycle so
-// order is preserved; poison items are set aside and the cycle continues.
+// ForwardOnce drains the pending queue once. Items of priority adapters
+// (cfg.ForwardPriorityAdapters) go first; inside each class the name order is
+// kept (timestamp prefixes make that arrival order). Non-priority items go in
+// slices of sliceSize, and the directory is re-read after every slice so a
+// priority item that arrived mid-cycle is sent before the backlog continues.
+// A systemic failure stops the cycle so order is preserved; poison items are
+// set aside and the cycle continues. The cycle ends when no item is left.
+// Every pass forwards, poisons or (lost claim) removes at least one item, and
+// an item still pending after its attempt is excluded for the rest of the
+// cycle, so the re-read loop terminates.
 func (f *Forwarder) ForwardOnce(ctx context.Context) {
+	worked := false
+	defer func() {
+		if worked {
+			f.writeStatus()
+		}
+	}()
+	stuck := map[string]bool{}
+	for {
+		priority, rest, ok := f.scanPending(stuck)
+		if !ok {
+			return
+		}
+		batch := rest
+		if len(priority) > 0 {
+			batch = priority
+		} else if len(batch) > sliceSize {
+			batch = batch[:sliceSize]
+		}
+		if len(batch) == 0 {
+			return
+		}
+		for _, name := range batch {
+			if ctx.Err() != nil {
+				return
+			}
+			worked = true
+			if !f.forwardItem(ctx, name) {
+				return
+			}
+			if _, err := os.Lstat(filepath.Join(f.cfg.Queue.Pending, name)); err == nil {
+				stuck[name] = true
+			}
+		}
+	}
+}
+
+// scanPending reads the pending directory and splits its items into the
+// priority class and the rest, each in name order. ok is false when the
+// directory cannot be read.
+func (f *Forwarder) scanPending(skip map[string]bool) (priority, rest []string, ok bool) {
 	entries, err := os.ReadDir(f.cfg.Queue.Pending)
 	if err != nil {
 		f.logger.Warn("read pending queue", "err", err)
-		return
+		return nil, nil, false
 	}
-	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
+		name := entry.Name()
 		// Shared pick/accounting predicate (review 2026-08-03 round-2 N2).
-		if !entry.IsDir() && queuefile.IsItem(entry.Name()) {
-			names = append(names, entry.Name())
+		if entry.IsDir() || !queuefile.IsItem(name) || skip[name] {
+			continue
+		}
+		if f.isPriority(name) {
+			priority = append(priority, name)
+		} else {
+			rest = append(rest, name)
 		}
 	}
-	sort.Strings(names)
-	worked := false
-	for _, name := range names {
-		if ctx.Err() != nil {
-			return
-		}
-		worked = true
-		if !f.forwardItem(ctx, name) {
-			break
+	sort.Strings(priority)
+	sort.Strings(rest)
+	return priority, rest, true
+}
+
+func (f *Forwarder) isPriority(name string) bool {
+	adapter, ok := queuefile.Adapter(name)
+	if !ok {
+		return false
+	}
+	for _, p := range f.cfg.ForwardPriorityAdapters {
+		if p == adapter {
+			return true
 		}
 	}
-	if worked {
-		f.writeStatus()
-	}
+	return false
 }
 
 // forwardItem pushes one queue file to the hub. Returns false when the cycle

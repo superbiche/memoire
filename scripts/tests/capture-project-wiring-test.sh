@@ -10,8 +10,9 @@ set -euo pipefail
 #
 # Pure and offline: a stub queue bin captures the -project argument, a fixture
 # registry drives resolution, nothing writes to Memoire or the live registry.
-# The rollout backfills' wiring is covered by turn-ingest-adapter-test.sh and
-# opencode-capture-test.sh; the resolver core by resolve-project-test.sh.
+# The rollout backfills' wiring is covered by turn-ingest-adapter-test.sh;
+# the native opencode adapter by tests/foreign/opencode-capture.sh; the
+# resolver core by resolve-project-test.sh.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TEXT_SCRIPT="$ROOT/scripts/memoire-capture-text.sh"

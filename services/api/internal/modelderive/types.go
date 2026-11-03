@@ -83,6 +83,11 @@ type Limits struct {
 	MaxInputEvents        int
 	MaxPromptBytes        int
 	MaxOutputObservations int
+	// MaxCompletionTokens is the completion cap the adapter sends as
+	// max_tokens. It rides Limits for PROVENANCE — the adapter reads its own
+	// configured value — so a run record states the generation room it was
+	// given (docs/DERIVE-PROFILE-DESIGN.md §4). 0 means the adapter default.
+	MaxCompletionTokens int
 }
 
 // Request carries everything needed to build a model prompt and to validate the
@@ -111,11 +116,32 @@ type Request struct {
 	// dedup (prompt/model A/B reruns; operator flag -force-rerun). Default
 	// idempotency is unchanged when false.
 	ForceRerun bool
+	// ThinkingPolicy and ThinkingBudgetTokens carry the endpoint profile's
+	// serving-side reasoning declaration (on|off|budget) into run provenance.
+	// Pure pass-through: they are never sent to the provider and never change
+	// request or parse behavior (docs/DERIVE-PROFILE-DESIGN.md §4). Empty and
+	// zero mean the endpoint declared nothing.
+	ThinkingPolicy       string
+	ThinkingBudgetTokens int
 	// AlreadyCaptured is the budgeted list of the session's existing
 	// observations rendered into the prompt as do-not-re-emit context
 	// (prompt v2.4). Advisory only: it is excluded from the canonical input
 	// hash — run idempotency stays a function of the source events.
 	AlreadyCaptured []db.SessionObservationSummary
+	// NoSupersede disables the derivation-time supersede outcome (Fibery
+	// #344, CLI -no-supersede). With it set the near-dup gate behaves exactly
+	// as it did before #344: a restatement of an earlier cut's proposal is
+	// rejected, with the same reason string and the same counts. The kill
+	// switch, not a tuning knob.
+	NoSupersede bool
+	// Provisional marks a run over a window whose TAIL IS STILL OPEN — the
+	// sweep derives a running session's last segment on every tick, mid-arc
+	// (Fibery #344, consequence of memoire:D260/D0261). It travels into the
+	// run metadata and each written observation's meta_json and changes
+	// nothing else: no column, no retrieval behavior, no idempotency input.
+	// It is a measurement hook — what gets superseded fast was scaffolding —
+	// and a future triage hint.
+	Provisional bool
 }
 
 // CandidateObservation is a validated, write-eligible observation candidate
@@ -205,6 +231,29 @@ const (
 	// candidate text and its match land in run metadata, nothing is written).
 	RejectClassNearDuplicate = "near_duplicate"
 )
+
+// OutcomeClassSupersede counts candidates that WROTE while replacing an
+// earlier cut's proposed observation (Fibery #344). It rides
+// candidate_reason_counts beside the rejection classes so the map explains
+// where every candidate went, but it is not a rejection: these rows exist.
+const OutcomeClassSupersede = "supersede"
+
+// SupersededCandidate is one derivation-time supersede, recorded in run
+// meta_json under superseded_candidates. Same custody discipline as
+// RejectedCandidate — text and target retained — plus the three scores the
+// decision stood on, which are the calibration record for thresholds chosen
+// by judgment rather than measurement.
+type SupersededCandidate struct {
+	Kind           string  `json:"kind"`
+	Text           string  `json:"text"`
+	SourceEventIDs []int64 `json:"source_event_ids,omitempty"`
+	// ObservationID is the new row; SupersededID is the row it replaced.
+	ObservationID int64   `json:"observation_id"`
+	SupersededID  int64   `json:"superseded_id"`
+	Trigram       float64 `json:"trigram"`
+	Containment   float64 `json:"containment"`
+	Growth        float64 `json:"growth"`
+}
 
 // ParsedResponse is the strict-parser result: write-eligible observations,
 // audit-only unknown candidates, and rejected candidates with reasons. Extra

@@ -250,3 +250,90 @@ func TestCompactLineRendersGovernanceFields(t *testing.T) {
 		})
 	}
 }
+
+// Lineage at retrieval (Fibery #335): a hit's run-siblings render as one
+// continuation line under its compact line. The compact line itself is
+// unchanged — D0238 pinned its field count — and a hit without siblings
+// renders exactly as before.
+func TestCompactLinesRenderSiblingContinuation(t *testing.T) {
+	const day = 1785312000 // 2026-07-29 UTC
+	hits := []searchHit{
+		{
+			ID: 204163, Project: "liaison", Kind: "decision", ReviewState: "lapsed",
+			Provenance: "inferred", Snippet: "rename Michel to Human",
+			OccurredAtEpoch: day,
+			Siblings: []observationSibling{
+				{ID: 204164, Kind: "task", ReviewState: "lapsed"},
+				{ID: 204165, Kind: "task", ReviewState: "accepted", CanInstruct: 1},
+				{ID: 204166, Kind: "fact", ReviewState: "accepted"},
+			},
+		},
+		{
+			ID: 204170, Project: "liaison", Kind: "fact", ReviewState: "accepted",
+			Provenance: "observed", Snippet: "no siblings here",
+			OccurredAtEpoch: day,
+		},
+	}
+	want := strings.Join([]string{
+		"[204163] decision~ 2026-07-29 liaison inferred/lapsed: rename Michel to Human",
+		"  \u21b3 same run: [204164] task~, [204165] task!, [204166] fact",
+		"[204170] fact 2026-07-29 liaison observed/accepted: no siblings here",
+	}, "\n")
+	if got := compactLines(hits); got != want {
+		t.Fatalf("compactLines:\n got %q\nwant %q", got, want)
+	}
+
+	// No siblings at all: the output is the bare compact lines.
+	bare := []searchHit{hits[1]}
+	if got, want := compactLines(bare), compactLine(hits[1]); got != want {
+		t.Fatalf("compactLines without siblings:\n got %q\nwant %q", got, want)
+	}
+	if siblingContinuationLine(nil) != "" {
+		t.Fatal("no siblings must render no continuation line")
+	}
+}
+
+// get_observations renders the same continuation line under its header, from
+// the `siblings` key the API serves BESIDE the observation record. The MCP
+// server never fetches siblings itself: it stays a thin adapter.
+func TestGetObservationsRendersSiblingContinuation(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("sekrit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/204170") {
+			w.Write([]byte(`{"observation":{"id":204170,"project":"liaison","kind":"fact",
+				"text":"lonesome","occurred_at_epoch":1785312000,"review_state":"accepted"}}`))
+			return
+		}
+		w.Write([]byte(`{"observation":{"id":204163,"project":"liaison","kind":"decision",
+			"text":"rename to Human","occurred_at_epoch":1785312000,"review_state":"lapsed"},
+			"siblings":[{"id":204164,"kind":"task","review_state":"lapsed","can_instruct":0},
+			            {"id":204165,"kind":"task","review_state":"accepted","can_instruct":1}]}`))
+	}))
+	defer srv.Close()
+
+	h := handleGetObservations(newAPIClient(srv.URL, tokenFile, false, ""))
+	req := mcp.CallToolRequest{}
+	req.Params.Arguments = map[string]any{"ids": []any{float64(204163), float64(204170)}}
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected error result: %+v", res)
+	}
+	text := resultText(t, res)
+	want := "  ↳ same run: [204164] task~, [204165] task!"
+	// The continuation line sits between the header and the body text.
+	header := "[204163] decision (liaison, 2026-07-29 08:00 UTC, lapsed)"
+	if !strings.Contains(text, header+"\n"+want+"\nrename to Human") {
+		t.Fatalf("continuation line is not between header and body:\n%s", text)
+	}
+	// The sibling-less observation keeps its two-line block.
+	if !strings.Contains(text, "[204170] fact (liaison, 2026-07-29 08:00 UTC, accepted)\nlonesome") {
+		t.Fatalf("sibling-less block changed shape:\n%s", text)
+	}
+}

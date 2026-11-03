@@ -53,6 +53,16 @@ type ToolEventRecord struct {
 	PathsTouched []string `json:"paths_touched,omitempty"`
 }
 
+// ErrInvalidFilter marks a read filter the store rejects by its own
+// validation (a client error). invalidFilterError keeps the bare message as
+// its text and matches this sentinel through errors.Is.
+var ErrInvalidFilter = errors.New("invalid filter")
+
+type invalidFilterError struct{ msg string }
+
+func (e invalidFilterError) Error() string        { return e.msg }
+func (e invalidFilterError) Is(target error) bool { return target == ErrInvalidFilter }
+
 // ListToolEventsInWindow returns RAW tool events filtered by session_id
 // (required), an inclusive occurred_at_epoch window, and optional agent_id /
 // project. Results are ordered by occurred_at_epoch ASC (then id ASC for a
@@ -63,10 +73,10 @@ type ToolEventRecord struct {
 // a best-effort convenience, not an authoritative artifact list.
 func (s *Store) ListToolEventsInWindow(ctx context.Context, filter ToolEventFilter) ([]ToolEventRecord, error) {
 	if strings.TrimSpace(filter.SessionID) == "" {
-		return nil, errors.New("session_id is required")
+		return nil, invalidFilterError{"session_id is required"}
 	}
 	if filter.StartEpoch != 0 && filter.EndEpoch != 0 && filter.EndEpoch < filter.StartEpoch {
-		return nil, errors.New("end must be >= start")
+		return nil, invalidFilterError{"end must be >= start"}
 	}
 
 	eventType := filter.EventType

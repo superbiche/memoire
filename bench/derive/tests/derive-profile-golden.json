@@ -1,0 +1,63 @@
+{
+  "_comment": "Shared oracle for the derive-profile ceiling formula, asserted by BOTH services/api/internal/config/derive_profile_golden_test.go and bench/derive/tests/profile-test.py. The bench computes -max-prompt-bytes from a profile; memoire computes the same number from the same registry file. A drift between the two would bench a different window than production runs — the comparison's whole premise (docs/DERIVE-PROFILE-DESIGN.md). Cases are exact integers, not tolerances: floor() has no tolerance.",
+  "formula": "floor((ctx_tokens - max_completion_tokens - margin_tokens) * bytes_per_token)",
+  "cases": [
+    {
+      "name": "bench-9b-rebench",
+      "why": "the geometry the 2026-08-25 re-bench is planned at",
+      "profile": {
+        "ctx_tokens": 32768,
+        "max_completion_tokens": 12288,
+        "bytes_per_token": 2.2,
+        "margin_tokens": 512,
+        "thinking": { "policy": "budget", "budget_tokens": 8192 }
+      },
+      "effective_max_prompt_bytes": 43929
+    },
+    {
+      "name": "autopsy-geometry",
+      "why": "the failed run's own numbers: 34918 is the ceiling that would have kept prompt + completion inside the 32768 context, against the 70000 actually sent",
+      "profile": {
+        "ctx_tokens": 32768,
+        "max_completion_tokens": 16384,
+        "bytes_per_token": 2.2,
+        "margin_tokens": 512
+      },
+      "effective_max_prompt_bytes": 34918
+    },
+    {
+      "name": "rounding-boundary",
+      "why": "50 * 2.3 is 114.99999999999999 in IEEE doubles, so the honest floor is 114 — the case that catches a reordered expression on either side",
+      "profile": {
+        "ctx_tokens": 1000,
+        "max_completion_tokens": 900,
+        "bytes_per_token": 2.3,
+        "margin_tokens": 50
+      },
+      "effective_max_prompt_bytes": 114
+    },
+    {
+      "name": "large-context",
+      "why": "a 64k serving context at the denser 2.3 ratio",
+      "profile": {
+        "ctx_tokens": 65536,
+        "max_completion_tokens": 16384,
+        "bytes_per_token": 2.3,
+        "margin_tokens": 1024,
+        "thinking": { "policy": "off" }
+      },
+      "effective_max_prompt_bytes": 110694
+    },
+    {
+      "name": "minimal-room",
+      "why": "one token of prompt room is legal geometry, and must not round to zero",
+      "profile": {
+        "ctx_tokens": 1000,
+        "max_completion_tokens": 998,
+        "bytes_per_token": 2.2,
+        "margin_tokens": 1
+      },
+      "effective_max_prompt_bytes": 2
+    }
+  ]
+}

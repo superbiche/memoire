@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -443,6 +444,81 @@ func TestQwenAdapterOrchestratorIntegration(t *testing.T) {
 	if runs[0].EndpointID != "hl3" {
 		t.Fatalf("endpoint_id=%q want hl3", runs[0].EndpointID)
 	}
+}
+
+// TestQwenAdapterReasoningEffort pins the chat-template steering channel
+// (operator ruling 2026-08-26, memoire's derive lane runs the HL5 brain at
+// "low"): the kwarg rides the request body verbatim when configured, and the
+// body stays byte-identical to the pre-knob shape when it is not — an
+// endpoint whose template ignores the kwarg must see no change at all.
+func TestQwenAdapterReasoningEffort(t *testing.T) {
+	captured := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[{"id":"qwen2.5-7b"}]}`))
+		case "/v1/chat/completions":
+			raw, _ := io.ReadAll(r.Body)
+			captured <- raw
+			qwenChatHandler(t, `{"schema_version":"1","observations":[]}`)(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	generate := func(t *testing.T, effort string) []byte {
+		t.Helper()
+		cfg := QwenConfig{
+			Endpoints: []QwenEndpoint{
+				{EndpointID: "hl3", BaseURL: srv.URL, APIKeyEnv: "HL3_QWEN_API_KEY", Models: []string{"qwen2.5-7b"}},
+			},
+			Timeout:         2 * time.Second,
+			ReasoningEffort: effort,
+		}
+		a, err := NewQwenAdapter(cfg, srv.Client(), qwenTestEnv(map[string]string{"HL3_QWEN_API_KEY": "placeholder"}))
+		if err != nil {
+			t.Fatalf("NewQwenAdapter: %v", err)
+		}
+		if _, err := a.Generate(context.Background(), qwenTestRequest("hl3", "qwen2.5-7b")); err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		return <-captured
+	}
+
+	t.Run("configured effort rides the body", func(t *testing.T) {
+		raw := generate(t, "low")
+		const want = `"chat_template_kwargs":{"reasoning_effort":"low"}`
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("request body missing %s\nbody: %s", want, raw)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("request body not JSON: %v", err)
+		}
+		kwargs, ok := body["chat_template_kwargs"].(map[string]any)
+		if !ok {
+			t.Fatalf("chat_template_kwargs = %v, want an object", body["chat_template_kwargs"])
+		}
+		if got := kwargs["reasoning_effort"]; got != "low" {
+			t.Fatalf("reasoning_effort = %v, want low", got)
+		}
+		if len(kwargs) != 1 {
+			t.Fatalf("chat_template_kwargs carries %d keys, want exactly reasoning_effort", len(kwargs))
+		}
+		// D53 contract: no other body field moves with the knob.
+		if body["temperature"] != float64(0) || body["stream"] != false {
+			t.Fatalf("D53 body fields changed: temperature=%v stream=%v", body["temperature"], body["stream"])
+		}
+	})
+
+	t.Run("unset effort omits the field", func(t *testing.T) {
+		raw := generate(t, "")
+		if strings.Contains(string(raw), "chat_template_kwargs") {
+			t.Fatalf("unset effort must not mention chat_template_kwargs\nbody: %s", raw)
+		}
+	})
 }
 
 // TestQwenAdapterSendsMaxTokensCap pins that every generation request carries

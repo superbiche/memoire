@@ -1,0 +1,27 @@
+[Unit]
+Description=Memoire local memory service
+Documentation=https://github.com/superbiche/memoire/blob/main/docs/DEPLOY.md
+
+[Container]
+Image=localhost/memoire:latest
+ContainerName=memoire
+# LAN-open listener (RULED: operator, 2026-07-23 — memoire:D165). Bearer
+# auth is the trust boundary; the host firewall stays the outer wall.
+PublishPort=37778:37778
+Volume=%h/.memoire:/data:Z
+Environment=MEMOIRE_ADDR=0.0.0.0:37778
+Environment=MEMOIRE_HOME=/data
+# MEMOIRE_DB lives in db.env (0600), NOT here: it may point at a PostgreSQL
+# DSN, and an inline Environment= would both put the credential in the unit
+# file and be reverted on every install/rebuild. If db.env is absent the unit
+# fails to start instead of silently writing to the wrong store.
+EnvironmentFile=%h/.memoire/db.env
+Environment=MEMOIRE_SCHEMA_DIR=/app/schema
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

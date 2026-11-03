@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# DRIFT_HOOK_START — docs-drift dogfood (2026-07-21); fail-open if drift absent
+if [ -f drift.lock ] && command -v drift >/dev/null 2>&1; then
+  if ! drift check; then
+    echo "drift: docs stale or links broken — fix per the drift skill, or bypass once with git commit --no-verify" >&2
+    exit 1
+  fi
+fi
+# DRIFT_HOOK_END

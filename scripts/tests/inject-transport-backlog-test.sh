@@ -39,6 +39,7 @@ mkdir -p "$TMP/home/queue/pending" "$TMP/home/queue/failed" "$TMP/proj"
 run_inject() { # extra env assignments as "K=V" args
   env -i PATH="$PATH" HOME="$TMP" \
     MEMOIRE_HOME="$TMP/home" \
+    MEMOIRE_INJECT=on \
     MEMOIRE_PROJECTS_REGISTRY="$TMP/registry-absent.json" \
     "$@" \
     bash "$INJECT" <<<"{\"cwd\":\"$TMP/proj\"}"

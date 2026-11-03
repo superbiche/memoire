@@ -65,17 +65,17 @@ func TestGovernanceHTTPNoiseFilterDefaultAndOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertBodyNotContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, "http accepted decision")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, "http clean governance noise peer")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&include_noise=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyNotContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, "http clean governance noise peer")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/observations?project=memoire-test&session_id=http-review-session&include_noise=true&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
 
-	assertBodyNotContains(t, handler, http.MethodGet, "/v1/search?q=http+accepted+decision&project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, "http accepted decision")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/search?q=http+accepted+decision&project=memoire-test&session_id=http-review-session&include_noise=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyNotContains(t, handler, http.MethodGet, "/v1/search?q=http+accepted+decision&project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/search?q=http+accepted+decision&project=memoire-test&session_id=http-review-session&include_noise=true&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
 
-	assertBodyNotContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&session_id=http-review-session", "read-token", "", http.StatusOK, "http accepted decision")
-	assertBodyContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&session_id=http-review-session&include_noise=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyNotContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&session_id=http-review-session&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
+	assertBodyContains(t, handler, http.MethodGet, "/v1/timeline?project=memoire-test&session_id=http-review-session&include_noise=true&include_derived=true", "read-token", "", http.StatusOK, "http accepted decision")
 
-	contextBody := `{"q":"http accepted decision","project":"memoire-test","session_id":"http-review-session"}`
+	contextBody := `{"q":"http accepted decision","project":"memoire-test","session_id":"http-review-session","include_derived":true}`
 	assertBodyNotContains(t, handler, http.MethodPost, "/v1/context?token=read-token", "", contextBody, http.StatusOK, "http accepted decision")
 	assertBodyContains(t, handler, http.MethodPost, "/v1/context?token=read-token&include_noise=true", "", contextBody, http.StatusOK, "http accepted decision")
 }

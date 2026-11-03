@@ -6,6 +6,9 @@ set -uo pipefail
 # liaison:D239 session-level kill switch: honored directly (not via the resolver) so
 # it works even if the resolver script is missing or broken.
 case "${MEMOIRE_CAPTURE:-}" in off|0|false) exit 0 ;; esac
+# The attribution fork (memoire-attribute-claude.py) is a headless session of its
+# own: its hooks stay silent so the fork is never captured or injected into.
+[[ -n "${MEMOIRE_ATTRIB_FORK:-}" ]] && exit 0
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QUEUE_BIN="${MEMOIRE_QUEUE_BIN:-$ROOT/bin/memoire-queue}"
@@ -46,6 +49,21 @@ TEXT="${MEMOIRE_TEXT:-}"
 STRICT="${MEMOIRE_CLAUDE_STRICT:-0}"
 LOG_FILE="${MEMOIRE_CLAUDE_HOOK_LOG:-${MEMOIRE_HOME:-$HOME/.memoire}/hooks/claude.log}"
 
+# notify_desktop TITLE BODY — a persistent desktop toast (critical urgency, no
+# expiry) so a lost capture is seen even though the hook stays fail-open
+# (operator ruling a1, 2026-10-08: the redaction key failing to load fails the
+# write, and that failure must be loud). Best effort: no notify-send or no
+# session bus means no toast, never a hook failure; the same bus discovery as
+# memoire-capture-health.sh. MEMOIRE_CLAUDE_NO_NOTIFY=1 silences it (tests).
+notify_desktop() {
+  [[ "${MEMOIRE_CLAUDE_NO_NOTIFY:-}" == 1 ]] && return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  local bus="${DBUS_SESSION_BUS_ADDRESS:-}"
+  if [[ -z "$bus" && -n "${XDG_RUNTIME_DIR:-}" && -S "$XDG_RUNTIME_DIR/bus" ]]; then bus="unix:path=$XDG_RUNTIME_DIR/bus"; fi
+  [[ -n "$bus" ]] || return 0
+  DBUS_SESSION_BUS_ADDRESS="$bus" timeout 5 notify-send -u critical -t 0 -a memoire-capture-claude -- "$1" "$2" >/dev/null 2>&1 || true
+}
+
 finish_error() {
   local code="${1:-1}"
   shift || true
@@ -56,6 +74,9 @@ finish_error() {
     if [[ "$STRICT" == "1" ]]; then
       printf 'memoire-capture-claude: %s\n' "$msg" >&2
     fi
+    case "$msg" in
+      "queue write failed"*) notify_desktop "Memoire: a Claude capture was NOT written" "$msg"$'\n'"Log: $LOG_FILE" ;;
+    esac
   fi
   if [[ "$STRICT" == "1" ]]; then
     exit "$code"
@@ -135,7 +156,7 @@ fi
 
 payload_file="$(mktemp "${TMPDIR:-/tmp}/memoire-claude-payload.XXXXXX.json")"
 cleanup() {
-  rm -f "$payload_file"
+  rm -f "$payload_file" "$payload_file.pat"
 }
 trap cleanup EXIT
 
@@ -191,8 +212,42 @@ fi
 source_event_id=""
 if [[ -n "$SESSION_ID" && -n "$tool_use_id" && "${hook_event,,}" == "posttooluse" ]]; then
   source_event_id="claude-posttooluse-$(printf '%s' "$SESSION_ID:$tool_use_id" | sha256sum | awk '{print $1}')"
+elif [[ -n "$SESSION_ID" && -n "$tool_use_id" && "${hook_event,,}" == "posttoolusefailure" ]]; then
+  # A failed call never fires PostToolUse, so its id space is its own: the
+  # same tool_use_id can never name both a success and a failure event.
+  source_event_id="claude-posttoolusefailure-$(printf '%s' "$SESSION_ID:$tool_use_id" | sha256sum | awk '{print $1}')"
 elif [[ -n "$SESSION_ID" && "${hook_event,,}" == "userpromptsubmit" ]]; then
-  prompt_fingerprint="$(jq -c '{session_id:(.session_id // .sessionId // ""), hook_event_name:(.hook_event_name // .hookEvent // .event // ""), prompt:(.prompt // .user_prompt // .userPrompt // .message // .text // ""), cwd:(.cwd // .project_dir // "")}' "$payload_file" | sha256sum | awk '{print $1}')"
+  # Position: how many identical prompts the transcript already holds. The hook
+  # fires before Claude Code appends the prompt, so the first occurrence sees 0
+  # and keeps the historical fingerprint (stored ids never change); a later
+  # identical prompt sees k>0 and hashes k in. A re-fire at the same position
+  # sees the same k. Missing, unreadable or unscannable transcript -> 0 (fail open; all but missing logged).
+  prompt_ordinal=0
+  transcript_path="$(jq -r '.transcript_path // empty' "$payload_file")"
+  # A missing file is the first prompt of a session (Claude Code creates the
+  # transcript after the hook): ordinal 0, silent. An existing file that cannot
+  # be read or scanned is logged.
+  if [[ -n "$transcript_path" && -e "$transcript_path" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    if [[ -r "$transcript_path" ]]; then
+      # The transcript stores a prompt as `"role":"user","content":<json string>}`;
+      # tool results and assistant text never match (arrays, escaped quotes).
+      # One fixed-string grep pass, pattern on stdin (never in a file: it holds
+      # the prompt text); the scan is cut off at 2 s, inside the hook's 5 s.
+      count=""
+      if pat="$(jq -j '"\"role\":\"user\",\"content\":" + ((.prompt // .user_prompt // .userPrompt // .message // .text // "") | tojson) + "}"' "$payload_file" 2>/dev/null)"; then
+        count="$(printf '%s' "$pat" | timeout 2 grep -cF -f - -- "$transcript_path" 2>/dev/null)" || true
+      fi
+      if [[ "$count" =~ ^[0-9]+$ ]]; then
+        prompt_ordinal="$count"
+      else
+        echo "$(date -Is) prompt ordinal: transcript scan failed path=$transcript_path; using ordinal 0" >> "$LOG_FILE" 2>/dev/null || true
+      fi
+    else
+      echo "$(date -Is) prompt ordinal: transcript unreadable path=$transcript_path; using ordinal 0" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+  fi
+  prompt_fingerprint="$(jq -c --argjson n "$prompt_ordinal" '{session_id:(.session_id // .sessionId // ""), hook_event_name:(.hook_event_name // .hookEvent // .event // ""), prompt:(.prompt // .user_prompt // .userPrompt // .message // .text // ""), cwd:(.cwd // .project_dir // "")} + (if $n > 0 then {ordinal:$n} else {} end)' "$payload_file" | sha256sum | awk '{print $1}')"
   source_event_id="claude-userpromptsubmit-$prompt_fingerprint"
 elif [[ -n "$SESSION_ID" && ( "$EVENT_TYPE" == "claude_SessionStart" || "$EVENT_TYPE" == "claude_SessionEnd" || "$EVENT_TYPE" == "session_start" || "$EVENT_TYPE" == "session_end" ) ]]; then
   source_event_id="claude-session-marker-$(printf '%s' "$SESSION_ID:$EVENT_TYPE" | sha256sum | awk '{print $1}')"
@@ -216,7 +271,9 @@ if [[ -n "${MRP_ROOT:-}" ]]; then
   args+=(-project-root "$MRP_ROOT" -project-source "$MRP_SOURCE")
 fi
 
-if ! "$QUEUE_BIN" \
-  "${args[@]}"; then
-  finish_error 1 "queue write failed"
+# The writer's stdout (the queue path) stays the hook's stdout; its stderr
+# (e.g. `redaction key: …`, fail-closed) rides the log line and the toast.
+{ qerr="$("$QUEUE_BIN" "${args[@]}" 2>&1 1>&3)"; qrc=$?; } 3>&1
+if (( qrc != 0 )); then
+  finish_error 1 "queue write failed: $(printf '%s' "$qerr" | head -c 300 | tr '\n' ' ')"
 fi
