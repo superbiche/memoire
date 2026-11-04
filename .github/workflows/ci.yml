@@ -15,7 +15,7 @@ jobs:
   # workflow runs code from pull requests. Images are built from the private
   # side after these jobs succeed for a commit.
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -51,7 +51,7 @@ jobs:
   # PG legs skip (MEMOIRE_TEST_PG_URL unset) and green CI never actually
   # judged Postgres.
   test-pg:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -69,7 +69,7 @@ jobs:
   # generic shapes only. The maintainers' sensitive pattern set never enters
   # this repository; the pre-push hook applies it locally.
   secret-scan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GITLEAKS_VERSION: 8.30.1
       GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
