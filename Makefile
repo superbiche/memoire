@@ -80,8 +80,13 @@ githooks:
 	  test "$$(git config core.hooksPath 2>/dev/null)" = ".githooks" || git config core.hooksPath .githooks; \
 	else echo "githooks: .githooks/ not present in this checkout — skipping"; fi
 
+# Publishing the harness-parity coverage file is a fleet-host side effect
+# (liaison reads ~/.agents/coverage/memoire.json); scripts/tests/coverage-test.sh
+# tests the validator everywhere. Hosts without the fleet inventory skip it.
 test-ops:
-	python3 scripts/memoire-coverage.py --print
+	@inv="$${MEMOIRE_HARNESS_INVENTORY:-$$HOME/.agents/harnesses.json}"; \
+	if [ -f "$$inv" ]; then python3 scripts/memoire-coverage.py --print; \
+	else echo "coverage: no harness inventory at $$inv; publication skipped (not a fleet host)"; fi
 	bash scripts/tests/live-turn-ingest-test.sh
 	bash scripts/tests/capture-tick-test.sh
 	bash scripts/tests/codex-capture-tick-test.sh
