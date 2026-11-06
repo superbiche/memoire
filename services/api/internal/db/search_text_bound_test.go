@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 )
 
 // The search-visible text bounds: pure function first, then both engines
@@ -21,7 +22,7 @@ import (
 func TestBoundSearchTextPure(t *testing.T) {
 	sha256hex := strings.Repeat("ab", 32)
 	sha512hex := strings.Repeat("cd", 64)
-	blob := strings.Repeat("QUJDabc1", 30) // 240 mixed-class base64 chars
+	blob := pseudoRandomBase64(240) // encoded "binary": high entropy, all three classes
 	hexdump := strings.Repeat("0123456789abcdef", 20)
 	wordpath := "/" + strings.Join(strings.Fields(strings.Repeat("some/deep/path/of/words ", 12)), "/")
 	longid := strings.Repeat("Service-Name_v2-", 20)
@@ -36,6 +37,11 @@ func TestBoundSearchTextPure(t *testing.T) {
 		{"long hex dump kept (no upper case)", hexdump, hexdump},
 		{"long word path kept (no digits)", wordpath, wordpath},
 		{"long hyphenated identifier kept", longid, longid},
+		{"url tail with digits and case kept (not delimited)", "see https://example.test/" + strings.Repeat("Project42/reports/", 20) + " now", "see https://example.test/" + strings.Repeat("Project42/reports/", 20) + " now"},
+		{"low-entropy mixed run kept", "x " + strings.Repeat("QUJDabc1", 30) + " y", "x " + strings.Repeat("QUJDabc1", 30) + " y"},
+		{"blob at start of text", blob + " tail", "[blob 240 chars] tail"},
+		{"blob after a quote keeps the quote", `{"b":"` + blob + `"}`, `{"b":"[blob 240 chars]"}`},
+		{"run glued to a URL (preceded by '.') is kept", "see host.example/" + blob + " now", "see host.example/" + blob + " now"},
 		{"data url is a blob", `{"image_url":"data:image/png;base64,` + blob + `"}`, `{"image_url":"[blob 262 chars]"}`},
 		{"data url with parameters is one blob", "data:image/png;charset=utf-8;base64," + blob, "[blob 276 chars]"},
 		{"bare base64 run is a blob", "x " + blob + " y", "x [blob 240 chars] y"},
@@ -91,6 +97,41 @@ func TestBoundSearchTextPure(t *testing.T) {
 	if BoundSearchText(under) != under {
 		t.Fatalf("text under both caps must be untouched")
 	}
+	// Combined boundary (review r2): exactly 20,000 runs and over the byte
+	// cap. The byte cut must still reserve the marker's run; the result holds
+	// at most the unit cap and is a fixed point.
+	both := strings.Repeat("a ", searchTextMaxUnits-1) + strings.Repeat("b", searchTextMaxBytes+1)
+	gb := BoundSearchText(both)
+	if n := countUnits(gb); n > searchTextMaxUnits || len(gb) > searchTextMaxBytes {
+		t.Fatalf("combined boundary: %d runs, %d bytes", n, len(gb))
+	}
+	if again := BoundSearchText(gb); again != gb {
+		t.Fatalf("combined boundary not idempotent: %d -> %d bytes", len(gb), len(again))
+	}
+}
+
+// pseudoRandomBase64 returns n base64 characters encoding a deterministic
+// pseudo-random byte stream (an LCG), the entropy profile of a PNG or zip.
+func pseudoRandomBase64(n int) string {
+	raw := make([]byte, n)
+	x := uint32(0x9e3779b9)
+	for i := range raw {
+		x = x*1664525 + 1013904223
+		raw[i] = byte(x >> 24)
+	}
+	return base64.StdEncoding.EncodeToString(raw)[:n]
+}
+
+func countUnits(s string) int {
+	n, in := 0, false
+	for _, r := range s {
+		u := unicode.IsLetter(r) || unicode.IsDigit(r)
+		if u && !in {
+			n++
+		}
+		in = u
+	}
+	return n
 }
 
 func TestSearchTextBoundThroughIngest(t *testing.T) {
@@ -164,7 +205,7 @@ func runSearchTextBoundBattery(t *testing.T, store *Store) {
 	// 1. A codex tool_result with a 2.9 MB inline screenshot: the shape of the
 	// 85 hub failures. Ingest succeeds, the words around the blob are kept and
 	// searchable, the blob is not, and the payload is stored whole.
-	png := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("\x89PNG screenshot bytes ", 100000)))
+	png := pseudoRandomBase64(2_900_000) // the entropy of a real PNG
 	payload, _ := json.Marshal(map[string]any{
 		"call_id": "call_1",
 		"output": []map[string]any{

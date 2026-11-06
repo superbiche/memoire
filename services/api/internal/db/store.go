@@ -4904,35 +4904,48 @@ func IngestText(in EventInput, payload json.RawMessage) string {
 // bounded text (pgshadow) changes nothing.
 //
 //   - A blob is a run of searchBlobMinRun (200) or more characters from the
-//     standard base64 alphabet [A-Za-z0-9+/=] that mixes upper case, lower
-//     case and digits, with its optional data: URL prefix. It is replaced by
-//     "[blob N chars]" (N counts the matched characters, prefix included). The
-//     class mix keeps hex dumps (no upper case), word-only paths and
-//     identifiers (no digits) and anything with '-', '_' or '.' in it; 200
-//     keeps every hash a human searches by (sha256 hex is 64, sha512 128).
-//   - The cut keeps at most searchTextMaxBytes (256 KiB) of text and at most
-//     searchTextMaxUnits (20,000) letter/digit runs, whichever comes first, on
-//     a rune boundary, and appends " [truncated]" inside the byte cap. The
-//     unit cap is what bounds the tsvector: 'simple' emits at most two
-//     lexemes per unit (a hyphenated compound and its parts, a URL and its
-//     host/path), every lexeme string is a substring so the strings total at
-//     most twice the bytes, and each lexeme costs a 4-byte WordEntry, a 2-byte
-//     position count, one 2-byte position per occurrence and up to 3 bytes of
-//     alignment (src/include/tsearch/ts_type.h). Worst case: 2*262,144 +
-//     2*20,000*(4+2+3) + 2*20,000*2 = 964,288 < 1,048,575. Token-dense text
-//     (an identifier listing, minified code) hits the unit cap long before the
-//     byte cap; prose hits the byte cap at roughly 40,000 words.
+//     standard base64 alphabet [A-Za-z0-9+/=] that is high-entropy: at least
+//     searchBlobMinDistinct (40) distinct characters in its first 256 and all
+//     three classes (upper, lower, digit) present. Encoded binary (PNG, zip,
+//     ciphertext) has 55-64 distinct characters per 256; paths, URLs,
+//     identifiers, hex and prose built from a vocabulary never approach 40
+//     (26 lower-case letters plus digits plus '/' is 37 even when every one
+//     appears). A bare run must also be delimited: preceded by start of text,
+//     whitespace or a JSON/quote delimiter, so a URL or path tail (preceded
+//     by '.', ':' or '/') is never a blob. An explicit data: URL body is a
+//     blob by prefix, delimiter or not. The blob becomes "[blob N chars]" (N
+//     counts the matched characters, prefix included). 200 keeps every hash
+//     a human searches by (sha256 hex is 64, sha512 128).
+//   - The cut keeps at most searchTextMaxBytes (192 KiB) of text and at most
+//     searchTextMaxUnits (20,000) letter/digit runs, marker included, on a
+//     rune boundary, and appends " [truncated]". Whenever either cap requires
+//     a cut, the marker's own run is reserved, so the result is a fixed
+//     point. The unit cap is what bounds the tsvector: 'simple' emits at most
+//     two lexemes per run (a hyphenated compound and its parts, a URL and its
+//     host/path), lexeme strings are lower-cased substrings (full Unicode
+//     lower-casing can grow a character by 3/2 at most, U+0130 -> "i\u0307"),
+//     so the strings total at most 3 x bytes, and each lexeme costs a 4-byte
+//     WordEntry, a 2-byte position count, one 2-byte position per occurrence
+//     (256 at most) and up to 3 bytes of alignment (src/include/tsearch/
+//     ts_type.h). Worst case: 3*196,608 + 2*20,000*(4+2+3) + 2*20,000*2 =
+//     1,029,824 < 1,048,575. Token-dense text (an identifier listing,
+//     minified code) hits the unit cap first; prose hits it at about 20,000
+//     words, the byte cap at about 30,000.
 //
 // SQLite and Postgres share this projection through IngestText, so the
 // pgshadow parity hashes are unaffected by the engine.
 const (
-	searchTextMaxBytes = 256 << 10
-	searchTextMaxUnits = 20000
-	searchBlobMinRun   = 200
-	searchTruncMarker  = " [truncated]"
+	searchTextMaxBytes    = 192 << 10
+	searchTextMaxUnits    = 20000
+	searchBlobMinRun      = 200
+	searchBlobMinDistinct = 40
+	searchTruncMarker     = " [truncated]"
 )
 
-var blobRunRE = regexp.MustCompile(fmt.Sprintf(`(?:data:[A-Za-z0-9.+/-]+(?:;[A-Za-z0-9=.+-]+)*;base64,)?[A-Za-z0-9+/=]{%d,}`, searchBlobMinRun))
+// Group 1: the delimiter before a bare run (kept); group 2: the data: prefix
+// (optional); group 3: the run. A run without a data: prefix needs the
+// delimiter; the (?:^|…) alternative lets the prefix form stand anywhere.
+var blobRunRE = regexp.MustCompile(fmt.Sprintf(`(^|[\s"'`+"`"+`\[\](){},;=<>])?(data:[A-Za-z0-9.+/-]+(?:;[A-Za-z0-9=.+-]+)*;base64,)?([A-Za-z0-9+/=]{%d,})`, searchBlobMinRun))
 
 // BoundSearchText applies the search-visible text bounds above. It is
 // idempotent and returns "" for "".
@@ -4947,10 +4960,21 @@ func BoundSearchText(text string) string {
 		text = strings.ToValidUTF8(text, "\uFFFD")
 	}
 	text = blobRunRE.ReplaceAllStringFunc(text, func(m string) string {
-		if !looksBase64(m) {
-			return m
+		sub := blobRunRE.FindStringSubmatch(m)
+		delim, prefix, run := sub[1], sub[2], sub[3]
+		// A bare run (no data: prefix) is a blob only when delimited and
+		// high-entropy; the delimiter is kept in front of the marker. Note
+		// that a match at offset 0 has delim == "" with ^ satisfied: the
+		// regexp engine records an empty group, so test the offset instead.
+		if prefix == "" {
+			if delim == "" && !strings.HasPrefix(text, m) {
+				return m
+			}
+			if !looksBase64(run) {
+				return m
+			}
 		}
-		return fmt.Sprintf("[blob %d chars]", len(m))
+		return fmt.Sprintf("%s[blob %d chars]", delim, len(prefix)+len(run))
 	})
 	if cut, ok := searchTextCut(text); ok {
 		text = text[:cut] + searchTruncMarker
@@ -4958,16 +4982,19 @@ func BoundSearchText(text string) string {
 	return text
 }
 
-// looksBase64 reports whether a run from the base64 alphabet mixes upper
-// case, lower case and digits — encoded bytes do, words and hex do not. A
-// data: prefix is skipped before looking.
+// looksBase64 reports whether a run from the base64 alphabet is encoded
+// binary rather than words: at least searchBlobMinDistinct distinct characters
+// in its first 256 and upper case, lower case and digits all present.
 func looksBase64(run string) bool {
-	if i := strings.Index(run, ";base64,"); i >= 0 && strings.HasPrefix(run, "data:") {
-		run = run[i+len(";base64,"):]
-	}
+	var seen [128]bool
+	distinct := 0
 	var upper, lower, digit bool
-	for i := 0; i < len(run) && !(upper && lower && digit); i++ {
+	for i := 0; i < len(run) && i < 256; i++ {
 		c := run[i]
+		if !seen[c] {
+			seen[c] = true
+			distinct++
+		}
 		switch {
 		case c >= 'A' && c <= 'Z':
 			upper = true
@@ -4977,21 +5004,21 @@ func looksBase64(run string) bool {
 			digit = true
 		}
 	}
-	return upper && lower && digit
+	return distinct >= searchBlobMinDistinct && upper && lower && digit
 }
 
 // searchTextCut returns the byte offset at which text must be cut so that
 // text[:cut]+searchTruncMarker holds at most searchTextMaxBytes bytes and at
-// most searchTextMaxUnits letter/digit runs (marker included), and whether a
-// cut is needed. The
-// offset is a rune boundary. Text within both caps returns ok=false.
+// most searchTextMaxUnits letter/digit runs (the marker's run included), and
+// whether a cut is needed. The offset is a rune boundary. Text within both
+// caps returns ok=false.
 func searchTextCut(text string) (int, bool) {
 	byteCap := searchTextMaxBytes - len(searchTruncMarker)
-	// The text needs a unit cut when it holds more than searchTextMaxUnits
-	// runs; the cut then lands at the start of run number searchTextMaxUnits,
-	// so that the marker (one run itself) brings the result to exactly the
-	// cap and a second pass finds nothing to do.
-	units, inUnit, unitsEnd, capStart := 0, false, -1, -1
+	// capStart is where run number searchTextMaxUnits begins: any cut lands
+	// at or before it, so that the marker brings the result to at most the
+	// unit cap and a second pass finds nothing to do. overUnits says the
+	// text itself exceeds the cap.
+	units, inUnit, capStart, overUnits := 0, false, -1, false
 	for i, r := range text {
 		isUnit := unicode.IsLetter(r) || unicode.IsDigit(r)
 		if isUnit && !inUnit {
@@ -5000,20 +5027,20 @@ func searchTextCut(text string) (int, bool) {
 				capStart = i
 			}
 			if units > searchTextMaxUnits {
-				unitsEnd = capStart
+				overUnits = true
 				break
 			}
 		}
 		inUnit = isUnit
 	}
-	if unitsEnd < 0 && len(text) <= searchTextMaxBytes {
+	if !overUnits && len(text) <= searchTextMaxBytes {
 		return 0, false
 	}
 	cut := byteCap
-	if unitsEnd >= 0 && unitsEnd < cut {
-		cut = unitsEnd
+	if capStart >= 0 && capStart < cut {
+		cut = capStart
 	}
-	if cut >= len(text) {
+	if cut > len(text) {
 		cut = len(text)
 	}
 	for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
