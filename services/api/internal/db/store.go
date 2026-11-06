@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"memoire/services/api/internal/authctx"
 	"memoire/services/api/internal/contenthash"
@@ -2148,9 +2149,9 @@ func (s *Store) Ingest(ctx context.Context, in EventInput) (IngestResult, error)
 			in.RequestID = auth.RequestID
 		}
 	}
-	text := in.Text
+	text := BoundSearchText(in.Text)
 	if text == "" {
-		text = projectText(in, payload)
+		text = BoundSearchText(projectText(in, payload))
 	}
 	key := in.IdempotencyKey(payload)
 
@@ -4884,10 +4885,61 @@ func SanitizeFTS(q string) string {
 // exported for the pgshadow replay lane (slice-5 groundwork, D157): the
 // Postgres replay must project text identically or parity hashes diverge.
 func IngestText(in EventInput, payload json.RawMessage) string {
-	if in.Text != "" {
-		return in.Text
+	if text := BoundSearchText(in.Text); text != "" {
+		return text
 	}
-	return projectText(in, payload)
+	return BoundSearchText(projectText(in, payload))
+}
+
+// Search-visible text bounds. The text column is a projection for search; the
+// event's custody is the payload, which these bounds never touch. Postgres
+// caps a tsvector at 1,048,575 bytes and the generated observations.text_tsv
+// column is computed from text, so an unbounded projection fails the whole
+// ingest: 85 hub events (codex_tool_result rows carrying an inline
+// data:image/png;base64 screenshot of 1 to 7.6 MB) sat in queue/failed/ on
+// 2026-11-06. Postgres text also refuses NUL and invalid UTF-8.
+//
+//   - A run of 200+ characters from the base64/base64url alphabet, with its
+//     optional data: URL prefix, is a blob: it carries no searchable word and
+//     is replaced by "[blob N bytes]". 200 keeps every hash a human searches
+//     by (sha256 hex is 64, sha512 is 128) and every ordinary identifier.
+//   - NUL is dropped and invalid UTF-8 replaced by U+FFFD.
+//   - Text longer than searchTextMaxBytes is cut at a rune boundary and
+//     marked "[truncated]"; 512 KiB of prose stays far under the tsvector
+//     cap once blobs are gone.
+//
+// SQLite and Postgres share this projection through IngestText, so the
+// pgshadow parity hashes are unaffected by the engine.
+const (
+	searchTextMaxBytes = 512 << 10
+	searchBlobMinRun   = 200
+)
+
+var blobRunRE = regexp.MustCompile(fmt.Sprintf(`(?:data:[A-Za-z0-9.+/-]+;base64,)?[A-Za-z0-9+/=_-]{%d,}`, searchBlobMinRun))
+
+// BoundSearchText applies the search-visible text bounds above. It is
+// idempotent and returns "" for "".
+func BoundSearchText(text string) string {
+	if text == "" {
+		return text
+	}
+	text = blobRunRE.ReplaceAllStringFunc(text, func(m string) string {
+		return fmt.Sprintf("[blob %d bytes]", len(m))
+	})
+	if strings.IndexByte(text, 0) >= 0 {
+		text = strings.ReplaceAll(text, "\x00", "")
+	}
+	if !utf8.ValidString(text) {
+		text = strings.ToValidUTF8(text, "�")
+	}
+	if len(text) > searchTextMaxBytes {
+		cut := searchTextMaxBytes
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = text[:cut] + " [truncated]"
+	}
+	return text
 }
 
 func projectText(in EventInput, payload json.RawMessage) string {

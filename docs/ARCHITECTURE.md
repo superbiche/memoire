@@ -6,6 +6,8 @@
 
 Memoire v0.1 is one write authority: the Go API process. Hooks and adapters either call HTTP or write event envelopes into the file queue. The service drains that queue into SQLite and projects each raw event into a search-visible `raw` observation.
 
+The observation's `text` is a search projection, not custody: the payload is kept whole, the text is bounded (`db.BoundSearchText`). Runs of 200 or more base64 characters (an inline `data:` image, an attachment) become `[blob N bytes]`, NUL and invalid UTF-8 are removed, and text beyond 512 KiB is cut at a rune boundary and marked `[truncated]`. Postgres computes the FTS column from this text and caps a `tsvector` at 1 MB; an unbounded projection fails the ingest of the whole event. Hashes (sha256 is 64 characters, sha512 128) and ordinary identifiers stay searchable.
+
 The HTTP API is canonical. MCP should arrive later as a thin adapter over HTTP, not as a second implementation of search or ingest behavior.
 
 SQLite is acceptable while Memoire is local and single-writer. Before Kubernetes or direct worker writes, run the storage gate documented in `docs/KICKOFF-PREP.md`.
