@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,7 +21,10 @@ import (
 func TestBoundSearchTextPure(t *testing.T) {
 	sha256hex := strings.Repeat("ab", 32)
 	sha512hex := strings.Repeat("cd", 64)
-	blob := strings.Repeat("QUJD", 60) // 240 base64 chars
+	blob := strings.Repeat("QUJDabc1", 30) // 240 mixed-class base64 chars
+	hexdump := strings.Repeat("0123456789abcdef", 20)
+	wordpath := "/" + strings.Join(strings.Fields(strings.Repeat("some/deep/path/of/words ", 12)), "/")
+	longid := strings.Repeat("Service-Name_v2-", 20)
 	cases := []struct {
 		name, in, want string
 	}{
@@ -29,36 +33,63 @@ func TestBoundSearchTextPure(t *testing.T) {
 		{"sha256 hex kept", "id " + sha256hex + " done", "id " + sha256hex + " done"},
 		{"sha512 hex kept", "id " + sha512hex + " done", "id " + sha512hex + " done"},
 		{"url kept", "see https://example.test/a/b/c?x=1&y=2 now", "see https://example.test/a/b/c?x=1&y=2 now"},
-		{"data url is a blob", `{"image_url":"data:image/png;base64,` + blob + `"}`, `{"image_url":"[blob 262 bytes]"}`},
-		{"bare base64 run is a blob", "x " + blob + " y", "x [blob 240 bytes] y"},
+		{"long hex dump kept (no upper case)", hexdump, hexdump},
+		{"long word path kept (no digits)", wordpath, wordpath},
+		{"long hyphenated identifier kept", longid, longid},
+		{"data url is a blob", `{"image_url":"data:image/png;base64,` + blob + `"}`, `{"image_url":"[blob 262 chars]"}`},
+		{"data url with parameters is one blob", "data:image/png;charset=utf-8;base64," + blob, "[blob 276 chars]"},
+		{"bare base64 run is a blob", "x " + blob + " y", "x [blob 240 chars] y"},
 		{"nul dropped", "a\x00b", "ab"},
 		{"invalid utf8 replaced", "a\xffb", "a�b"},
+		// Composition: NUL inside a would-be blob is normalized first, so the
+		// first call already sees (and replaces) the run the second would.
+		{"nul inside a blob run", blob[:120] + "\x00" + blob[120:], "[blob 240 chars]"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := BoundSearchText(c.in); got != c.want {
+			got := BoundSearchText(c.in)
+			if got != c.want {
 				t.Fatalf("BoundSearchText(%q) = %q, want %q", c.in, got, c.want)
 			}
-			if again := BoundSearchText(BoundSearchText(c.in)); again != c.want {
-				t.Fatalf("not idempotent: %q", again)
+			if again := BoundSearchText(got); again != got {
+				t.Fatalf("not idempotent: %q -> %q", got, again)
 			}
 		})
 	}
 
-	long := strings.Repeat("word ", searchTextMaxBytes/5+1000) // > cap, ASCII
+	// Byte cap: prose past 256 KiB is cut; the result including the marker is
+	// within the cap and stable under a second pass.
+	long := strings.Repeat("plain words ", searchTextMaxBytes/12+1000)
 	got := BoundSearchText(long)
-	if !strings.HasSuffix(got, " [truncated]") {
-		t.Fatalf("long text: want [truncated] suffix, got tail %q", got[len(got)-30:])
+	if !strings.HasSuffix(got, searchTruncMarker) || len(got) > searchTextMaxBytes {
+		t.Fatalf("long prose: want cut within %d bytes with marker, got %d bytes", searchTextMaxBytes, len(got))
 	}
-	if len(got) > searchTextMaxBytes+len(" [truncated]") {
-		t.Fatalf("long text: %d bytes exceeds the cap", len(got))
+	if again := BoundSearchText(got); again != got {
+		t.Fatalf("truncated prose not idempotent")
 	}
 	// The cut lands on a rune boundary: a multibyte run straddling the cap
 	// is not split into invalid UTF-8.
-	multi := strings.Repeat("é", searchTextMaxBytes) // 2 bytes each
+	multi := strings.Repeat("é", searchTextMaxBytes) // 2 bytes each, one unit
 	gm := BoundSearchText(multi)
-	if !strings.HasSuffix(gm, " [truncated]") || strings.ContainsRune(gm, '�') {
-		t.Fatalf("multibyte cut produced invalid text")
+	if !strings.HasSuffix(gm, searchTruncMarker) || strings.ContainsRune(gm, '�') || len(gm) > searchTextMaxBytes {
+		t.Fatalf("multibyte cut produced invalid or oversized text (%d bytes)", len(gm))
+	}
+	// Unit cap: token-dense text well under the byte cap is cut at 20,000
+	// letter/digit runs.
+	dense := strings.Repeat("ab-cd ", 15000) // 30,000 units, 90 KB
+	gd := BoundSearchText(dense)
+	if !strings.HasSuffix(gd, searchTruncMarker) || len(gd) >= len(dense) {
+		t.Fatalf("token-dense text: want a unit-cap cut, got %d of %d bytes", len(gd), len(dense))
+	}
+	if n := strings.Count(gd, "ab"); n > searchTextMaxUnits/2 {
+		t.Fatalf("token-dense text: %d compounds survive, want <= %d", n, searchTextMaxUnits/2)
+	}
+	if again := BoundSearchText(gd); again != gd {
+		t.Fatalf("unit-cut text not idempotent")
+	}
+	under := strings.Repeat("ab-cd ", 9000) // 18,000 units: untouched
+	if BoundSearchText(under) != under {
+		t.Fatalf("text under both caps must be untouched")
 	}
 }
 
@@ -96,11 +127,44 @@ func runSearchTextBoundBattery(t *testing.T, store *Store) {
 	ctx := context.Background()
 	now := time.Now().Unix()
 	project := "textbound"
+	ingest := func(id, adapter, eventType, text string, payload []byte, age int64) IngestResult {
+		t.Helper()
+		res, err := store.Ingest(ctx, EventInput{
+			Project:         project,
+			SessionID:       "tb-session",
+			SourceAdapter:   adapter,
+			SourceEventID:   id,
+			EventType:       eventType,
+			OccurredAtEpoch: now - age,
+			Text:            text,
+			Payload:         json.RawMessage(payload),
+		})
+		if err != nil {
+			t.Fatalf("ingest %s: %v", id, err)
+		}
+		return res
+	}
+	storedText := func(eventID int64) string {
+		t.Helper()
+		var text string
+		if err := store.rdb.QueryRow(`SELECT text FROM observations WHERE event_id = ?`, eventID).Scan(&text); err != nil {
+			t.Fatalf("raw observation text of %d: %v", eventID, err)
+		}
+		return text
+	}
+	hits := func(q string) int {
+		t.Helper()
+		h, err := store.Search(ctx, q, project, 10)
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		return len(h)
+	}
 
-	// 1. A codex tool_result with a 2 MB inline screenshot: the shape of the
-	// 85 hub failures. Ingest must succeed and the projection must keep the
-	// words around the blob and drop the blob.
-	png := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("\x89PNG screenshot bytes ", 100000))) // ~2.9 MB
+	// 1. A codex tool_result with a 2.9 MB inline screenshot: the shape of the
+	// 85 hub failures. Ingest succeeds, the words around the blob are kept and
+	// searchable, the blob is not, and the payload is stored whole.
+	png := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("\x89PNG screenshot bytes ", 100000)))
 	payload, _ := json.Marshal(map[string]any{
 		"call_id": "call_1",
 		"output": []map[string]any{
@@ -108,79 +172,62 @@ func runSearchTextBoundBattery(t *testing.T, store *Store) {
 			{"type": "input_image", "image_url": "data:image/png;base64," + png},
 		},
 	})
-	in := EventInput{
-		Project:         project,
-		SessionID:       "tb-session",
-		SourceAdapter:   "codex",
-		SourceEventID:   "tb-evt-blob",
-		EventType:       "codex_tool_result",
-		OccurredAtEpoch: now - 50,
-		Payload:         json.RawMessage(payload),
-	}
-	res, err := store.Ingest(ctx, in)
-	if err != nil {
-		t.Fatalf("ingest with inline blob: %v", err)
-	}
-	var text string
-	if err := store.rdb.QueryRow(`SELECT text FROM observations WHERE event_id = ?`, res.ID).Scan(&text); err != nil {
-		t.Fatalf("raw observation text: %v", err)
-	}
-	if len(text) > 4096 || !strings.Contains(text, "[blob ") || !strings.Contains(text, "quokka-marker") {
+	res := ingest("tb-evt-blob", "codex", "codex_tool_result", "", payload, 50)
+	if text := storedText(res.ID); len(text) > 4096 || !strings.Contains(text, "[blob ") || !strings.Contains(text, "quokka-marker") {
 		t.Fatalf("projection: want short text with the blob marker and the words, got %d bytes", len(text))
 	}
-	if hits, err := store.Search(ctx, "quokka-marker", project, 10); err != nil || len(hits) != 1 {
-		t.Fatalf("search for the kept word: hits=%d err=%v", len(hits), err)
+	if n := hits("quokka-marker"); n != 1 {
+		t.Fatalf("search for the kept word: want 1 hit, got %d", n)
 	}
-	if hits, err := store.Search(ctx, png[1000:1040], project, 10); err != nil || len(hits) != 0 {
-		t.Fatalf("search for a blob fragment: want 0 hits, got %d err=%v", len(hits), err)
+	if n := hits(png[1000:1040]); n != 0 {
+		t.Fatalf("search for a blob fragment: want 0 hits, got %d", n)
 	}
-	// The payload keeps custody of the whole thing.
 	ev, err := store.GetEvent(ctx, res.ID)
-	if err != nil || !strings.Contains(string(ev.Payload), png[:64]) {
-		t.Fatalf("payload custody lost: err=%v", err)
+	if err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+	var got, want any
+	if json.Unmarshal(ev.Payload, &got) != nil || json.Unmarshal(payload, &want) != nil || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("payload custody: stored payload differs from the ingested one")
 	}
 
 	// 2. Client-supplied text with a NUL (the acpx_prompt failure) ingests.
-	nul := EventInput{
-		Project:         project,
-		SessionID:       "tb-session",
-		SourceAdapter:   "acpx",
-		SourceEventID:   "tb-evt-nul",
-		EventType:       "acpx_prompt",
-		OccurredAtEpoch: now - 40,
-		Text:            "before\x00after wallaby-marker",
-		Payload:         json.RawMessage(`{"k":"v"}`),
-	}
-	if _, err := store.Ingest(ctx, nul); err != nil {
-		t.Fatalf("ingest text with NUL: %v", err)
-	}
-	if hits, err := store.Search(ctx, "wallaby-marker", project, 10); err != nil || len(hits) != 1 {
-		t.Fatalf("search after NUL strip: hits=%d err=%v", len(hits), err)
+	ingest("tb-evt-nul", "acpx", "acpx_prompt", "before\x00after wallaby-marker", []byte(`{"k":"v"}`), 40)
+	if n := hits("wallaby-marker"); n != 1 {
+		t.Fatalf("search after NUL strip: want 1 hit, got %d", n)
 	}
 
-	// 3. Oversized prose is cut at the cap and still indexed.
+	// 3. Oversized prose is cut at the byte cap and still indexed.
 	prose := strings.Repeat("plain words of a very long transcript ", 20000) + "numbat-marker"
-	big := EventInput{
-		Project:         project,
-		SessionID:       "tb-session",
-		SourceAdapter:   "codex",
-		SourceEventID:   "tb-evt-prose",
-		EventType:       "codex_tool_result",
-		OccurredAtEpoch: now - 30,
-		Text:            prose,
-		Payload:         json.RawMessage(`{}`),
+	res = ingest("tb-evt-prose", "codex", "codex_tool_result", prose, []byte(`{}`), 30)
+	if text := storedText(res.ID); !strings.HasSuffix(text, searchTruncMarker) || len(text) > searchTextMaxBytes {
+		t.Fatalf("prose: want cut within the byte cap, got %d bytes", len(text))
 	}
-	res, err = store.Ingest(ctx, big)
-	if err != nil {
-		t.Fatalf("ingest oversized prose: %v", err)
+	if n := hits("transcript"); n != 1 {
+		t.Fatalf("search in truncated prose: want 1 hit, got %d", n)
 	}
-	if err := store.rdb.QueryRow(`SELECT text FROM observations WHERE event_id = ?`, res.ID).Scan(&text); err != nil {
-		t.Fatalf("prose text: %v", err)
+
+	// 4. Token-dense text: 52,428 distinct hyphenated compounds "aaaa-xxxx"
+	// (the reviewer's tsvector counterexample: ~1.15 MB of lexemes from 512 KiB
+	// of text, every run far below the blob threshold). The unit cap cuts it
+	// and Postgres accepts the generated tsvector.
+	var sb strings.Builder
+	for i := 0; i < 52428; i++ {
+		n := i
+		var suffix [4]byte
+		for k := 3; k >= 0; k-- {
+			suffix[k] = byte('a' + n%26)
+			n /= 26
+		}
+		sb.WriteString("aaaa-")
+		sb.Write(suffix[:])
+		sb.WriteByte(' ')
 	}
-	if !strings.HasSuffix(text, " [truncated]") || len(text) > searchTextMaxBytes+len(" [truncated]") {
-		t.Fatalf("prose: want truncated at the cap, got %d bytes", len(text))
+	res = ingest("tb-evt-dense", "codex", "codex_tool_result", sb.String(), []byte(`{}`), 20)
+	if text := storedText(res.ID); !strings.HasSuffix(text, searchTruncMarker) || len(text) > searchTextMaxBytes {
+		t.Fatalf("dense: want a cut within the caps, got %d bytes", len(text))
 	}
-	if hits, err := store.Search(ctx, "transcript", project, 10); err != nil || len(hits) != 1 {
-		t.Fatalf("search in truncated prose: hits=%d err=%v", len(hits), err)
+	if n := hits("aaaa-aaab"); n != 1 {
+		t.Fatalf("search for an early dense compound: want 1 hit, got %d", n)
 	}
 }
