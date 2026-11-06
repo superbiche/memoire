@@ -37,19 +37,18 @@ func TestBoundSearchTextPure(t *testing.T) {
 		{"long hex dump kept (no upper case)", hexdump, hexdump},
 		{"long word path kept (no digits)", wordpath, wordpath},
 		{"long hyphenated identifier kept", longid, longid},
-		{"url tail with digits and case kept (not delimited)", "see https://example.test/" + strings.Repeat("Project42/reports/", 20) + " now", "see https://example.test/" + strings.Repeat("Project42/reports/", 20) + " now"},
-		{"low-entropy mixed run kept", "x " + strings.Repeat("QUJDabc1", 30) + " y", "x " + strings.Repeat("QUJDabc1", 30) + " y"},
-		{"blob at start of text", blob + " tail", "[blob 240 chars] tail"},
-		{"blob after a quote keeps the quote", `{"b":"` + blob + `"}`, `{"b":"[blob 240 chars]"}`},
-		{"run glued to a URL (preceded by '.') is kept", "see host.example/" + blob + " now", "see host.example/" + blob + " now"},
+		{"url tail with digits and case kept", "see https://example.test/" + strings.Repeat("Project42/reports/", 20) + " now", "see https://example.test/" + strings.Repeat("Project42/reports/", 20) + " now"},
+		{"vocabulary path with high character diversity kept", "Application/Build/Controller/Database/Event/Factory/Gateway/Handler/Identity/Json/Kernel/Logger/Middleware/Network/Observer/Project/Queue/Repository/Service/Template/User/Validator/Worker/Xml/Yaml/Zip/Version1234567890", "Application/Build/Controller/Database/Event/Factory/Gateway/Handler/Identity/Json/Kernel/Logger/Middleware/Network/Observer/Project/Queue/Repository/Service/Template/User/Validator/Worker/Xml/Yaml/Zip/Version1234567890"},
+		{"bare base64 run without a data: prefix is plain text", "x " + blob + " y", "x " + blob + " y"},
+		{"data url inside json", `{"b":"data:application/octet-stream;base64,` + blob + `"}`, `{"b":"[blob 277 chars]"}`},
+		{"two data urls", "data:image/png;base64," + blob + "." + "data:image/png;base64," + blob, "[blob 262 chars].[blob 262 chars]"},
 		{"data url is a blob", `{"image_url":"data:image/png;base64,` + blob + `"}`, `{"image_url":"[blob 262 chars]"}`},
 		{"data url with parameters is one blob", "data:image/png;charset=utf-8;base64," + blob, "[blob 276 chars]"},
-		{"bare base64 run is a blob", "x " + blob + " y", "x [blob 240 chars] y"},
 		{"nul dropped", "a\x00b", "ab"},
 		{"invalid utf8 replaced", "a\xffb", "a�b"},
 		// Composition: NUL inside a would-be blob is normalized first, so the
 		// first call already sees (and replaces) the run the second would.
-		{"nul inside a blob run", blob[:120] + "\x00" + blob[120:], "[blob 240 chars]"},
+		{"nul inside a data url body", "data:image/png;base64," + blob[:120] + "\x00" + blob[120:], "[blob 262 chars]"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
