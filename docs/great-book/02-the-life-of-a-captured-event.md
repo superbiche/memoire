@@ -59,7 +59,13 @@ refused and nothing reaches the queue, rather than being written unredacted. Cha
 What lands is an **event**, and the event shape is generic on purpose. An
 envelope must carry a schema version of 1, a project, a session id, a source
 adapter, an event type and a `payload`; it may carry an occurred-at time, a
-`text` field that is search-visible, and metadata. A Claude Code tool call keeps
+`text` field that is search-visible, and metadata. Search-visible is a
+projection with bounds, not a copy: NUL is dropped and invalid UTF-8 becomes
+U+FFFD; an inline base64 `data:` URL whose body is at least two hundred
+characters (a screenshot pasted into a tool result) becomes `[blob N chars]`,
+prefix included in the count; and text past 96 KiB or 20,000 letter/digit runs
+(a hyphenated compound counts its parts) is cut and marked `[truncated]` — the
+payload keeps the whole thing. A Claude Code tool call keeps
 its `tool_name` and `tool_input` inside `payload`, where they belong, rather
 than as columns that would make one harness's vocabulary into everyone's
 schema.

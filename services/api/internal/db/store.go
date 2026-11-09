@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"memoire/services/api/internal/authctx"
 	"memoire/services/api/internal/contenthash"
@@ -2148,10 +2150,7 @@ func (s *Store) Ingest(ctx context.Context, in EventInput) (IngestResult, error)
 			in.RequestID = auth.RequestID
 		}
 	}
-	text := in.Text
-	if text == "" {
-		text = projectText(in, payload)
-	}
+	text := IngestText(in, payload)
 	key := in.IdempotencyKey(payload)
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -4884,10 +4883,123 @@ func SanitizeFTS(q string) string {
 // exported for the pgshadow replay lane (slice-5 groundwork, D157): the
 // Postgres replay must project text identically or parity hashes diverge.
 func IngestText(in EventInput, payload json.RawMessage) string {
-	if in.Text != "" {
-		return in.Text
+	if text := BoundSearchText(in.Text); text != "" {
+		return text
 	}
-	return projectText(in, payload)
+	return BoundSearchText(projectText(in, payload))
+}
+
+// Search-visible text bounds. The text column is a projection for search; the
+// event's custody is the payload, which these bounds never touch. Postgres
+// caps a tsvector at 1,048,575 bytes and the generated observations.text_tsv
+// column is computed from text, so an unbounded projection fails the whole
+// ingest: 85 hub events (codex_tool_result rows carrying an inline
+// data:image/png;base64 screenshot of 1 to 7.6 MB) sat in queue/failed/ on
+// 2026-11-06. Postgres text also refuses NUL and invalid UTF-8.
+//
+// Order matters for idempotence: normalize first (NUL dropped, invalid UTF-8
+// replaced by U+FFFD), then blobs, then the cut. Each step's output is a fixed
+// point of itself and of the steps before it, so BoundSearchText(x) ==
+// BoundSearchText(BoundSearchText(x)): a replay that re-projects an already
+// bounded text (pgshadow) changes nothing.
+//
+//   - A blob is the body of a data: URL — "data:<type>[;param…];base64," followed
+//     by searchBlobMinRun (200) or more standard-base64 characters. It carries
+//     no searchable word and becomes "[blob N chars]" (N counts the matched
+//     characters, prefix included). Nothing else is classified: no heuristic
+//     on bare runs, so a path, an identifier listing, a hash, a hex dump or
+//     minified code is never mistaken for binary (review 2026-11-06, r3). A
+//     bare encoded attachment without the data: prefix is simply text and
+//     falls under the cut like any other oversized text.
+//   - The cut keeps at most searchTextMaxBytes (96 KiB) of text and at most
+//     searchTextMaxUnits (20,000) letter/digit runs, marker included, on a
+//     rune boundary, and appends " [truncated]". Whenever either cap requires
+//     a cut, the marker's own run is reserved, so the result is a fixed
+//     point. The unit cap is what bounds the tsvector: the 'simple'
+//     configuration emits at most two lexemes per run (a hyphenated compound
+//     and its parts, a URL and its host/path), lexeme strings are lower-cased
+//     substrings and Unicode lower-casing can grow a character by 5/2 at most
+//     (SpecialCasing: U+00CC -> i U+0307 U+0300, 2 -> 5 bytes, under any
+//     provider or locale), so the strings total at most 2 * 5/2 * bytes, and
+//     each lexeme costs a 4-byte WordEntry, a 2-byte position count, one
+//     2-byte position per occurrence (256 at most) and up to 3 bytes of
+//     alignment (src/include/tsearch/ts_type.h). Worst case:
+//     5*98,304 + 2*20,000*(4+2+3) + 2*20,000*2 = 931,520 < 1,048,575, for any
+//     locale. Token-dense text (an identifier listing, minified code) hits
+//     the unit cap first; prose hits the byte cap at about 15,000 words.
+//
+// SQLite and Postgres share this projection through IngestText, so the
+// pgshadow parity hashes are unaffected by the engine.
+const (
+	searchTextMaxBytes = 96 << 10
+	searchTextMaxUnits = 20000
+	searchBlobMinRun   = 200
+	searchTruncMarker  = " [truncated]"
+)
+
+var blobRunRE = regexp.MustCompile(fmt.Sprintf(`data:[A-Za-z0-9.+/-]+(?:;[A-Za-z0-9=.+-]+)*;base64,[A-Za-z0-9+/=]{%d,}`, searchBlobMinRun))
+
+// BoundSearchText applies the search-visible text bounds above. It is
+// idempotent and returns "" for "".
+func BoundSearchText(text string) string {
+	if text == "" {
+		return text
+	}
+	if strings.IndexByte(text, 0) >= 0 {
+		text = strings.ReplaceAll(text, "\x00", "")
+	}
+	if !utf8.ValidString(text) {
+		text = strings.ToValidUTF8(text, "\uFFFD")
+	}
+	text = blobRunRE.ReplaceAllStringFunc(text, func(m string) string {
+		return fmt.Sprintf("[blob %d chars]", len(m))
+	})
+	if cut, ok := searchTextCut(text); ok {
+		text = text[:cut] + searchTruncMarker
+	}
+	return text
+}
+
+// searchTextCut returns the byte offset at which text must be cut so that
+// text[:cut]+searchTruncMarker holds at most searchTextMaxBytes bytes and at
+// most searchTextMaxUnits letter/digit runs (the marker's run included), and
+// whether a cut is needed. The offset is a rune boundary. Text within both
+// caps returns ok=false.
+func searchTextCut(text string) (int, bool) {
+	byteCap := searchTextMaxBytes - len(searchTruncMarker)
+	// capStart is where run number searchTextMaxUnits begins: any cut lands
+	// at or before it, so that the marker brings the result to at most the
+	// unit cap and a second pass finds nothing to do. overUnits says the
+	// text itself exceeds the cap.
+	units, inUnit, capStart, overUnits := 0, false, -1, false
+	for i, r := range text {
+		isUnit := unicode.IsLetter(r) || unicode.IsDigit(r)
+		if isUnit && !inUnit {
+			units++
+			if units == searchTextMaxUnits {
+				capStart = i
+			}
+			if units > searchTextMaxUnits {
+				overUnits = true
+				break
+			}
+		}
+		inUnit = isUnit
+	}
+	if !overUnits && len(text) <= searchTextMaxBytes {
+		return 0, false
+	}
+	cut := byteCap
+	if capStart >= 0 && capStart < cut {
+		cut = capStart
+	}
+	if cut > len(text) {
+		cut = len(text)
+	}
+	for cut > 0 && cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return cut, true
 }
 
 func projectText(in EventInput, payload json.RawMessage) string {
