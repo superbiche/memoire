@@ -28,7 +28,7 @@ sig = "9d25798cb8671afa"
 [[bindings]]
 doc = "docs/ARCHITECTURE.md"
 target = "scripts/memoire-capture-claude.sh"
-sig = "0f87afcc1dd81e3d"
+sig = "bdae05cfa00f5bd2"
 
 [[bindings]]
 doc = "docs/ARCHITECTURE.md"

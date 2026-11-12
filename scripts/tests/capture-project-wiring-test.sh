@@ -27,12 +27,19 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# Stub queue bin: echo the -project value the adapter resolved.
+# Stub queue bin: echo the -project value the adapter resolved, and record the
+# call. The CC hook keeps the writer's stdout out of the hook's stdout (it is
+# model context there), so its cases read the record instead.
 STUB="$TMP/memoire-queue"
+STUB_CALLS="$TMP/stub-calls"
+export STUB_CALLS
 cat > "$STUB" <<'STUBEOF'
 #!/usr/bin/env bash
 while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-project" ]]; then printf 'PROJECT=%s\n' "${2:-}"; fi
+  if [[ "$1" == "-project" ]]; then
+    printf 'PROJECT=%s\n' "${2:-}"
+    printf 'PROJECT=%s\n' "${2:-}" >> "$STUB_CALLS"
+  fi
   shift
 done
 exit 0
@@ -54,6 +61,16 @@ export MEMOIRE_PROJECTS_REGISTRY="$REG"
 unset MEMOIRE_PROJECT
 
 proj_of() { sed -n 's/^PROJECT=//p' <<<"$1" | head -1; }
+
+# CC hook cases: run the hook on a payload, return what the stub recorded and
+# fail if the hook printed anything.
+claude_calls() {
+  local payload="$1" out
+  : > "$STUB_CALLS"
+  out="$(printf '%s' "$payload" | "$CLAUDE_SCRIPT" 2>/dev/null)"
+  [[ -z "$out" ]] || fail "claude: hook stdout must stay empty, got '$out'"
+  cat "$STUB_CALLS"
+}
 
 # --- memoire-capture-text.sh --------------------------------------------------
 # Registry hit: CWD_VALUE (=MEMOIRE_CWD) resolves through the registry.
@@ -83,18 +100,15 @@ out="$(MEMOIRE_CWD=/home/user/projfoo "$QWEN_SCRIPT" --text hi 2>/dev/null)"
 
 # --- memoire-capture-claude.sh (CC hook) --------------------------------------
 # The hook resolves from the payload .cwd (session home).
-out="$(printf '{"cwd":"/home/user/projfoo","hook_event_name":"PostToolUse","session_id":"s1"}' \
-  | "$CLAUDE_SCRIPT" 2>/dev/null)"
+out="$(claude_calls '{"cwd":"/home/user/projfoo","hook_event_name":"PostToolUse","session_id":"s1"}')"
 [[ "$(proj_of "$out")" == "client-projfoo" ]] \
   || fail "claude: registry hit expected client-projfoo, got '$(proj_of "$out")'"
 
-out="$(printf '{"cwd":"/home/user/otherproj","hook_event_name":"PostToolUse","session_id":"s1"}' \
-  | "$CLAUDE_SCRIPT" 2>/dev/null)"
+out="$(claude_calls '{"cwd":"/home/user/otherproj","hook_event_name":"PostToolUse","session_id":"s1"}')"
 [[ "$(proj_of "$out")" == "otherproj" ]] \
   || fail "claude: unmapped dir must fail-open to basename, got '$(proj_of "$out")'"
 
-out="$(printf '{"cwd":"/home/user/projfoo","hook_event_name":"PostToolUse","session_id":"s1"}' \
-  | MEMOIRE_PROJECT=forced "$CLAUDE_SCRIPT" 2>/dev/null)"
+out="$(MEMOIRE_PROJECT=forced claude_calls '{"cwd":"/home/user/projfoo","hook_event_name":"PostToolUse","session_id":"s1"}')"
 [[ "$(proj_of "$out")" == "forced" ]] \
   || fail "claude: MEMOIRE_PROJECT override must win, got '$(proj_of "$out")'"
 
@@ -112,8 +126,8 @@ out="$(MEMOIRE_CAPTURE=off MEMOIRE_CWD=/home/user/projfoo "$TEXT_SCRIPT" --text 
 out="$(MEMOIRE_CAPTURE=off MEMOIRE_RESOLVE_PROJECT=/no/such/resolver.sh \
   MEMOIRE_CWD=/home/user/projfoo "$TEXT_SCRIPT" --text hi 2>/dev/null)"
 [[ -z "$out" ]] || fail "text: MEMOIRE_CAPTURE=off must gate even without resolver, got '$out'"
-out="$(printf '{"cwd":"/home/user/projfoo","hook_event_name":"PostToolUse","session_id":"s1"}' \
-  | MEMOIRE_CAPTURE=off MEMOIRE_CLAUDE_HOOK_LOG="$TMP/hook.log" "$CLAUDE_SCRIPT" 2>/dev/null)"
+out="$(MEMOIRE_CAPTURE=off MEMOIRE_CLAUDE_HOOK_LOG="$TMP/hook.log" \
+  claude_calls '{"cwd":"/home/user/projfoo","hook_event_name":"PostToolUse","session_id":"s1"}')"
 [[ -z "$out" ]] || fail "claude: MEMOIRE_CAPTURE=off must capture nothing, got '$out'"
 
 # Repo-level: capture: false in the nearest .memoire gates via the resolver,
@@ -127,8 +141,8 @@ out="$(MEMOIRE_CWD="$KOFF/sub" "$TEXT_SCRIPT" --text hi 2>/dev/null)"
 [[ -z "$out" ]] || fail "text: .memoire capture:false must gate from subdir, got '$out'"
 out="$(MEMOIRE_PROJECT=forced MEMOIRE_CWD="$KOFF" "$TEXT_SCRIPT" --text hi 2>/dev/null)"
 [[ -z "$out" ]] || fail "text: MEMOIRE_PROJECT must not bypass capture:false, got '$out'"
-out="$(printf '{"cwd":"%s","hook_event_name":"PostToolUse","session_id":"s1"}' "$KOFF" \
-  | MEMOIRE_CLAUDE_HOOK_LOG="$TMP/hook.log" "$CLAUDE_SCRIPT" 2>/dev/null)"
+out="$(MEMOIRE_CLAUDE_HOOK_LOG="$TMP/hook.log" \
+  claude_calls "$(printf '{"cwd":"%s","hook_event_name":"PostToolUse","session_id":"s1"}' "$KOFF")")"
 [[ -z "$out" ]] || fail "claude: .memoire capture:false must capture nothing, got '$out'"
 
 # A .memoire WITHOUT capture: false must not gate — and its project: key wins.
