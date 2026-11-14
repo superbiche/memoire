@@ -127,6 +127,35 @@ for (const mode of ["fail", "empty", "hang"]) {
 }
 setMode("inject", "ok");
 
+// --- new sessions: setup entries are real; cursor location ---------------------
+{
+  clearBatches();
+  const pi = makePi(); memoire(pi);
+  const entries = [
+    { type: "model_change", id: "setup1", parentId: null, timestamp: ts, provider: "conductor", modelId: "coder" },
+    { type: "thinking_level_change", id: "setup2", parentId: "setup1", timestamp: ts, thinkingLevel: "medium" },
+  ];
+  const ctx = makeCtx("s-new", entries);
+  await fire(pi, "session_start", { type: "session_start", reason: "startup" }, ctx);
+  entries.push(msg("sys9", { role: "system", content: "x", sections: {}, timestamp: 1 }), user("u9", "hi"));
+  await settle(pi, ctx);
+  const ids = readBatches().flat().filter((e) => e.event_type === "pi_entry").map((e) => e.source_event_id.split(":").pop());
+  check(JSON.stringify(ids) === JSON.stringify(["setup1", "setup2", "sys9", "u9"]), `new session: setup entries present at start are captured (${ids})`);
+  check(fs.existsSync(path.join(home, "capture-cursors", "pi", "s-new.json")), "cursor: written under capture-cursors/pi");
+  check(!fs.existsSync(path.join(home, "pi-capture", "s-new.json")), "cursor: nothing written at the old place");
+  // a cursor left at the old place is still honoured: its settled ids are not queued again
+  fs.mkdirSync(path.join(home, "pi-capture"), { recursive: true });
+  fs.writeFileSync(path.join(home, "pi-capture", "s-legacy.json"), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["l1"] }));
+  clearBatches();
+  const pi2 = makePi(); memoire(pi2);
+  const legacy = [user("l1", "queued by an older extension"), user("l2", "new")];
+  const lctx = makeCtx("s-legacy", legacy);
+  await fire(pi2, "session_start", { type: "session_start", reason: "resume" }, lctx);
+  await settle(pi2, lctx);
+  const got = readBatches().flat().filter((e) => e.event_type === "pi_entry").map((e) => e.source_event_id.split(":").pop());
+  check(JSON.stringify(got) === JSON.stringify(["l2"]), `legacy cursor: only the unsettled entry is queued (${got})`);
+}
+
 // --- capture -----------------------------------------------------------------
 {
   clearBatches();
@@ -149,9 +178,9 @@ setMode("inject", "ok");
   await settle(pi, ctx);
   const all = readBatches().flat();
   const ids = all.map((e) => e.source_event_id);
-  check(!ids.some((id) => id.endsWith(":old1")), "capture: entries present at session start are not queued");
+  check(ids.some((id) => id.endsWith(":old1")), "capture: history present at session start without a cursor is replayed, not assumed captured");
   const entryIds = all.filter((e) => e.event_type === "pi_entry").map((e) => e.source_event_id.split(":").pop());
-  check(JSON.stringify(entryIds) === JSON.stringify(["sys1", "u1", "a1", "r1", "a2", "a3", "a4", "mc1"]), `capture: one pi_entry per new entry in order (${entryIds})`);
+  check(JSON.stringify(entryIds) === JSON.stringify(["old1", "sys1", "u1", "a1", "r1", "a2", "a3", "a4", "mc1"]), `capture: one pi_entry per entry in order (${entryIds})`);
   const turns = all.filter((e) => e.event_type === "pi_assistant_turn");
   check(JSON.stringify(turns.map((t) => t.source_event_id)) === JSON.stringify(["pi:turn:s-cap:a1", "pi:turn:s-cap:a2"]), `capture: turns for normal ends with text only (${turns.map((t) => t.source_event_id)})`);
   check(turns[1]?.text === "Done.\n\nTwo files.", "capture: turn text joins non-blank text parts with a blank line");
@@ -209,13 +238,113 @@ setMode("inject", "ok");
   await fire(pi, "session_start", { type: "session_start", reason: "resume" }, ctx);
   await settle(pi, ctx);
   const got = readBatches().flat().filter((e) => e.event_type === "pi_entry");
-  check(JSON.stringify(got.map((e) => e.source_event_id.split(":").pop())) === JSON.stringify(["cp1", "u9"]),
-    `restart: entries missed before the restart are queued, pre-extension history is not (${got.map((e) => e.source_event_id)})`);
+  check(JSON.stringify(got.map((e) => e.source_event_id.split(":").pop())) === JSON.stringify(["pre1", "cp1", "u9"]),
+    `restart: entries missed before the restart are queued, and so is history that has no cursor (${got.map((e) => e.source_event_id)})`);
   const cp = got.find((e) => e.source_event_id.endsWith(":cp1"))?.payload.entry.systemMessage;
   check(cp && !("memoire" in cp.sections) && cp.sections.memoire_omitted === true && !cp.content.includes("obs é日本"),
     "compaction: the checkpoint's systemMessage loses the memoire section and the injected text");
-  const cursor = JSON.parse(fs.readFileSync(path.join(home, "pi-capture", `${sid}.json`), "utf8"));
+  const cursor = JSON.parse(fs.readFileSync(path.join(home, "capture-cursors", "pi", `${sid}.json`), "utf8"));
   check(JSON.stringify(cursor.settled.sort()) === JSON.stringify(["cp1", "pre1", "u9"]), `cursor: lists the settled ids (${cursor.settled})`);
+}
+
+// --- delivery never claimed without a write (fix round 1) ----------------------
+{
+  const cursorFile = (sid) => path.join(home, "capture-cursors", "pi", `${sid}.json`);
+  const legacyFile = (sid) => path.join(home, "pi-capture", `${sid}.json`);
+  const queued = () => readBatches().flat().filter((e) => e.event_type === "pi_entry").map((e) => e.source_event_id.split(":").pop());
+  const run = async (sid, entries, reason = "resume") => {
+    const pi = makePi(); memoire(pi);
+    const ctx = makeCtx(sid, entries);
+    await fire(pi, "session_start", { type: "session_start", reason }, ctx);
+    await settle(pi, ctx);
+  };
+
+  // failed delivery, then a lost cursor, then a resume: every entry ends in the queue
+  {
+    clearBatches();
+    const sid = "s-lost";
+    const entries = [user("e1", "one"), assistant("e2", [{ type: "text", text: "two" }]), user("e3", "three")];
+    setMode("queue", "fail");
+    await run(sid, entries, "startup");
+    check(queued().length === 0, "lost cursor: the failed write queued nothing");
+    const afterFail = fs.existsSync(cursorFile(sid)) ? JSON.parse(fs.readFileSync(cursorFile(sid), "utf8")) : { settled: [] };
+    check(afterFail.settled.length === 0, `lost cursor: a failed write settled nothing (${afterFail.settled})`);
+    fs.rmSync(cursorFile(sid), { force: true });           // the cursor is lost
+    setMode("queue", "ok");
+    await run(sid, entries);
+    check(JSON.stringify(queued()) === JSON.stringify(["e1", "e2", "e3"]), `lost cursor: every undelivered entry is finally queued (${queued()})`);
+    check(JSON.parse(fs.readFileSync(cursorFile(sid), "utf8")).settled.length === 3, "lost cursor: settled only after the successful write");
+    // delivered, cursor lost again, resume: replayed once more (the hub's keys absorb it), never lost
+    clearBatches();
+    fs.rmSync(cursorFile(sid), { force: true });
+    await run(sid, entries);
+    check(JSON.stringify(queued()) === JSON.stringify(["e1", "e2", "e3"]), `lost cursor after delivery: replayed once per attempt (${queued()})`);
+    clearBatches();
+    await run(sid, entries);
+    check(queued().length === 0, "cursor intact: nothing is queued twice");
+  }
+
+  // legacy cursor present, new cursor absent: honoured and migrated
+  {
+    clearBatches();
+    const sid = "s-legacy-only";
+    fs.mkdirSync(path.dirname(legacyFile(sid)), { recursive: true });
+    fs.writeFileSync(legacyFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a"] }));
+    await run(sid, [user("a", "x"), user("b", "y")]);
+    check(JSON.stringify(queued()) === JSON.stringify(["b"]), `legacy only: its settled entry is not replayed (${queued()})`);
+    check(JSON.parse(fs.readFileSync(cursorFile(sid), "utf8")).settled.sort().join() === "a,b", "legacy only: migrated to the current cursor");
+  }
+
+  // both present and disagreeing: only what both settled counts
+  {
+    clearBatches();
+    const sid = "s-disagree";
+    fs.mkdirSync(path.dirname(legacyFile(sid)), { recursive: true });
+    fs.mkdirSync(path.dirname(cursorFile(sid)), { recursive: true });
+    fs.writeFileSync(legacyFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a"] }));
+    fs.writeFileSync(cursorFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a", "b"], excluded: [] }));
+    await run(sid, [user("a", "x"), user("b", "y"), user("c", "z")]);
+    check(JSON.stringify(queued()) === JSON.stringify(["b", "c"]), `disagreeing cursors: the smaller settled set wins, b is replayed (${queued()})`);
+  }
+
+  // exclusions resolve by union across two cursors: a newer exclusion survives an older legacy cursor
+  {
+    clearBatches();
+    const sid = "s-excl-union";
+    fs.mkdirSync(path.dirname(legacyFile(sid)), { recursive: true });
+    fs.mkdirSync(path.dirname(cursorFile(sid)), { recursive: true });
+    fs.writeFileSync(legacyFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a"], excluded: [] }));
+    fs.writeFileSync(cursorFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a"], excluded: ["x"] }));
+    await run(sid, [user("a", "x"), user("x", "private"), user("c", "z")]);
+    check(JSON.stringify(queued()) === JSON.stringify(["c"]), `exclusion union: the newer exclusion survives the older cursor (${queued()})`);
+    const c = JSON.parse(fs.readFileSync(cursorFile(sid), "utf8"));
+    check(c.excluded.includes("x") && !c.settled.includes("x"), "exclusion union: still recorded as excluded, never as settled");
+    // and the other direction: the legacy cursor holds the exclusion
+    clearBatches();
+    const sid2 = "s-excl-union-2";
+    fs.writeFileSync(legacyFile(sid2), JSON.stringify({ schema: "pi-capture-cursor/1", settled: [], excluded: ["x"] }));
+    fs.writeFileSync(cursorFile(sid2), JSON.stringify({ schema: "pi-capture-cursor/1", settled: [], excluded: [] }));
+    await run(sid2, [user("x", "private"), user("c", "z")]);
+    check(JSON.stringify(queued()) === JSON.stringify(["c"]), `exclusion union: an exclusion only the legacy cursor holds also stays (${queued()})`);
+  }
+
+  // an exclusion is its own explicit rule: recorded apart, not delivered, and evaluated again after a cursor loss
+  {
+    clearBatches();
+    const sid = "s-excluded";
+    const entries = [user("x1", "private")];
+    setMode("resolve", "off");
+    await run(sid, entries, "startup");
+    const c = JSON.parse(fs.readFileSync(cursorFile(sid), "utf8"));
+    check(c.settled.length === 0 && c.excluded.join() === "x1", `exclusion: recorded as excluded, not as settled (${JSON.stringify(c)})`);
+    setMode("resolve", "on");
+    await run(sid, entries);
+    check(queued().length === 0, "exclusion: not queued later while the cursor lives, even with capture back on");
+    fs.rmSync(cursorFile(sid), { force: true });
+    await run(sid, entries);
+    check(JSON.stringify(queued()) === JSON.stringify(["x1"]), "exclusion: with the cursor lost the rule is evaluated again at replay time");
+  }
+  setMode("resolve", "on");
 }
 
 // --- resume matrix: each case is two processes on one session ---------------

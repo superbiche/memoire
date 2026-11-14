@@ -64,7 +64,16 @@
         "lane": "extension",
         "surface": "~/.pi/agent/extensions/memoire.js",
         "source": "scripts/pi-extension/memoire.js",
-        "doc": "the extension queues entries on agent_settled"
+        "doc": "the extension queues entries on agent_settled",
+        "sweep": {
+          "enable_env": "MEMOIRE_CAPTURE_PI",
+          "timer": "memoire-capture-pi-tick.timer",
+          "scripts": [
+            "scripts/memoire-capture-pi.mjs",
+            "scripts/memoire-capture-pi-tick.sh"
+          ],
+          "doc": "host-side sweep of Pi session files (agent sessions, the Conclave seat's store, caged workers' run directories) sharing the extension's cursor and keys; catches what the extension cannot see or reach"
+        }
       },
       "acpx": "boundaries"
     },

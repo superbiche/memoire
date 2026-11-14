@@ -29,6 +29,16 @@ maintainer workflow and the private decision ledger.
 - Decision references such as `D97` or `L0010` cite the maintainers' private ledger. Treat them as citations, not
   links, and restate in the public document whatever a reader needs.
 
+## Deployment
+
+- Generated configuration refuses missing required values; installed artifacts are not its only source.
+- A schema-writing artifact applies its migrations or refuses startup.
+- Scheduled lanes run released artifacts or tagged-commit binaries.
+- Compute lane success from executed-leg statuses, not process exit alone.
+- Push a warning when transport backlog age exceeds its threshold.
+- Deployment manifests pin images by immutable commit identity.
+- Check manifest-cluster parity before deploy and after apply.
+
 ## Verification
 
 For code changes:
