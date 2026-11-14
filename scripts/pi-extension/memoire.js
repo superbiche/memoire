@@ -54,6 +54,10 @@
 // MEMOIRE_CAPTURE is off|0|false or the resolver reports the cwd's project as
 // capture-disabled (`--capture-enabled` prints "off").
 //
+// What this extension cannot see or reach (a Conclave seat, a caged worker, a session whose cursor
+// and queue write both failed) is captured from the session files by the host-side sweep,
+// scripts/memoire-capture-pi.mjs, which shares this cursor and these keys.
+//
 // Overrides: MEMOIRE_INJECT_SCRIPT, MEMOIRE_RESOLVE_PROJECT, MEMOIRE_QUEUE_BIN,
 // MEMOIRE_INJECT_WRAPPER_TIMEOUT (seconds, positive integer, default 10),
 // MEMOIRE_HOME (log under hooks/pi-capture.log).
@@ -74,7 +78,7 @@ const deadlineSeconds = () => {
   const v = String(process.env.MEMOIRE_INJECT_WRAPPER_TIMEOUT ?? "");
   return /^[1-9][0-9]{0,8}$/.test(v) ? Number(v) : 10;
 };
-const captureOff = () => /^(off|0|false)$/.test(String(process.env.MEMOIRE_CAPTURE ?? ""));
+export const captureOff = () => /^(off|0|false)$/.test(String(process.env.MEMOIRE_CAPTURE ?? ""));
 const SHUTDOWN_WAIT_MS = 10000;
 const QUEUE_TIMEOUT_MS = 30000;
 const RESOLVER_TIMEOUT_MS = 3000;
@@ -122,7 +126,7 @@ async function injectorText(cwd) {
 
 // The resolver prints "off" for a capture-disabled project; its exit code does
 // not count. --verbose prints key<TAB>root<TAB>source.
-async function resolveProject(cwd) {
+export async function resolveProject(cwd) {
   const enabled = await run(resolverScript(), ["--capture-enabled", cwd], { timeoutMs: RESOLVER_TIMEOUT_MS });
   if (enabled.stdout.trim() === "off") return null;
   const r = await run(resolverScript(), ["--verbose", cwd], { timeoutMs: RESOLVER_TIMEOUT_MS });
@@ -180,7 +184,7 @@ function withoutOwnSection(entry, injectedText) {
 // mounts writable (the older pi-capture/ is not mounted: inside the sandbox its cursor
 // died with the session, 2026-11-14). A cursor left at the old place is still read.
 const safeId = (sessionId) => (/^[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : Buffer.from(sessionId).toString("hex").slice(0, 200));
-const cursorPath = (sessionId) => path.join(memoireHome(), "capture-cursors", "pi", `${safeId(sessionId)}.json`);
+export const cursorPath = (sessionId) => path.join(memoireHome(), "capture-cursors", "pi", `${safeId(sessionId)}.json`);
 const legacyCursorPath = (sessionId) => path.join(memoireHome(), "pi-capture", `${safeId(sessionId)}.json`);
 const idSet = (v) => new Set(Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
 const union = (a, b) => new Set([...a, ...b]);
@@ -198,13 +202,13 @@ function readCursorFile(file) {
 // because a replay is absorbed by the hub's idempotent keys, while trusting the larger set
 // could skip an entry that was never delivered); the excluded sets resolve by union (an
 // entry excluded once stays excluded, whichever cursor recorded it).
-function readCursor(sessionId) {
+export function readCursor(sessionId) {
   const current = readCursorFile(cursorPath(sessionId));
   const legacy = readCursorFile(legacyCursorPath(sessionId));
   if (current && legacy) return { settled: intersect(current.settled, legacy.settled), excluded: union(current.excluded, legacy.excluded) };
   return current ?? legacy;
 }
-function writeCursor(sessionId, settled, excluded) {
+export function writeCursor(sessionId, settled, excluded) {
   try {
     const file = cursorPath(sessionId);
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -254,7 +258,7 @@ export function buildEvents(entries, { sessionId, sessionFile, cwd, project, inj
   return events;
 }
 
-async function writeBatch(events) {
+export async function writeBatch(events) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "memoire-pi."));
   const file = path.join(dir, "batch.jsonl");
   try {
@@ -312,6 +316,10 @@ export default function memoire(pi) {
   const settle = (entries, sid, delivered) => {
     if (sid !== sessionId) return; // the session changed while the batch ran
     for (const e of entries) (delivered ? settled : excluded).add(e.id);
+    // The host-side sweep (memoire-capture-pi.mjs) shares this cursor: keep what it settled
+    // meanwhile rather than overwrite it (a lost update would only cause an idempotent replay).
+    const onDisk = readCursorFile(cursorPath(sid));
+    if (onDisk) { for (const id of onDisk.settled) settled.add(id); for (const id of onDisk.excluded) excluded.add(id); }
     writeCursor(sid, settled, excluded);
   };
 
