@@ -47,7 +47,8 @@
 // is absorbed and an undelivered one is finally captured; a lost cursor costs a replay,
 // never a loss. The capture switches are evaluated again at replay time. When two cursors
 // exist (the current one and the older pi-capture/ one) and disagree, only what both
-// settled counts: the smaller set replays more, and a replay is harmless.
+// settled counts (the smaller set replays more, and a replay is harmless) while an entry
+// either cursor excluded stays excluded.
 // session_shutdown waits (bounded) for writes in flight. Redaction
 // stays at the queue-write gate (MEMOIRE_REDACT). Capture is skipped when
 // MEMOIRE_CAPTURE is off|0|false or the resolver reports the cwd's project as
@@ -182,6 +183,7 @@ const safeId = (sessionId) => (/^[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessio
 const cursorPath = (sessionId) => path.join(memoireHome(), "capture-cursors", "pi", `${safeId(sessionId)}.json`);
 const legacyCursorPath = (sessionId) => path.join(memoireHome(), "pi-capture", `${safeId(sessionId)}.json`);
 const idSet = (v) => new Set(Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+const union = (a, b) => new Set([...a, ...b]);
 const intersect = (a, b) => new Set([...a].filter((x) => b.has(x)));
 function readCursorFile(file) {
   try {
@@ -192,13 +194,14 @@ function readCursorFile(file) {
     return null; // absent or malformed
   }
 }
-// Both cursors present and disagreeing: the intersection (see the header: safe because a
-// replay is absorbed by the hub's idempotent keys, while trusting the larger set could
-// skip an entry that was never delivered).
+// Both cursors present and disagreeing: the settled sets resolve by intersection (safe
+// because a replay is absorbed by the hub's idempotent keys, while trusting the larger set
+// could skip an entry that was never delivered); the excluded sets resolve by union (an
+// entry excluded once stays excluded, whichever cursor recorded it).
 function readCursor(sessionId) {
   const current = readCursorFile(cursorPath(sessionId));
   const legacy = readCursorFile(legacyCursorPath(sessionId));
-  if (current && legacy) return { settled: intersect(current.settled, legacy.settled), excluded: intersect(current.excluded, legacy.excluded) };
+  if (current && legacy) return { settled: intersect(current.settled, legacy.settled), excluded: union(current.excluded, legacy.excluded) };
   return current ?? legacy;
 }
 function writeCursor(sessionId, settled, excluded) {

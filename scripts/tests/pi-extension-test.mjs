@@ -307,6 +307,27 @@ setMode("inject", "ok");
     check(JSON.stringify(queued()) === JSON.stringify(["b", "c"]), `disagreeing cursors: the smaller settled set wins, b is replayed (${queued()})`);
   }
 
+  // exclusions resolve by union across two cursors: a newer exclusion survives an older legacy cursor
+  {
+    clearBatches();
+    const sid = "s-excl-union";
+    fs.mkdirSync(path.dirname(legacyFile(sid)), { recursive: true });
+    fs.mkdirSync(path.dirname(cursorFile(sid)), { recursive: true });
+    fs.writeFileSync(legacyFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a"], excluded: [] }));
+    fs.writeFileSync(cursorFile(sid), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["a"], excluded: ["x"] }));
+    await run(sid, [user("a", "x"), user("x", "private"), user("c", "z")]);
+    check(JSON.stringify(queued()) === JSON.stringify(["c"]), `exclusion union: the newer exclusion survives the older cursor (${queued()})`);
+    const c = JSON.parse(fs.readFileSync(cursorFile(sid), "utf8"));
+    check(c.excluded.includes("x") && !c.settled.includes("x"), "exclusion union: still recorded as excluded, never as settled");
+    // and the other direction: the legacy cursor holds the exclusion
+    clearBatches();
+    const sid2 = "s-excl-union-2";
+    fs.writeFileSync(legacyFile(sid2), JSON.stringify({ schema: "pi-capture-cursor/1", settled: [], excluded: ["x"] }));
+    fs.writeFileSync(cursorFile(sid2), JSON.stringify({ schema: "pi-capture-cursor/1", settled: [], excluded: [] }));
+    await run(sid2, [user("x", "private"), user("c", "z")]);
+    check(JSON.stringify(queued()) === JSON.stringify(["c"]), `exclusion union: an exclusion only the legacy cursor holds also stays (${queued()})`);
+  }
+
   // an exclusion is its own explicit rule: recorded apart, not delivered, and evaluated again after a cursor loss
   {
     clearBatches();
