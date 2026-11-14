@@ -62,6 +62,7 @@ test-core: $(UI_DIST)/index.html
 	bash scripts/tests/opencode-plugin-test.sh
 	bash scripts/tests/opencode-plugin-v2-test.sh
 	bash scripts/tests/require-ran.sh bash scripts/tests/pi-extension-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/pi-sweep-test.sh
 	bash scripts/tests/require-ran.sh bash scripts/tests/subagent-context-plugin-test.sh
 	bash scripts/tests/require-ran.sh bash scripts/tests/capture-trigger-plugin-test.sh
 	bash scripts/tests/spdx-header-test.sh
@@ -92,6 +93,7 @@ test-ops:
 	bash scripts/tests/codex-capture-tick-test.sh
 	bash scripts/tests/qwen-capture-tick-test.sh
 	bash scripts/tests/opencode-capture-tick-test.sh
+	bash scripts/tests/require-ran.sh bash scripts/tests/pi-capture-tick-test.sh
 	bash scripts/tests/acpx-capture-tick-test.sh
 	bash scripts/tests/muse-capture-tick-test.sh
 	bash scripts/tests/capture-health-test.sh
