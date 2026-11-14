@@ -127,6 +127,35 @@ for (const mode of ["fail", "empty", "hang"]) {
 }
 setMode("inject", "ok");
 
+// --- new sessions: setup entries are real; cursor location ---------------------
+{
+  clearBatches();
+  const pi = makePi(); memoire(pi);
+  const entries = [
+    { type: "model_change", id: "setup1", parentId: null, timestamp: ts, provider: "conductor", modelId: "coder" },
+    { type: "thinking_level_change", id: "setup2", parentId: "setup1", timestamp: ts, thinkingLevel: "medium" },
+  ];
+  const ctx = makeCtx("s-new", entries);
+  await fire(pi, "session_start", { type: "session_start", reason: "startup" }, ctx);
+  entries.push(msg("sys9", { role: "system", content: "x", sections: {}, timestamp: 1 }), user("u9", "hi"));
+  await settle(pi, ctx);
+  const ids = readBatches().flat().filter((e) => e.event_type === "pi_entry").map((e) => e.source_event_id.split(":").pop());
+  check(JSON.stringify(ids) === JSON.stringify(["setup1", "setup2", "sys9", "u9"]), `new session: setup entries present at start are captured (${ids})`);
+  check(fs.existsSync(path.join(home, "capture-cursors", "pi", "s-new.json")), "cursor: written under capture-cursors/pi");
+  check(!fs.existsSync(path.join(home, "pi-capture", "s-new.json")), "cursor: nothing written at the old place");
+  // a cursor left at the old place is still honoured: its settled ids are not queued again
+  fs.mkdirSync(path.join(home, "pi-capture"), { recursive: true });
+  fs.writeFileSync(path.join(home, "pi-capture", "s-legacy.json"), JSON.stringify({ schema: "pi-capture-cursor/1", settled: ["l1"] }));
+  clearBatches();
+  const pi2 = makePi(); memoire(pi2);
+  const legacy = [user("l1", "queued by an older extension"), user("l2", "new")];
+  const lctx = makeCtx("s-legacy", legacy);
+  await fire(pi2, "session_start", { type: "session_start", reason: "resume" }, lctx);
+  await settle(pi2, lctx);
+  const got = readBatches().flat().filter((e) => e.event_type === "pi_entry").map((e) => e.source_event_id.split(":").pop());
+  check(JSON.stringify(got) === JSON.stringify(["l2"]), `legacy cursor: only the unsettled entry is queued (${got})`);
+}
+
 // --- capture -----------------------------------------------------------------
 {
   clearBatches();
@@ -214,7 +243,7 @@ setMode("inject", "ok");
   const cp = got.find((e) => e.source_event_id.endsWith(":cp1"))?.payload.entry.systemMessage;
   check(cp && !("memoire" in cp.sections) && cp.sections.memoire_omitted === true && !cp.content.includes("obs é日本"),
     "compaction: the checkpoint's systemMessage loses the memoire section and the injected text");
-  const cursor = JSON.parse(fs.readFileSync(path.join(home, "pi-capture", `${sid}.json`), "utf8"));
+  const cursor = JSON.parse(fs.readFileSync(path.join(home, "capture-cursors", "pi", `${sid}.json`), "utf8"));
   check(JSON.stringify(cursor.settled.sort()) === JSON.stringify(["cp1", "pre1", "u9"]), `cursor: lists the settled ids (${cursor.settled})`);
 }
 

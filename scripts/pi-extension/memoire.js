@@ -35,7 +35,7 @@
 //     (stopReason stop, length or toolUse) with non-empty text: the text parts
 //     joined by "\n\n" in the event TEXT, no cap. This is the derivation input.
 // Ids: pi:entry:<session id>:<entry id> and pi:turn:<session id>:<entry id>.
-// Delivery: a per-session cursor, $MEMOIRE_HOME/pi-capture/<session id>.json,
+// Delivery: a per-session cursor, $MEMOIRE_HOME/capture-cursors/pi/<session id>.json,
 // lists the entry ids already settled (queued, or excluded by MEMOIRE_CAPTURE
 // off or a capture-disabled project: an excluded entry is never queued later). An entry stays out of it until its batch is
 // written, so a failed write is retried at the next settle, and after a
@@ -170,18 +170,26 @@ function withoutOwnSection(entry, injectedText) {
 
 // The per-session delivery cursor (see the header). A malformed file reads as
 // absent; a write failure is logged and capture goes on in memory.
-const cursorPath = (sessionId) => {
-  const safe = /^[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : Buffer.from(sessionId).toString("hex").slice(0, 200);
-  return path.join(memoireHome(), "pi-capture", `${safe}.json`);
-};
+// The cursor lives under capture-cursors/pi, the directory every Pi sandbox profile
+// mounts writable (the older pi-capture/ is not mounted: inside the sandbox its cursor
+// died with the session, 2026-11-14). A cursor left at the old place is still read.
+const safeId = (sessionId) => (/^[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : Buffer.from(sessionId).toString("hex").slice(0, 200));
+const cursorPath = (sessionId) => path.join(memoireHome(), "capture-cursors", "pi", `${safeId(sessionId)}.json`);
+const legacyCursorPath = (sessionId) => path.join(memoireHome(), "pi-capture", `${safeId(sessionId)}.json`);
 function readCursor(sessionId) {
-  try {
-    const ids = JSON.parse(fs.readFileSync(cursorPath(sessionId), "utf8"))?.settled;
-    return Array.isArray(ids) ? new Set(ids.filter((v) => typeof v === "string")) : null;
-  } catch {
-    return null;
+  for (const file of [cursorPath(sessionId), legacyCursorPath(sessionId)]) {
+    try {
+      const ids = JSON.parse(fs.readFileSync(file, "utf8"))?.settled;
+      if (Array.isArray(ids)) return new Set(ids.filter((v) => typeof v === "string"));
+    } catch { /* absent or malformed: next */ }
   }
+  return null;
 }
+// A session whose conversation has begun (a user, assistant or tool-result message) and
+// has no cursor is history from before the extension; one that holds only its setup
+// entries (model, thinking level, name) is new, and those entries are real.
+const conversationBegun = (entries) => entries.some((e) => e?.type === "message"
+  && ["user", "assistant", "toolResult"].includes(e.message?.role));
 function writeCursor(sessionId, ids) {
   try {
     const file = cursorPath(sessionId);
@@ -259,7 +267,8 @@ export default function memoire(pi) {
       if (cursor) {
         for (const id of cursor) seen.add(id);
       } else {
-        for (const e of ctx.sessionManager.getEntries()) seen.add(e.id);
+        const entries = ctx.sessionManager.getEntries();
+        if (conversationBegun(entries)) for (const e of entries) seen.add(e.id);
         writeCursor(sessionId, seen);
       }
     } catch (e) {
