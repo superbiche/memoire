@@ -30,11 +30,17 @@
 //     is opened without following a link (descriptor-relative through /proc/self/fd, Linux), the
 //     type and size are checked on the descriptor that is then read, line by line (memory bounded by
 //     the longest permitted line and one chunk), discovery is bounded in depth and breadth.
+//   * A session inside a host-approved workspace is captured only when the project its header cwd
+//     resolves to (the live capture's own resolution) is the project the host approved: a nested
+//     repository, or an excluded directory with its own policy, is quarantined, never captured under
+//     the parent; a distinct project the host did not approve likewise.
 //   * A store cannot speak for another store's session. Seat and cage sessions are bound to their
 //     origin (kind, run id, or seat and cockpit) in the session id, the event key and the cursor
 //     (`capture-cursors/pi-origin/`); only the ordinary store shares the extension's cursor and
-//     plain keys. A header id claimed by two origins (or by two files of one origin) quarantines
-//     every claimant, and is reported.
+//     plain keys. Conflicts stay where they are untrusted: two files of ONE origin claiming one id are
+//     both quarantined; a seat or cage file claiming an id held by a session of the ordinary store is
+//     quarantined and that session proceeds; ids claimed across two untrusted origins collide nowhere
+//     (each is bound to its own host record and origin) and both proceed.
 //
 // Where each kind of session lives (read from the launchers and the floor code, 2026-11-14):
 //   agent   ~/.pi/agent/sessions/<cwd key>/*.jsonl        ordinary, sandboxed, T3 Code, ACP
@@ -61,7 +67,7 @@
 //
 // Environment: MEMOIRE_HOME, MEMOIRE_QUEUE_BIN, MEMOIRE_RESOLVE_PROJECT, MEMOIRE_PI_SESSION_ROOTS,
 //   MEMOIRE_PI_RUNS_DIR, LIAISON_PI_SEAT_STATE, LIAISON_CONCLAVE_HOME, PI_CODING_AGENT_DIR,
-//   MEMOIRE_PI_EXTENSION_PATH (the extension file to import; tests).
+//   MEMOIRE_PI_EXTENSION_PATH (the extension file to import; tests), MEMOIRE_PI_MAX_DIR_ENTRIES (tests).
 
 import fs from "node:fs";
 import os from "node:os";
@@ -76,13 +82,15 @@ const extPath = process.env.MEMOIRE_PI_EXTENSION_PATH
 const ext = await import(pathToFileURL(extPath).href);
 const { buildEvents, readCursor, readCursorFile, updateCursor, updateCursorAt, cursorPath, resolveProject, writeBatch, captureOff } = ext;
 
+const started = Date.now();
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const CHUNK_ENTRIES = 400;
 const CHUNK_BYTES = 32 * 1024 * 1024;
 const MAX_DEPTH = 5;
-const MAX_DIR_ENTRIES = 20000;
+const MAX_DIR_ENTRIES = Number(process.env.MEMOIRE_PI_MAX_DIR_ENTRIES) > 0 ? Number(process.env.MEMOIRE_PI_MAX_DIR_ENTRIES) : 20000;   // the env is a test knob
 const MAX_FILES = 50000;
+const MAX_VISITED = 200000;     // directory entries looked at in one run, matched or not
 const log = (m) => process.stderr.write(`memoire-capture-pi: ${m}\n`);
 const home = os.homedir();
 const memoireHome = () => process.env.MEMOIRE_HOME || path.join(home, ".memoire");
@@ -117,9 +125,14 @@ const opts = { scan: false, roots: [], since: 0, quietFor: 0, maxSeconds: 0, sum
   if (!opts.scan && !opts.files.length) { usage(); process.exit(2); }
 }
 
+const totals = { sessions: 0, events: 0, failed: 0, rejected: 0, stopped: 0, left: 0, quarantined: 0 };
+const deadline = opts.maxSeconds ? started + opts.maxSeconds * 1000 : Infinity;
+// The internal deadline covers discovery and the claims pass as well as the capture loop.
+const timeUp = () => { if (Date.now() >= deadline) { totals.stopped = 1; return true; } return false; };
+
 // --- descriptor-relative, no-follow access (Linux) --------------------------------------------
 const C = fs.constants;
-const RDONLY_NOFOLLOW = C.O_RDONLY | C.O_NOFOLLOW | (C.O_CLOEXEC ?? 0);
+const RDONLY_NOFOLLOW = C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK | (C.O_CLOEXEC ?? 0);   // O_NONBLOCK: a FIFO placed by a worker must not stall the sweep; the type is checked on the descriptor before any read
 const procFd = (fd) => `/proc/self/fd/${fd}`;
 const okName = (n) => typeof n === "string" && n !== "" && n !== "." && n !== ".." && !n.includes("/") && !n.includes("\0");
 
@@ -144,8 +157,32 @@ function openPath(rootDir, parts, lastIsDir = false) {
     return fd;
   } catch (e) { closeQuiet(fd); throw e; }
 }
-function listDir(fd) {
-  try { return fs.readdirSync(procFd(fd)).filter(okName).slice(0, MAX_DIR_ENTRIES); } catch { return []; }
+// Iterate a directory instead of reading it whole: the caps apply during iteration. Yields the
+// names of the wanted kind ("dir" | "file"); links are never yielded; a FIFO, socket or device node
+// where a directory or a record is expected is skipped and counted without being opened.
+let visited = 0;
+function* listDir(fd, want) {
+  let d;
+  try { d = fs.opendirSync(procFd(fd)); } catch { return; }
+  try {
+    let e, n = 0;
+    while ((e = d.readSync()) !== null) {
+      if (++n > MAX_DIR_ENTRIES || ++visited > MAX_VISITED) { totals.rejected++; log("discovery cap reached: directory listing cut"); return; }
+      if ((n & 63) === 0 && timeUp()) return;
+      if (!okName(e.name) || e.isSymbolicLink()) continue;
+      let isDir = e.isDirectory(), isFile = e.isFile();
+      if (!isDir && !isFile) {
+        let st; try { st = fs.lstatSync(`${procFd(fd)}/${e.name}`); } catch { continue; }   // lstat: never opens, never blocks
+        if (st.isSymbolicLink()) continue;
+        isDir = st.isDirectory(); isFile = st.isFile();
+        if (!isDir && !isFile) {
+          if (want === "dir" || (want === "file" && e.name.endsWith(".jsonl"))) { totals.rejected++; log(`skip (not a regular file or directory): name=${e.name.slice(0, 80)}`); }
+          continue;
+        }
+      }
+      if (want === "dir" ? isDir : isFile) yield e.name;
+    }
+  } finally { try { d.closeSync(); } catch { /* */ } }
 }
 function fstatOf(fd) { return fs.fstatSync(fd); }
 
@@ -193,11 +230,11 @@ function discover() {
     let rfd = -1;
     try {
       rfd = openRoot(root);
-      for (const key of listDir(rfd)) {
+      for (const key of listDir(rfd, "dir")) {
         let dfd = -1;
         try {
           dfd = openChild(rfd, key, C.O_DIRECTORY);
-          for (const name of listDir(dfd)) if (name.endsWith(".jsonl")) add({ kind, root, parts: [key, name], origin: { kind: "agent" } });
+          for (const name of listDir(dfd, "file")) if (name.endsWith(".jsonl")) add({ kind, root, parts: [key, name], origin: { kind: "agent" } });
         } catch { /* a link, not a directory, vanished: skipped */ } finally { closeQuiet(dfd); }
       }
     } catch { /* unreadable root */ } finally { closeQuiet(rfd); }
@@ -221,19 +258,19 @@ function discover() {
       let sessionsFd = -1;
       try {
         sessionsFd = openChild(sfd, "sessions", C.O_DIRECTORY);
-        for (const seat of listDir(sessionsFd)) {
+        for (const seat of listDir(sessionsFd, "dir")) {
           let seatFd = -1;
           try {
             seatFd = openChild(sessionsFd, seat, C.O_DIRECTORY);
-            for (const key of listDir(seatFd)) {
+            for (const key of listDir(seatFd, "dir")) {
               let kfd = -1;
               try {
                 kfd = openChild(seatFd, key, C.O_DIRECTORY);
-                for (const cwdKey of listDir(kfd)) {
+                for (const cwdKey of listDir(kfd, "dir")) {
                   let cfd = -1;
                   try {
                     cfd = openChild(kfd, cwdKey, C.O_DIRECTORY);
-                    for (const name of listDir(cfd)) if (name.endsWith(".jsonl")) add({ kind: "seat", root: state, parts: ["sessions", seat, key, cwdKey, name], origin: { kind: "seat", seat, key, id: `seat:${seat}:${key}` } });
+                    for (const name of listDir(cfd, "file")) if (name.endsWith(".jsonl")) add({ kind: "seat", root: state, parts: ["sessions", seat, key, cwdKey, name], origin: { kind: "seat", seat, key, id: `seat:${seat}:${key}` } });
                   } catch { /* */ } finally { closeQuiet(cfd); }
                 }
               } catch { /* */ } finally { closeQuiet(kfd); }
@@ -249,17 +286,17 @@ function discover() {
     let rfd = -1;
     try {
       rfd = openRoot(runs);
-      for (const run of listDir(rfd)) {
+      for (const run of listDir(rfd, "dir")) {
         let runFd = -1, acpxFd = -1, psFd = -1;
         try {
           runFd = openChild(rfd, run, C.O_DIRECTORY);
           acpxFd = openChild(runFd, "acpx", C.O_DIRECTORY);       // worker-writable: opened without following
           psFd = openChild(acpxFd, "pi-sessions", C.O_DIRECTORY);
-          for (const cwdKey of listDir(psFd)) {
+          for (const cwdKey of listDir(psFd, "dir")) {
             let cfd = -1;
             try {
               cfd = openChild(psFd, cwdKey, C.O_DIRECTORY);
-              for (const name of listDir(cfd)) if (name.endsWith(".jsonl")) add({ kind: "cage", root: runs, parts: [run, "acpx", "pi-sessions", cwdKey, name], origin: { kind: "cage", run, id: `cage:${run}` } });
+              for (const name of listDir(cfd, "file")) if (name.endsWith(".jsonl")) add({ kind: "cage", root: runs, parts: [run, "acpx", "pi-sessions", cwdKey, name], origin: { kind: "cage", run, id: `cage:${run}` } });
             } catch { /* */ } finally { closeQuiet(cfd); }
           }
         } catch { /* a run without a Pi store, or with a link where a directory belongs */ } finally { closeQuiet(psFd); closeQuiet(acpxFd); closeQuiet(runFd); }
@@ -286,6 +323,17 @@ async function projectOf(cwd) {
   return projects.get(cwd);
 }
 
+// A session inside a host-approved workspace is captured only when the project its header cwd
+// resolves to (the live capture's own resolution) is the project the host approved: a nested
+// repository or an excluded directory with its own policy is never captured under the parent, and
+// a distinct project the host did not approve is not captured either. Projects are compared by key.
+async function sameProject(cwd, hostProject) {
+  const hp = await projectOf(cwd);
+  if (!hp) return "header cwd resolves to a capture-disabled project";
+  if (hp.key !== hostProject.key) return "header cwd resolves to a project the host did not approve";
+  return null;
+}
+
 // {ok, cwd, project|null (capture-disabled), ...} or {quarantine: reason}
 async function attribute(file, header) {
   const cwd = header.cwd;
@@ -301,7 +349,9 @@ async function attribute(file, header) {
     if (!rec || rec.seat !== o.seat || typeof rec.cockpit !== "string") return { quarantine: "no host launch record for this seat and cockpit" };
     if (!inside(cwd, rec.cockpit) || file.parts[3] !== dirKey(cwd)) return { quarantine: "header cwd is not the cockpit the launcher recorded" };
     const p = await projectOf(rec.cockpit);
-    return { cwd, project: p, excluded: !p };
+    if (!p) return { cwd, project: null, excluded: true };
+    const mismatch = await sameProject(cwd, p);
+    return mismatch ? { quarantine: mismatch } : { cwd, project: p, excluded: false };
   }
   if (o.kind === "cage") {
     const rec = readHostJson(file.root, [o.run, "state.json"]);
@@ -310,7 +360,9 @@ async function attribute(file, header) {
     if (!inside(cwd, t.cage) || file.parts[3] !== dirKey(cwd)) return { quarantine: "header cwd is not the workspace the run record names" };
     const pc = await projectOf(t.cage);
     const pr = await projectOf(t.repo);
-    return { cwd, project: pc && pr ? pr : null, excluded: !pc || !pr };
+    if (!pc || !pr) return { cwd, project: null, excluded: true };
+    const mismatch = await sameProject(cwd, pc);
+    return mismatch ? { quarantine: mismatch } : { cwd, project: pr, excluded: false };
   }
   return { quarantine: "unknown origin" };
 }
@@ -349,7 +401,6 @@ function migrateLegacy(ns) {
 }
 
 // --- one file --------------------------------------------------------------------------------
-const totals = { sessions: 0, events: 0, failed: 0, rejected: 0, stopped: 0, left: 0, quarantined: 0 };
 const quarantine = (f, why) => { totals.quarantined++; log(`quarantine: kind=${f.origin.kind} origin=${f.origin.id ?? "agent"} file=${f.parts[f.parts.length - 1]} reason=${why}`); };
 
 function readHeader(fd, size) {
@@ -366,21 +417,39 @@ function readHeader(fd, size) {
 
 // First pass over the files: header ids by origin, to find claims of one id by more than one file.
 function openFile(f) { return openPath(f.root, f.parts); }
+const tailDigest = (fd, size) => {
+  const n = Math.min(4096, size); if (n <= 0) return "";
+  const buf = Buffer.alloc(n); fs.readSync(fd, buf, 0, n, size - n);
+  return crypto.createHash("sha256").update(buf).digest("hex").slice(0, 32);
+};
+// Header ids by origin. Identities are bound to their origin, so an id claimed in two origins
+// collides nowhere; what is quarantined is the claimant that is not trusted to hold it:
+//   * two files of ONE origin claiming one id: both;
+//   * a seat or cage file claiming an id that a session of the ordinary store holds: that claimant
+//     (the ordinary session, and any other origin's, proceed).
 function claims(files) {
   const byId = new Map();
   for (const f of files) {
+    if (timeUp()) break;
     let fd = -1;
     try {
       fd = openFile(f);
       const st = fstatOf(fd);
-      if (!st.isFile() || st.size > MAX_FILE_BYTES) continue;
+      if (!st.isFile()) { totals.rejected++; log(`skip (not a regular file): kind=${f.origin.kind} file=${f.parts[f.parts.length - 1]}`); f.skip = true; continue; }
+      if (st.size > MAX_FILE_BYTES) continue;
       f.stat = st;
       f.header = readHeader(fd, Math.min(st.size, MAX_LINE_BYTES));
       const list = byId.get(f.header.id) ?? [];
       list.push(f); byId.set(f.header.id, list);
     } catch (e) { f.headerError = e instanceof Reject ? e.message : (e?.code ?? "unreadable"); } finally { closeQuiet(fd); }
   }
-  for (const list of byId.values()) if (list.length > 1) for (const f of list) f.conflict = list.length;
+  for (const list of byId.values()) {
+    if (list.length < 2) continue;
+    const byOrigin = new Map();
+    for (const f of list) { const k = f.origin.kind === "agent" ? "agent" : f.origin.id; (byOrigin.get(k) ?? byOrigin.set(k, []).get(k)).push(f); }
+    for (const [, fs_] of byOrigin) if (fs_.length > 1) for (const f of fs_) f.conflict = `header id claimed by ${fs_.length} files of one origin`;
+    if (byOrigin.has("agent")) for (const [k, fs_] of byOrigin) if (k !== "agent") for (const f of fs_) f.conflict = f.conflict ?? "header id also held by a session of the ordinary store";
+  }
 }
 
 async function sweepFile(f) {
@@ -393,13 +462,17 @@ async function sweepFile(f) {
     const header = readHeader(fd, st.size);
     const att = await attribute(f, header);
     if (att.quarantine) { quarantine(f, att.quarantine); return; }
-    if (f.conflict) { quarantine(f, `header id claimed by ${f.conflict} files`); return; }
+    if (f.conflict) { quarantine(f, f.conflict); return; }
     const ns = nsId(f.origin, header.id);
     const ops = cursorOps(f.origin, ns);
     const cur = ops.read();
     const swept = cur?.extra?.swept;
-    const mark = { size: st.size, mtimeMs: st.mtimeMs };
-    if (cur && swept && swept.size === mark.size && swept.mtimeMs === mark.mtimeMs) return;   // complete earlier sweep, unchanged since
+    // What makes "unchanged since a complete sweep" sound, all taken from the descriptor being read:
+    // size and mtime (a writer can restore mtime) plus the inode and the change time (which a write,
+    // a rename-over or a utimes all move and an unprivileged writer cannot set) plus a digest of
+    // the last bytes.
+    const mark = { size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, ino: st.ino, tail: tailDigest(fd, st.size) };
+    if (cur && swept && ["size", "mtimeMs", "ctimeMs", "ino", "tail"].every((k) => swept[k] === mark[k])) return;   // complete earlier sweep, unchanged since
     const settled = cur?.settled ?? new Set();
     const excluded = cur?.excluded ?? new Set();
     const label = f.origin.kind;
@@ -460,10 +533,10 @@ async function sweepFile(f) {
 
 // --- run -------------------------------------------------------------------
 if (captureOff()) process.exit(0);
-const started = Date.now();
 const found = discover();
 claims(found);
 const files = found
+  .filter((f) => !f.skip)
   .map((f) => (f.stat ? f : (() => { let fd = -1; try { fd = openFile(f); f.stat = fstatOf(fd); return f; } catch { return null; } finally { closeQuiet(fd); } })()))
   .filter((f) => f && f.stat.mtimeMs / 1000 >= opts.since)
   .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
@@ -471,7 +544,8 @@ const files = found
 if (process.env.MEMOIRE_PI_TEST_PAUSE) { const go = process.env.MEMOIRE_PI_TEST_PAUSE; fs.writeFileSync(`${go}.ready`, ""); while (!fs.existsSync(`${go}.go`)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20); }
 for (let i = 0; i < files.length; i++) {
   const f = files[i];
-  if (opts.maxSeconds && (Date.now() - started) / 1000 >= opts.maxSeconds) { totals.stopped = 1; totals.left += files.length - i; break; }
+  if (opts.maxSeconds && timeUp()) { totals.left += files.length - i; break; }
+  if (f.skip) continue;
   if (opts.quietFor && (Date.now() - f.stat.mtimeMs) / 1000 < opts.quietFor) { totals.left++; continue; }
   if (f.headerError) { totals.rejected++; log(`reject (${f.headerError}): kind=${f.origin.kind} file=${f.parts[f.parts.length - 1]}`); continue; }
   await sweepFile(f);
