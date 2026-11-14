@@ -42,6 +42,7 @@ if [[ "$1" == "--capture-enabled" ]]; then
   [[ "$2" == *private* ]] && { echo off; exit 1; }
   echo on; exit 0
 fi
+[[ "$2" == *nested* ]] && { printf 'nested-key\\t%s\\tregistry\\n' "$2"; exit 0; }
 printf 'proj-key\\t%s\\tregistry\\n' "$2"`);
 
 const env = (extra = {}) => ({
@@ -330,13 +331,9 @@ const names = () => readBatches().flat().map((e) => e.source_event_id);
   session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-cage--/poison.jsonl"), "victim", "/work/cage", [user("same", "forged")], { age: 7200 });
   session(path.join(root, "agent/sessions/--work-x--/real.jsonl"), "victim", "/work/x", [user("same", "real")]);
   let r = run(); let s = summary(r);
-  check(names().length === 0 && s.quarantined === 2, `identity: one id claimed by two origins quarantines both (${r.stdout.trim()})`);
-  check(/header id claimed by 2 files/.test(r.stderr), "identity: the conflict is reported");
-  check(!fs.existsSync(cursorFile("victim")) && !fs.existsSync(originCursorFile(`${CAGE}:victim`)), "identity: nothing is settled for either claimant");
-  // once the forgery is gone, the genuine entry is captured (it was never suppressed)
-  fs.rmSync(path.join(root, "runs/run-1/acpx/pi-sessions"), { recursive: true, force: true });
-  r = run();
-  check(names().join() === "pi:entry:victim:same", `identity: the genuine session is captured after the forgery is removed (${names()})`);
+  check(names().join() === "pi:entry:victim:same" && s.quarantined === 1, `identity: a cage file claiming an ordinary session's id is quarantined, the ordinary session proceeds (${r.stdout.trim()} ${names()})`);
+  check(/header id also held by a session of the ordinary store/.test(r.stderr), "identity: the conflict is reported");
+  check(!fs.existsSync(originCursorFile(`${CAGE}:victim`)), "identity: nothing is settled for the untrusted claimant");
   // equal entry ids in different sessions of different origins never collide
   fresh();
   session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-cage--/a.jsonl"), "cage-s", "/work/cage", [user("e1", "a")]);
@@ -391,6 +388,120 @@ const names = () => readBatches().flat().map((e) => e.source_event_id);
   setMode("queue", "ok");
   run();
   check(names().join() === "pi:entry:old-1:k2", `lookback: the new entry is delivered, only it (${names()})`);
+}
+
+
+// ===== sweep fix round 2 (R13b) =============================================================================
+const mkfifo = (f) => { fs.mkdirSync(path.dirname(f), { recursive: true }); const r = spawnSync("mkfifo", [f]); return r.status === 0; };
+
+// --- B1: a nested project inside the recorded workspace ---------------------------------------------------
+{
+  fresh();
+  fs.writeFileSync(path.join(root, "runs/run-1/state.json"), JSON.stringify({ target: { cage: "/work", repo: "/repo" } }));
+  fs.writeFileSync(path.join(root, "seat-state/cockpits/conclave-coordinator/cockpit-key.json"), JSON.stringify({ seat: "conclave-coordinator", cockpit: "/work" }));
+  // the reviewer's case: /work is allowed, /work/private is capture-disabled
+  session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-private--/a.jsonl"), "nest-cage-1", "/work/private", [user("p1", "excluded descendant")]);
+  session(path.join(root, "seat-state/sessions/conclave-coordinator/cockpit-key/--work-private--/a.jsonl"), "nest-seat-1", "/work/private", [user("p2", "excluded descendant")]);
+  // a nested project that is capture-enabled but distinct: the host did not approve it
+  session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-nested--/b.jsonl"), "nest-cage-2", "/work/nested", [user("n1", "distinct project")]);
+  session(path.join(root, "seat-state/sessions/conclave-coordinator/cockpit-key/--work-nested--/b.jsonl"), "nest-seat-2", "/work/nested", [user("n2", "distinct project")]);
+  // control: a directory of the same project inside the workspace is captured
+  session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-sub--/c.jsonl"), "nest-cage-3", "/work/sub", [user("c1", "same project")]);
+  session(path.join(root, "seat-state/sessions/conclave-coordinator/cockpit-key/--work-sub--/c.jsonl"), "nest-seat-3", "/work/sub", [user("c2", "same project")]);
+  const r = run(); const s = summary(r);
+  check(names().sort().join() === [`pi:entry:${CAGE}:nest-cage-3:c1`, `pi:entry:${SEAT}:nest-seat-3:c2`].sort().join(), `nested: only the same-project directories are captured (${names()})`);
+  check(s.quarantined === 4, `nested: an excluded descendant and a distinct approved-by-nobody project are quarantined, for cage and seat (${r.stdout.trim()})`);
+  check(/did not approve|capture-disabled project/.test(r.stderr) && !fs.existsSync(originCursorFile(`${CAGE}:nest-cage-1`)), "nested: reason named, nothing settled");
+}
+
+// --- B2: a file that is not a regular file --------------------------------------------------------------------
+{
+  fresh();
+  const ok = mkfifo(path.join(root, "runs/run-1/acpx/pi-sessions/--work-cage--/fifo.jsonl"));
+  check(ok, "fifo: mkfifo available");
+  mkfifo(path.join(root, "agent/sessions/--work-z--/fifo2.jsonl"));
+  session(path.join(root, "agent/sessions/--work-a--/real.jsonl"), "after-fifo", "/work/a", [user("r1", "other session")]);
+  session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-cage--/real.jsonl"), "cage-real", "/work/cage", [user("r2", "cage session")]);
+  const t0 = Date.now();
+  const r = spawnSync("node", [sweep, "--scan", "--summary", "--max-seconds", "2"], { env: env(), encoding: "utf8", timeout: 20000 });
+  check(r.status === 0 && Date.now() - t0 < 10000, `fifo: the sweep finishes (status ${r.status}, ${Date.now() - t0} ms)`);
+  check(names().sort().join() === ["pi:entry:after-fifo:r1", `pi:entry:${CAGE}:cage-real:r2`].sort().join(), `fifo: the other sessions are captured (${names()})`);
+  check(Number(r.stdout.trim().split("\t")[3]) >= 2, `fifo: non-regular files are skipped and counted (${r.stdout.trim()})`);
+  // a FIFO where a directory belongs, and as a host record
+  fresh();
+  fs.mkdirSync(path.join(root, "runs/run-9"), { recursive: true });
+  mkfifo(path.join(root, "runs/run-9/acpx"));
+  fs.rmSync(path.join(root, "runs/run-1/state.json")); mkfifo(path.join(root, "runs/run-1/state.json"));
+  session(path.join(root, "runs/run-1/acpx/pi-sessions/--work-cage--/x.jsonl"), "fifo-rec", "/work/cage", [user("q1", "t")]);
+  session(path.join(root, "agent/sessions/--work-a--/real.jsonl"), "after-fifo-2", "/work/a", [user("r1", "other")]);
+  const r2 = spawnSync("node", [sweep, "--scan", "--summary", "--max-seconds", "2"], { env: env(), encoding: "utf8", timeout: 20000 });
+  check(r2.status === 0 && names().join() === "pi:entry:after-fifo-2:r1" && summary(r2).quarantined === 1, `fifo: a FIFO as a directory or as a host record does not stall the sweep; the session without a usable record is quarantined (${r2.stdout.trim()})`);
+}
+
+// --- conflicts stay where they are untrusted --------------------------------------------------------------------
+{
+  const cageSession = (run_, id, entry, cwd = "/work/cage") => {
+    fs.mkdirSync(path.join(root, `runs/${run_}`), { recursive: true });
+    fs.writeFileSync(path.join(root, `runs/${run_}/state.json`), JSON.stringify({ target: { cage: cwd, repo: "/work/repo" } }));
+    session(path.join(root, `runs/${run_}/acpx/pi-sessions/${dirKeyOf(cwd)}/f.jsonl`), id, cwd, [user(entry, "t")]);
+  };
+  const dirKeyOf = (cwd) => "--" + cwd.replace(/^\//, "").replace(/\//g, "-") + "--";
+  // cage against ordinary
+  fresh();
+  cageSession("run-a", "shared", "x1");
+  session(path.join(root, "agent/sessions/--work-a--/g.jsonl"), "shared", "/work/a", [user("g1", "genuine")]);
+  let r = run();
+  check(names().join() === "pi:entry:shared:g1" && summary(r).quarantined === 1, `conflict cage/ordinary: the cage claimant is quarantined, the genuine session captured (${names()})`);
+  // cage against cage: both proceed under their own origin
+  fresh();
+  cageSession("run-a", "shared", "x1"); cageSession("run-b", "shared", "x2");
+  r = run();
+  check(names().sort().join() === ["pi:entry:cage:run-a:shared:x1", "pi:entry:cage:run-b:shared:x2"].sort().join() && summary(r).quarantined === 0, `conflict cage/cage: each is bound to its own run, both captured (${names()})`);
+  // seat against cage
+  fresh();
+  cageSession("run-a", "shared", "x1");
+  session(path.join(root, "seat-state/sessions/conclave-coordinator/cockpit-key/--work-seat--/f.jsonl"), "shared", "/work/seat", [user("s1", "seat")]);
+  r = run();
+  check(names().sort().join() === ["pi:entry:cage:run-a:shared:x1", `pi:entry:${SEAT}:shared:s1`].sort().join() && summary(r).quarantined === 0, `conflict seat/cage: both captured under their origin (${names()})`);
+  // two files of one origin: both quarantined, in every kind
+  fresh();
+  session(path.join(root, "agent/sessions/--work-a--/one.jsonl"), "dup", "/work/a", [user("d1", "a")]);
+  session(path.join(root, "agent/sessions/--work-a--/two.jsonl"), "dup", "/work/a", [user("d1", "a")]);
+  cageSession("run-a", "dupc", "x1");
+  session(path.join(root, "runs/run-a/acpx/pi-sessions/--work-cage--/g.jsonl"), "dupc", "/work/cage", [user("x1", "t")]);
+  r = run();
+  check(names().length === 0 && summary(r).quarantined === 4, `conflict within one origin: both files quarantined, ordinary and cage (${r.stdout.trim()} ${names()})`);
+}
+
+// --- the skip is sound: a rewrite that keeps size and mtime is read again ---------------------------------------
+{
+  fresh();
+  const f = path.join(root, "agent/sessions/--work-a--/rw.jsonl");
+  session(f, "rw-1", "/work/a", [user("k1", "aaaa")]);
+  run(); clearBatches();
+  check(summary(run()).events === 0 && queued().length === 0, "skip: an unchanged, completely swept file is not read again");
+  // an in-place rewrite of the same length (a new entry id), mtime restored
+  const st = fs.statSync(f);
+  const text = fs.readFileSync(f, "utf8").replace('"k1"', '"k2"');
+  const fd = fs.openSync(f, "r+"); fs.writeSync(fd, text, 0); fs.closeSync(fd);
+  fs.utimesSync(f, st.atimeMs / 1000, st.mtimeMs / 1000);
+  const st2 = fs.statSync(f);
+  check(st2.size === st.size && st2.mtimeMs === st.mtimeMs && st2.ino === st.ino, "skip: the rewrite keeps size, mtime and inode");
+  run();
+  check(ids(queued()).join() === "k2", `skip: ... and is still read again (the change time moved) (${queued()})`);
+}
+
+// --- bounded discovery: iteration with caps, the deadline covers discovery ---------------------------------------
+{
+  fresh();
+  for (let i = 0; i < 300; i++) fs.mkdirSync(path.join(root, `agent/sessions/--work-d${i}--`), { recursive: true });
+  session(path.join(root, "agent/sessions/--work-a--/f.jsonl"), "bound-1", "/work/a", [user("b1", "t")]);
+  let r = spawnSync("node", [sweep, "--scan", "--summary", "--max-seconds", "0.000001"], { env: env(), encoding: "utf8", timeout: 30000 });
+  check(r.status === 0 && summary(r).stopped === 1 && names().length === 0, `bounded: the deadline covers discovery, the run stops before capturing (${r.stdout.trim()})`);
+  clearBatches(); fs.rmSync(path.join(mh, "capture-cursors"), { recursive: true, force: true });
+  for (let i = 0; i < 80; i++) fs.writeFileSync(path.join(root, `agent/sessions/--work-a--/pad${i}.txt`), "");
+  r = spawnSync("node", [sweep, "--scan", "--summary"], { env: env({ MEMOIRE_PI_MAX_DIR_ENTRIES: "50" }), encoding: "utf8", timeout: 30000 });
+  check(r.status === 0 && /discovery cap reached/.test(r.stderr), "bounded: a directory listing is cut at the cap while iterating, the run completes");
 }
 
 if (failures) { console.error(`pi-sweep-test: ${failures} failure(s)`); process.exit(1); }
