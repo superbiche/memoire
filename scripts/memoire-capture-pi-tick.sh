@@ -11,11 +11,14 @@ set -uo pipefail
 # slow run never delays another capture tick, and none of them knows about Pi.
 #
 # One tick writes ONE line to $MEMOIRE_HOME/log/capture-pi-tick.log:
-#   tick_pi sessions=N events=N failed_sessions=N rejected=N blobs=0 stopped=0|1 left=N source=primary rc=R
-#           [timed_out=1] [fail="..."]
+#   tick_pi sessions=N events=N failed_sessions=N rejected=N quarantined=N blobs=0 stopped=0|1 left=N
+#           source=primary rc=R [timed_out=1] [fail="..."]
 # (the adapter's summary: sessions that queued events, events queued, failed chunks, rejected
-# files, stopped at the time bound, files left for later: still being written or past the bound).
-# A skipped tick logs `tick_pi skipped=<reason>`. Exit code 0 whenever the tick itself ran.
+# files, QUARANTINED files (no host record for their seat or run, or a header that disagrees with
+# it: never queued, never settled, named on the adapter's stderr lines), stopped at the time bound,
+# files left for later: still being written or past the bound). A skipped tick logs
+# `tick_pi skipped=<reason>`; one that cannot take its lock logs skipped=lock_unavailable and does
+# not run. Exit code 0 whenever the tick itself ran.
 #
 # Bound: the adapter runs under `timeout -k KILL_S PI_TICK_TIMEOUT`, stdout and stderr to files,
 # stdin closed and the lock descriptor closed; it stops itself a margin before the bound at a file
@@ -29,8 +32,8 @@ set -uo pipefail
 #   MEMOIRE_PI_TICK_TIMEOUT      default 240  - wall-clock bound, seconds
 #   MEMOIRE_PI_TICK_KILL_S       default 10   - delay between TERM and KILL
 #   MEMOIRE_TICK_QUIET_S         default 120  - leave files changed more recently (still written)
-#   MEMOIRE_TICK_SINCE_S         default 172800 - 48h scan bound (a full backfill is a manual run:
-#                                memoire-capture-pi.mjs --scan with no --since)
+#                                (no lookback window: the adapter skips a file whose size and mtime
+#                                match the mark of a complete earlier sweep, so nothing is stranded)
 #   MEMOIRE_CAPTURE_PI_BIN       adapter path override
 #   MEMOIRE_NODE                 node binary (default: node on PATH)
 # The session roots are the adapter's own parameters (MEMOIRE_PI_SESSION_ROOTS, MEMOIRE_PI_RUNS_DIR,
@@ -62,21 +65,19 @@ NODE="${MEMOIRE_NODE:-node}"
 TIMEOUT_S="${MEMOIRE_PI_TICK_TIMEOUT:-240}"
 KILL_S="${MEMOIRE_PI_TICK_KILL_S:-10}"
 QUIET="${MEMOIRE_TICK_QUIET_S:-120}"
-SINCE="${MEMOIRE_TICK_SINCE_S:-172800}"
 [[ "$TIMEOUT_S" =~ ^[1-9][0-9]*$ ]] || TIMEOUT_S=240
 [[ "$KILL_S" =~ ^[1-9][0-9]*$ ]] || KILL_S=10
 [[ "$QUIET" =~ ^[0-9]+$ ]] || QUIET=120
-[[ "$SINCE" =~ ^[1-9][0-9]*$ ]] || SINCE=172800
 
 LOCK_FILE="$MEMOIRE_HOME/capture-pi-tick.lock"
 mkdir -p "$MEMOIRE_HOME" 2>/dev/null
 HAVE_LOCK=0
 if command -v flock >/dev/null 2>&1 && touch "$LOCK_FILE" 2>/dev/null; then
-  exec 8>"$LOCK_FILE"
+  { exec 8>"$LOCK_FILE"; } 2>/dev/null || { log "tick_pi skipped=lock_unavailable"; exit 0; }
   flock -n 8 || { log "tick_pi skipped=locked"; exit 0; }
   HAVE_LOCK=1
 else
-  log "tick_pi lock unavailable, proceeding"
+  log "tick_pi skipped=lock_unavailable"; exit 0
 fi
 
 if (( HAVE_LOCK )); then
@@ -101,23 +102,22 @@ MARGIN=$((TIMEOUT_S / 4))
 {
   timeout -k "$KILL_S" "$TIMEOUT_S" "$NODE" "$BIN" \
     --scan --summary --quiet-for "$QUIET" \
-    --since "@$(( $(date +%s) - SINCE ))" \
     --max-seconds "$(( TIMEOUT_S - MARGIN ))" \
     </dev/null >"$OUT_FILE" 2>"$ERR_FILE" 8>&-
   RC=$?
 } 2>/dev/null
 
-SESSIONS=0 EVENTS=0 FAILED=0 REJECTED=0 STOPPED=0 LEFT=0 BLOBS=0 SOURCE=primary
-IFS=$'\t' read -r SESSIONS EVENTS FAILED REJECTED STOPPED LEFT BLOBS SOURCE < <(tail -n 1 "$OUT_FILE" 2>/dev/null)
-for N in SESSIONS EVENTS FAILED REJECTED STOPPED LEFT BLOBS; do
+SESSIONS=0 EVENTS=0 FAILED=0 REJECTED=0 STOPPED=0 LEFT=0 BLOBS=0 SOURCE=primary QUARANTINED=0
+IFS=$'\t' read -r SESSIONS EVENTS FAILED REJECTED STOPPED LEFT BLOBS SOURCE QUARANTINED < <(tail -n 1 "$OUT_FILE" 2>/dev/null)
+for N in SESSIONS EVENTS FAILED REJECTED STOPPED LEFT BLOBS QUARANTINED; do
   [[ "${!N}" =~ ^[0-9]+$ ]] || printf -v "$N" 0
 done
 SOURCE=primary
 
 clean() { LC_ALL=C tr -c '[:print:]\n' ' ' | tr -d '"' | cut -c1-160; }
-FAIL_LINES="$(grep -E 'queue write failed|unreadable|reject' "$ERR_FILE" 2>/dev/null | head -n 2 | clean | paste -sd'|' -)"
+FAIL_LINES="$(grep -E 'queue write failed|cursor update failed|unreadable|reject|quarantine' "$ERR_FILE" 2>/dev/null | head -n 2 | clean | paste -sd'|' -)"
 EXTRA=""
 (( RC == 124 || RC == 137 )) && EXTRA=" timed_out=1"
 [[ -n "$FAIL_LINES" ]] && EXTRA="$EXTRA fail=\"$FAIL_LINES\""
-log "tick_pi sessions=$SESSIONS events=$EVENTS failed_sessions=$FAILED rejected=$REJECTED blobs=$BLOBS stopped=$STOPPED left=$LEFT source=$SOURCE rc=$RC$EXTRA"
+log "tick_pi sessions=$SESSIONS events=$EVENTS failed_sessions=$FAILED rejected=$REJECTED quarantined=$QUARANTINED blobs=$BLOBS stopped=$STOPPED left=$LEFT source=$SOURCE rc=$RC$EXTRA"
 exit 0

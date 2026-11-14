@@ -28,7 +28,7 @@ import fs from "node:fs";
 fs.appendFileSync(process.env.CALLS, process.argv.slice(2).join(" ") + "\n");
 if (process.env.HANG) { process.on("SIGTERM", () => {}); await new Promise((r) => setTimeout(r, 30000)); }
 console.error("memoire-capture-pi: queue write failed: kind=agent session=x");
-console.log(process.env.SUMMARY ?? "2\t9\t1\t0\t0\t3\t0\tprimary");
+console.log(process.env.SUMMARY ?? "2\t9\t1\t0\t0\t3\t0\tprimary\t4");
 JS
 export MEMOIRE_CAPTURE_PI_BIN="$W/adapter.mjs" CALLS="$W/calls"
 
@@ -41,8 +41,8 @@ check "nothing ran yet" '[[ ! -e "$CALLS" ]]'
 
 # on: one line with the adapter's summary, the adapter gets the scan arguments
 MEMOIRE_CAPTURE_PI=on "$TICK"
-check "adapter called once with --scan --summary --quiet-for --since --max-seconds" '[[ "$(wc -l < "$CALLS")" == 1 ]] && grep -q -- "--scan --summary --quiet-for 120 --since @" "$CALLS" && grep -q -- "--max-seconds 210" "$CALLS"'
-check "summary line" 'tail -n 1 "$LOG" | grep -q "tick_pi sessions=2 events=9 failed_sessions=1 rejected=0 blobs=0 stopped=0 left=3 source=primary rc=0 fail=\"memoire-capture-pi: queue write failed"'
+check "adapter called once with --scan --summary --quiet-for --max-seconds, and no lookback window" '[[ "$(wc -l < "$CALLS")" == 1 ]] && grep -q -- "--scan --summary --quiet-for 120 --max-seconds 210" "$CALLS" && ! grep -q -- "--since" "$CALLS"'
+check "summary line" 'tail -n 1 "$LOG" | grep -q "tick_pi sessions=2 events=9 failed_sessions=1 rejected=0 quarantined=4 blobs=0 stopped=0 left=3 source=primary rc=0 fail=\"memoire-capture-pi: queue write failed"'
 
 # a garbage summary falls back to zeros
 SUMMARY="junk" MEMOIRE_CAPTURE_PI=on "$TICK"
@@ -59,6 +59,12 @@ check "a running tick is not overlapped" 'tail -n 1 "$LOG" | grep -q "skipped=lo
 start=$(date +%s)
 HANG=1 MEMOIRE_PI_TICK_TIMEOUT=2 MEMOIRE_PI_TICK_KILL_S=1 MEMOIRE_CAPTURE_PI=on "$TICK"; rc=$?
 check "hung adapter: tick exits 0 within the bound" '[[ $rc == 0 && $(( $(date +%s) - start )) -le 6 ]] && tail -n 1 "$LOG" | grep -q "timed_out=1"'
+
+# a lock the tick cannot take: it refuses to run (it used to proceed unlocked)
+rm -f "$CALLS"; mkdir -p "$MEMOIRE_HOME/capture-pi-tick.lock.d"
+( LOCKDIR="$MEMOIRE_HOME"; rm -f "$LOCKDIR/capture-pi-tick.lock"; mkdir "$LOCKDIR/capture-pi-tick.lock"; MEMOIRE_CAPTURE_PI=on "$TICK" )
+check "an unobtainable lock is a logged refusal, the adapter does not run" 'tail -n 1 "$LOG" | grep -q "skipped=lock_unavailable" && [[ ! -e "$CALLS" ]]'
+rmdir "$MEMOIRE_HOME/capture-pi-tick.lock" 2>/dev/null || true
 
 # the installer writes units only on `install`; usage otherwise (nothing is installed here)
 check "installer: usage on no argument" '! "$ROOT/scripts/capture-pi-tick-timer.sh" 2>/dev/null'

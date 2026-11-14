@@ -151,6 +151,10 @@ function stripImages(value) {
 function scrubSystemMessage(m, injectedText) {
   if (!m || typeof m !== "object" || m.role !== "system") return m;
   const out = { ...m };
+  // The injected text this very message recorded: recovered BEFORE the section is deleted, so a
+  // rendered copy of it (tagged or not) is removed whoever captures the entry (the live
+  // extension knows its own injection; the host-side sweep only has what the file recorded).
+  const recorded = typeof out.sections?.memoire === "string" ? out.sections.memoire.trim() : "";
   if (out.sections && typeof out.sections === "object" && "memoire" in out.sections) {
     const { memoire: _own, ...rest } = out.sections;
     out.sections = { ...rest, memoire_omitted: true };
@@ -159,8 +163,8 @@ function scrubSystemMessage(m, injectedText) {
     // Pi renders a named section as <name>…</name>; an injection made by an
     // earlier process is only recognisable by its tag.
     out.content = out.content.replace(/<memoire>[\s\S]*?<\/memoire>/g, "[memoire section omitted]");
-    if (injectedText && out.content.includes(injectedText)) {
-      out.content = out.content.split(injectedText).join("[memoire section omitted]");
+    for (const text of new Set([injectedText, recorded])) {
+      if (text && out.content.includes(text)) out.content = out.content.split(text).join("[memoire section omitted]");
     }
   }
   return out;
@@ -189,11 +193,12 @@ const legacyCursorPath = (sessionId) => path.join(memoireHome(), "pi-capture", `
 const idSet = (v) => new Set(Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
 const union = (a, b) => new Set([...a, ...b]);
 const intersect = (a, b) => new Set([...a].filter((x) => b.has(x)));
-function readCursorFile(file) {
+export function readCursorFile(file) {
   try {
     const d = JSON.parse(fs.readFileSync(file, "utf8"));
     if (!Array.isArray(d?.settled)) return null;
-    return { settled: idSet(d.settled), excluded: idSet(d.excluded) };
+    const { schema: _s, settled: _a, excluded: _b, ...extra } = d;
+    return { settled: idSet(d.settled), excluded: idSet(d.excluded), extra };
   } catch {
     return null; // absent or malformed
   }
@@ -209,17 +214,62 @@ export function readCursor(sessionId) {
   return current ?? legacy;
 }
 export function writeCursor(sessionId, settled, excluded) {
+  return writeCursorAt(cursorPath(sessionId), settled, excluded, {});
+}
+export function writeCursorAt(file, settled, excluded, extra = {}) {
   try {
-    const file = cursorPath(sessionId);
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ schema: "pi-capture-cursor/1", settled: [...settled], excluded: [...excluded] }) + "\n", { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ schema: "pi-capture-cursor/1", settled: [...settled], excluded: [...excluded], ...extra }) + "\n", { mode: 0o600 });
     fs.renameSync(tmp, file);
     return true;
   } catch (e) {
-    logLine({ status: "error=cursor", session: sessionId, detail: e?.message ?? e });
+    logLine({ status: "error=cursor", session: path.basename(file), detail: e?.message ?? e });
     return false;
   }
+}
+
+// One lock per cursor file, shared by this extension and the host-side sweep: every update is a
+// read-modify-write under it, so neither can overwrite the other's settled or EXCLUDED ids (a lost
+// exclusion is a capture of an excluded project, not a harmless replay). An exclusive-create lock
+// file; a lock older than 30 s is a dead holder's and is broken. Not taken within ~5 s: the
+// update does not happen (the caller retries at its next settle / run).
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+export function withCursorLock(file, fn) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const lock = `${file}.lock`;
+  let fd = -1;
+  for (let i = 0; i < 200 && fd < 0; i++) {
+    try { fd = fs.openSync(lock, "wx", 0o600); } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 30000) fs.rmSync(lock, { force: true }); } catch { /* raced */ }
+      sleepMs(25);
+    }
+  }
+  if (fd < 0) throw new Error("cursor lock not taken");
+  try { return fn(); } finally {
+    try { fs.closeSync(fd); } catch { /* */ }
+    try { fs.rmSync(lock, { force: true }); } catch { /* */ }
+  }
+}
+// mutate({settled, excluded, extra}) under the lock; what is on disk (both cursors for a session
+// of the ordinary store) is the base, never a stale in-memory copy. Returns the new state or null.
+export function updateCursorAt(file, mutate, { base } = {}) {
+  try {
+    return withCursorLock(file, () => {
+      const own = readCursorFile(file);
+      const b = base ? base() : null;
+      const cur = { settled: union(own?.settled ?? new Set(), b?.settled ?? new Set()), excluded: union(own?.excluded ?? new Set(), b?.excluded ?? new Set()), extra: own?.extra ?? {} };
+      mutate(cur);
+      return writeCursorAt(file, cur.settled, cur.excluded, cur.extra) ? cur : null;
+    });
+  } catch (e) {
+    logLine({ status: "error=cursor-lock", session: path.basename(file), detail: e?.message ?? e });
+    return null;
+  }
+}
+export function updateCursor(sessionId, mutate) {
+  return updateCursorAt(cursorPath(sessionId), mutate, { base: () => readCursor(sessionId) });
 }
 
 function turnText(message) {
@@ -312,15 +362,16 @@ export default function memoire(pi) {
   });
 
   // `delivered`: the batch was written. Otherwise the entries were excluded by an explicit
-  // capture rule. Nothing is recorded for a failed write.
+  // capture rule. Nothing is recorded for a failed write. The update is serialised with the
+  // host-side sweep (one lock, read-modify-write), and what the sweep settled meanwhile is kept.
   const settle = (entries, sid, delivered) => {
     if (sid !== sessionId) return; // the session changed while the batch ran
     for (const e of entries) (delivered ? settled : excluded).add(e.id);
-    // The host-side sweep (memoire-capture-pi.mjs) shares this cursor: keep what it settled
-    // meanwhile rather than overwrite it (a lost update would only cause an idempotent replay).
-    const onDisk = readCursorFile(cursorPath(sid));
-    if (onDisk) { for (const id of onDisk.settled) settled.add(id); for (const id of onDisk.excluded) excluded.add(id); }
-    writeCursor(sid, settled, excluded);
+    const cur = updateCursor(sid, (c) => {
+      for (const id of settled) c.settled.add(id);
+      for (const id of excluded) c.excluded.add(id);
+    });
+    if (cur) { for (const id of cur.settled) settled.add(id); for (const id of cur.excluded) excluded.add(id); }
   };
 
   const capture = async (ctx) => {
