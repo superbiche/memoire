@@ -186,9 +186,22 @@ def check_native(native: dict, env: dict[str, str]) -> tuple[str, str]:
             problems.append(f"extension differs from source: {dest}")
     if lane not in ("hooks", "rollout-sweep", "store-sweep", "extension"):
         problems.append(f"unknown lane {lane!r}")
+    sweep = native.get("sweep")
+    if sweep:
+        # A native lane that also declares a host-side store sweep (Pi: the extension cannot see a
+        # seat or a cage) is wired only when the sweep is too.
+        for rel in sweep.get("scripts", []):
+            script = ROOT / rel
+            if not (script.is_file() and os.access(script, os.X_OK)):
+                problems.append(f"sweep script not executable: {rel}")
+        flag = sweep.get("enable_env")
+        if flag and env.get(flag, "").lower() not in ("on", "1", "true"):
+            problems.append(f"sweep: {flag} is not on")
+        if sweep.get("timer"):
+            problems += [f"sweep: {p}" for p in timer_runs_executable(sweep["timer"])]
     if problems:
         return "gap", "; ".join(problems)
-    return "wired", f"{lane}" + (f" via {native['timer']}" if native.get("timer") else "")
+    return "wired", f"{lane}" + (f" via {native['timer']}" if native.get("timer") else "") + (f" + sweep via {sweep['timer']}" if sweep and sweep.get("timer") else "")
 
 
 def check_acpx_lane(acpx_lane: dict, env: dict[str, str]) -> tuple[bool, str]:

@@ -78,7 +78,8 @@ jq -nc '{session_id:"s1",cwd:"/work/proj",hook_event_name:"UserPromptSubmit",pro
 
 # 5. Successful write: no toast, nothing logged as a failure.
 : > "$NOTIFY"; : > "$LOG"
-fire "$WORK/queue-ok" || fail "ok hook exited non-zero"
+out="$(fire "$WORK/queue-ok")" || fail "ok hook exited non-zero"
+[[ -z "$out" ]] || fail "queue path leaked into model context"
 (( $(grep -c "^CALL " "$NOTIFY") == 0 )) || fail "success sent a toast"
 grep -q 'queue write failed' "$LOG" && fail "success logged a failure"
 

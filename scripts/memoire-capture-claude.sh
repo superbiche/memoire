@@ -271,9 +271,9 @@ if [[ -n "${MRP_ROOT:-}" ]]; then
   args+=(-project-root "$MRP_ROOT" -project-source "$MRP_SOURCE")
 fi
 
-# The writer's stdout (the queue path) stays the hook's stdout; its stderr
-# (e.g. `redaction key: …`, fail-closed) rides the log line and the toast.
-{ qerr="$("$QUEUE_BIN" "${args[@]}" 2>&1 1>&3)"; qrc=$?; } 3>&1
+# Queue paths are transport bookkeeping, not model context. Preserve writer errors
+# for the existing failure log/toast and strict-mode status.
+qerr="$("$QUEUE_BIN" "${args[@]}" 2>&1 1>/dev/null)"; qrc=$?
 if (( qrc != 0 )); then
   finish_error 1 "queue write failed: $(printf '%s' "$qerr" | head -c 300 | tr '\n' ' ')"
 fi

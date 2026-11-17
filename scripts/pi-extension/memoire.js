@@ -35,18 +35,28 @@
 //     (stopReason stop, length or toolUse) with non-empty text: the text parts
 //     joined by "\n\n" in the event TEXT, no cap. This is the derivation input.
 // Ids: pi:entry:<session id>:<entry id> and pi:turn:<session id>:<entry id>.
-// Delivery: a per-session cursor, $MEMOIRE_HOME/pi-capture/<session id>.json,
-// lists the entry ids already settled (queued, or excluded by MEMOIRE_CAPTURE
-// off or a capture-disabled project: an excluded entry is never queued later). An entry stays out of it until its batch is
-// written, so a failed write is retried at the next settle, and after a
-// restart: when a session with a
-// cursor resumes, its entries missing from the cursor are queued. A session
-// first seen without a cursor (history from before the extension) is marked
-// as settled and not queued: backfill is a transcript reader, not this
-// extension. session_shutdown waits (bounded) for writes in flight. Redaction
+// Delivery: a per-session cursor, $MEMOIRE_HOME/capture-cursors/pi/<session id>.json,
+// keeps two sets apart: `settled` (entries whose batch was written to the queue: only a
+// successful write adds to it) and `excluded` (entries skipped by an explicit capture
+// rule: MEMOIRE_CAPTURE off|0|false, or a project the resolver reports capture-disabled;
+// an excluded entry is not queued later, even with capture back on, as long as the cursor
+// survives). An entry stays out of both until its batch is written, so a failed write is
+// retried at the next settle and after a restart. A session without a cursor is NOT
+// assumed captured: all its entries are queued again. The queue's keys are idempotent
+// (pi:entry:<session id>:<entry id>; the hub keeps one row per key), so a delivered entry
+// is absorbed and an undelivered one is finally captured; a lost cursor costs a replay,
+// never a loss. The capture switches are evaluated again at replay time. When two cursors
+// exist (the current one and the older pi-capture/ one) and disagree, only what both
+// settled counts (the smaller set replays more, and a replay is harmless) while an entry
+// either cursor excluded stays excluded.
+// session_shutdown waits (bounded) for writes in flight. Redaction
 // stays at the queue-write gate (MEMOIRE_REDACT). Capture is skipped when
 // MEMOIRE_CAPTURE is off|0|false or the resolver reports the cwd's project as
 // capture-disabled (`--capture-enabled` prints "off").
+//
+// What this extension cannot see or reach (a Conclave seat, a caged worker, a session whose cursor
+// and queue write both failed) is captured from the session files by the host-side sweep,
+// scripts/memoire-capture-pi.mjs, which shares this cursor and these keys.
 //
 // Overrides: MEMOIRE_INJECT_SCRIPT, MEMOIRE_RESOLVE_PROJECT, MEMOIRE_QUEUE_BIN,
 // MEMOIRE_INJECT_WRAPPER_TIMEOUT (seconds, positive integer, default 10),
@@ -68,7 +78,7 @@ const deadlineSeconds = () => {
   const v = String(process.env.MEMOIRE_INJECT_WRAPPER_TIMEOUT ?? "");
   return /^[1-9][0-9]{0,8}$/.test(v) ? Number(v) : 10;
 };
-const captureOff = () => /^(off|0|false)$/.test(String(process.env.MEMOIRE_CAPTURE ?? ""));
+export const captureOff = () => /^(off|0|false)$/.test(String(process.env.MEMOIRE_CAPTURE ?? ""));
 const SHUTDOWN_WAIT_MS = 10000;
 const QUEUE_TIMEOUT_MS = 30000;
 const RESOLVER_TIMEOUT_MS = 3000;
@@ -116,7 +126,7 @@ async function injectorText(cwd) {
 
 // The resolver prints "off" for a capture-disabled project; its exit code does
 // not count. --verbose prints key<TAB>root<TAB>source.
-async function resolveProject(cwd) {
+export async function resolveProject(cwd) {
   const enabled = await run(resolverScript(), ["--capture-enabled", cwd], { timeoutMs: RESOLVER_TIMEOUT_MS });
   if (enabled.stdout.trim() === "off") return null;
   const r = await run(resolverScript(), ["--verbose", cwd], { timeoutMs: RESOLVER_TIMEOUT_MS });
@@ -141,6 +151,10 @@ function stripImages(value) {
 function scrubSystemMessage(m, injectedText) {
   if (!m || typeof m !== "object" || m.role !== "system") return m;
   const out = { ...m };
+  // The injected text this very message recorded: recovered BEFORE the section is deleted, so a
+  // rendered copy of it (tagged or not) is removed whoever captures the entry (the live
+  // extension knows its own injection; the host-side sweep only has what the file recorded).
+  const recorded = typeof out.sections?.memoire === "string" ? out.sections.memoire.trim() : "";
   if (out.sections && typeof out.sections === "object" && "memoire" in out.sections) {
     const { memoire: _own, ...rest } = out.sections;
     out.sections = { ...rest, memoire_omitted: true };
@@ -149,8 +163,8 @@ function scrubSystemMessage(m, injectedText) {
     // Pi renders a named section as <name>…</name>; an injection made by an
     // earlier process is only recognisable by its tag.
     out.content = out.content.replace(/<memoire>[\s\S]*?<\/memoire>/g, "[memoire section omitted]");
-    if (injectedText && out.content.includes(injectedText)) {
-      out.content = out.content.split(injectedText).join("[memoire section omitted]");
+    for (const text of new Set([injectedText, recorded])) {
+      if (text && out.content.includes(text)) out.content = out.content.split(text).join("[memoire section omitted]");
     }
   }
   return out;
@@ -170,28 +184,92 @@ function withoutOwnSection(entry, injectedText) {
 
 // The per-session delivery cursor (see the header). A malformed file reads as
 // absent; a write failure is logged and capture goes on in memory.
-const cursorPath = (sessionId) => {
-  const safe = /^[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : Buffer.from(sessionId).toString("hex").slice(0, 200);
-  return path.join(memoireHome(), "pi-capture", `${safe}.json`);
-};
-function readCursor(sessionId) {
+// The cursor lives under capture-cursors/pi, the directory every Pi sandbox profile
+// mounts writable (the older pi-capture/ is not mounted: inside the sandbox its cursor
+// died with the session, 2026-11-14). A cursor left at the old place is still read.
+const safeId = (sessionId) => (/^[A-Za-z0-9_-]{1,128}$/.test(sessionId) ? sessionId : Buffer.from(sessionId).toString("hex").slice(0, 200));
+export const cursorPath = (sessionId) => path.join(memoireHome(), "capture-cursors", "pi", `${safeId(sessionId)}.json`);
+const legacyCursorPath = (sessionId) => path.join(memoireHome(), "pi-capture", `${safeId(sessionId)}.json`);
+const idSet = (v) => new Set(Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+const union = (a, b) => new Set([...a, ...b]);
+const intersect = (a, b) => new Set([...a].filter((x) => b.has(x)));
+export function readCursorFile(file) {
   try {
-    const ids = JSON.parse(fs.readFileSync(cursorPath(sessionId), "utf8"))?.settled;
-    return Array.isArray(ids) ? new Set(ids.filter((v) => typeof v === "string")) : null;
+    const d = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!Array.isArray(d?.settled)) return null;
+    const { schema: _s, settled: _a, excluded: _b, ...extra } = d;
+    return { settled: idSet(d.settled), excluded: idSet(d.excluded), extra };
   } catch {
+    return null; // absent or malformed
+  }
+}
+// Both cursors present and disagreeing: the settled sets resolve by intersection (safe
+// because a replay is absorbed by the hub's idempotent keys, while trusting the larger set
+// could skip an entry that was never delivered); the excluded sets resolve by union (an
+// entry excluded once stays excluded, whichever cursor recorded it).
+export function readCursor(sessionId) {
+  const current = readCursorFile(cursorPath(sessionId));
+  const legacy = readCursorFile(legacyCursorPath(sessionId));
+  if (current && legacy) return { settled: intersect(current.settled, legacy.settled), excluded: union(current.excluded, legacy.excluded) };
+  return current ?? legacy;
+}
+export function writeCursor(sessionId, settled, excluded) {
+  return writeCursorAt(cursorPath(sessionId), settled, excluded, {});
+}
+export function writeCursorAt(file, settled, excluded, extra = {}) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ schema: "pi-capture-cursor/1", settled: [...settled], excluded: [...excluded], ...extra }) + "\n", { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (e) {
+    logLine({ status: "error=cursor", session: path.basename(file), detail: e?.message ?? e });
+    return false;
+  }
+}
+
+// One lock per cursor file, shared by this extension and the host-side sweep: every update is a
+// read-modify-write under it, so neither can overwrite the other's settled or EXCLUDED ids (a lost
+// exclusion is a capture of an excluded project, not a harmless replay). An exclusive-create lock
+// file; a lock older than 30 s is a dead holder's and is broken. Not taken within ~5 s: the
+// update does not happen (the caller retries at its next settle / run).
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+export function withCursorLock(file, fn) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const lock = `${file}.lock`;
+  let fd = -1;
+  for (let i = 0; i < 200 && fd < 0; i++) {
+    try { fd = fs.openSync(lock, "wx", 0o600); } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 30000) fs.rmSync(lock, { force: true }); } catch { /* raced */ }
+      sleepMs(25);
+    }
+  }
+  if (fd < 0) throw new Error("cursor lock not taken");
+  try { return fn(); } finally {
+    try { fs.closeSync(fd); } catch { /* */ }
+    try { fs.rmSync(lock, { force: true }); } catch { /* */ }
+  }
+}
+// mutate({settled, excluded, extra}) under the lock; what is on disk (both cursors for a session
+// of the ordinary store) is the base, never a stale in-memory copy. Returns the new state or null.
+export function updateCursorAt(file, mutate, { base } = {}) {
+  try {
+    return withCursorLock(file, () => {
+      const own = readCursorFile(file);
+      const b = base ? base() : null;
+      const cur = { settled: union(own?.settled ?? new Set(), b?.settled ?? new Set()), excluded: union(own?.excluded ?? new Set(), b?.excluded ?? new Set()), extra: own?.extra ?? {} };
+      mutate(cur);
+      return writeCursorAt(file, cur.settled, cur.excluded, cur.extra) ? cur : null;
+    });
+  } catch (e) {
+    logLine({ status: "error=cursor-lock", session: path.basename(file), detail: e?.message ?? e });
     return null;
   }
 }
-function writeCursor(sessionId, ids) {
-  try {
-    const file = cursorPath(sessionId);
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ schema: "pi-capture-cursor/1", settled: [...ids] }) + "\n", { mode: 0o600 });
-    fs.renameSync(tmp, file);
-  } catch (e) {
-    logLine({ status: "error=cursor", session: sessionId, detail: e?.message ?? e });
-  }
+export function updateCursor(sessionId, mutate) {
+  return updateCursorAt(cursorPath(sessionId), mutate, { base: () => readCursor(sessionId) });
 }
 
 function turnText(message) {
@@ -230,7 +308,7 @@ export function buildEvents(entries, { sessionId, sessionFile, cwd, project, inj
   return events;
 }
 
-async function writeBatch(events) {
+export async function writeBatch(events) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "memoire-pi."));
   const file = path.join(dir, "batch.jsonl");
   try {
@@ -245,7 +323,9 @@ export default function memoire(pi) {
   let sessionId = "";
   let injected = null; // null: not computed for this session yet; "" : nothing to inject
   let injecting = null;
-  const seen = new Set();
+  const settled = new Set();   // delivered: the queue write succeeded
+  const excluded = new Set();  // skipped by an explicit capture rule
+  const done = (id) => settled.has(id) || excluded.has(id);
   const inflight = new Set();
   const pending = new Set();
 
@@ -254,14 +334,14 @@ export default function memoire(pi) {
       sessionId = ctx.sessionManager.getSessionId();
       injected = null;
       injecting = null;
-      seen.clear();
+      settled.clear();
+      excluded.clear();
       const cursor = readCursor(sessionId);
       if (cursor) {
-        for (const id of cursor) seen.add(id);
-      } else {
-        for (const e of ctx.sessionManager.getEntries()) seen.add(e.id);
-        writeCursor(sessionId, seen);
+        for (const id of cursor.settled) settled.add(id);
+        for (const id of cursor.excluded) excluded.add(id);
       }
+      // no cursor: nothing is assumed captured; the first settle replays the whole history
     } catch (e) {
       logLine({ status: "error=session", detail: e?.message ?? e });
     }
@@ -281,12 +361,17 @@ export default function memoire(pi) {
     }
   });
 
-  // Settled for good: queued, or excluded by a capture switch. An excluded
-  // entry is never queued later, even after a restart with capture back on.
-  const settle = (entries, sid) => {
+  // `delivered`: the batch was written. Otherwise the entries were excluded by an explicit
+  // capture rule. Nothing is recorded for a failed write. The update is serialised with the
+  // host-side sweep (one lock, read-modify-write), and what the sweep settled meanwhile is kept.
+  const settle = (entries, sid, delivered) => {
     if (sid !== sessionId) return; // the session changed while the batch ran
-    for (const e of entries) seen.add(e.id);
-    writeCursor(sid, seen);
+    for (const e of entries) (delivered ? settled : excluded).add(e.id);
+    const cur = updateCursor(sid, (c) => {
+      for (const id of settled) c.settled.add(id);
+      for (const id of excluded) c.excluded.add(id);
+    });
+    if (cur) { for (const id of cur.settled) settled.add(id); for (const id of cur.excluded) excluded.add(id); }
   };
 
   const capture = async (ctx) => {
@@ -294,10 +379,10 @@ export default function memoire(pi) {
     let meta;
     try {
       if (ctx.sessionManager.getSessionId() !== sessionId) resetSession(ctx);
-      entries = ctx.sessionManager.getEntries().filter((e) => !seen.has(e.id) && !inflight.has(e.id));
+      entries = ctx.sessionManager.getEntries().filter((e) => !done(e.id) && !inflight.has(e.id));
       if (!entries.length) return;
       if (captureOff()) {
-        settle(entries, sessionId);
+        settle(entries, sessionId, false);
         return;
       }
       meta = { sessionId, sessionFile: ctx.sessionManager.getSessionFile(), cwd: ctx.cwd, injectedText: injected || "" };
@@ -309,11 +394,11 @@ export default function memoire(pi) {
     try {
       const project = await resolveProject(meta.cwd);
       if (!project) {
-        settle(entries, meta.sessionId); // capture-disabled project: never queued, never retried
+        settle(entries, meta.sessionId, false); // capture-disabled project: excluded, not retried while the cursor lives
         return;
       }
       const ok = await writeBatch(buildEvents(entries, { ...meta, project }));
-      if (ok) settle(entries, meta.sessionId);
+      if (ok) settle(entries, meta.sessionId, true);
       else logLine({ status: "error=queue", session: meta.sessionId, entries: entries.length });
     } catch (e) {
       logLine({ status: "error=capture", session: meta.sessionId, detail: e?.message ?? e });
