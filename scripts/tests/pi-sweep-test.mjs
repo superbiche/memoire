@@ -478,6 +478,9 @@ const mkfifo = (f) => { fs.mkdirSync(path.dirname(f), { recursive: true }); cons
   fresh();
   const f = path.join(root, "agent/sessions/--work-a--/rw.jsonl");
   session(f, "rw-1", "/work/a", [user("k1", "aaaa")]);
+  // A whole-second mtime survives the restore below exactly: utimes takes seconds as a double, and Node 22
+  // truncates the restored time to the microsecond, so a nanosecond mtime would not round-trip.
+  fs.utimesSync(f, 1700000000, 1700000000);
   run(); clearBatches();
   check(summary(run()).events === 0 && queued().length === 0, "skip: an unchanged, completely swept file is not read again");
   // an in-place rewrite of the same length (a new entry id), mtime restored
